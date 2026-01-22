@@ -4,7 +4,7 @@ from torch_geometric.nn import GATv2Conv
 from torch_geometric.data import Data, Batch
 
 class RecurrentGATTracker(nn.Module):
-    def __init__(self, input_dim=7, hidden_dim=64, output_dim=7, num_heads=4):
+    def __init__(self, input_dim=8, hidden_dim=64, output_dim=7, num_heads=4):
         super().__init__()
         self.hidden_dim = hidden_dim
         

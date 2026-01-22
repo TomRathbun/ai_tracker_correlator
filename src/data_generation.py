@@ -1,18 +1,10 @@
 import numpy as np
-import torch
+import json
+import os
 from dataclasses import dataclass
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Generator
+from schema import RadarConfig, RadarPlot, RadarBeacon, BatchFrame
 
-@dataclass
-class RadarConfig:
-    id: int
-    x: float
-    y: float
-    z: float
-    range_max: float = 100000.0  # meters
-    azimuth_noise: float = 0.005  # radians
-    range_noise: float = 50.0  # meters
-    prob_detection: float = 0.9
 
 @dataclass
 class TrackState:
@@ -24,6 +16,8 @@ class TrackState:
     vy: float
     vz: float
     t: float
+    callsign: str = "N/A"
+    code: int = 1200
 
 class DataGenerator:
     def __init__(self, radars: List[RadarConfig], num_tracks: int = 20, batch_duration: float = 3.0):
@@ -35,7 +29,6 @@ class DataGenerator:
     def _init_tracks(self) -> List[TrackState]:
         tracks = []
         for i in range(self.num_tracks):
-            # Random initialization within a volume
             x = np.random.uniform(-50000, 50000)
             y = np.random.uniform(-50000, 50000)
             z = np.random.uniform(1000, 10000)
@@ -43,8 +36,10 @@ class DataGenerator:
             heading = np.random.uniform(0, 2*np.pi)
             vx = speed * np.cos(heading)
             vy = speed * np.sin(heading)
-            vz = 0.0 # simple level flight for now
-            tracks.append(TrackState(i, x, y, z, vx, vy, vz, 0.0))
+            vz = 0.0 # simple level flight
+            callsign = f"AC{i:03d}"
+            code = 1000 + i
+            tracks.append(TrackState(i, x, y, z, vx, vy, vz, 0.0, callsign, code))
         return tracks
 
     def update_tracks(self, dt: float):
@@ -53,28 +48,15 @@ class DataGenerator:
             track.y += track.vy * dt
             track.z += track.vz * dt
             track.t += dt
-            
-            # Simple boundary check to wrap around or bounce could be added here
-            # For now just let them fly
 
-    def generate_batch(self, t_start: float) -> Tuple[torch.Tensor, torch.Tensor]:
+    def generate_frame(self, current_time: float) -> BatchFrame:
         """
-        Generates a 3-second batch of reports.
-        Returns:
-            reports: Tensor of shape (N, features) [x, y, z, vx, vy, amp, sensor_id]
-            labels: Tensor of shape (N, 1) [track_id] (or -1 for clutter)
+        Generates a single time-slice frame of measurements.
         """
-        reports_list = []
-        labels_list = []
+        self.update_tracks(self.batch_duration) 
+        measurements = []
         
-        # We can simulate slightly different timestamps within the batch if we want
-        # For simplicity, let's assume all reports arrive roughly at t_start for now
-        # or propagate tracks to exact measure times if we simulate rotating radar.
-        
-        # Let's assume snapshot at t_start for now:
-        self.update_tracks(self.batch_duration) # Move tracks to current time
-        
-        # Generate measurements
+        # Reports from tracks
         for radar in self.radars:
             for track in self.tracks:
                 # Check coverage
@@ -85,28 +67,40 @@ class DataGenerator:
                 
                 if dist < radar.range_max:
                     if np.random.rand() < radar.prob_detection:
-                        # Add noise
-                        # Measurement usually in polar (range, az) then converted back
+                        # Noise
                         az = np.arctan2(dy, dx)
-                        
                         meas_dist = dist + np.random.normal(0, radar.range_noise)
                         meas_az = az + np.random.normal(0, radar.azimuth_noise)
                         
-                        # Convert back to Cartesian
                         mx = radar.x + meas_dist * np.cos(meas_az)
                         my = radar.y + meas_dist * np.sin(meas_az)
-                        mz = track.z # approximate altitude from mode-C or 3D radar
+                        mz = track.z 
                         
-                        # Mock amplitude and doppler (vx, vy from track + noise)
                         mvx = track.vx + np.random.normal(0, 5)
                         mvy = track.vy + np.random.normal(0, 5)
-                        amp = np.random.uniform(10, 100) # SNR
                         
-                        reports_list.append([mx, my, mz, mvx, mvy, amp, radar.id])
-                        labels_list.append(track.id)
-        
-        # Add clutter
-        num_clutter = int(len(reports_list) * 0.1) # 10% clutter
+                        # Decide Plot vs Beacon (e.g., 20% beacon, 80% plot for primary)
+                        # For simplicity, let's say sensor 1 is Primary (Plot), sensor 2 is Secondary (Beacon)
+                        # Or mixed. Let's make it random per detection for coverage variety.
+                        is_beacon = np.random.rand() < 0.3 # 30% chance for beacon info
+                        
+                        if is_beacon:
+                             measurements.append(RadarBeacon(
+                                 sensor_id=radar.id, timestamp=current_time,
+                                 x=mx, y=my, z=mz, vx=mvx, vy=mvy,
+                                 identity_code=track.code, callsign=track.callsign,
+                                 track_id=track.id
+                             ))
+                        else:
+                             amp = np.random.uniform(10, 100)
+                             measurements.append(RadarPlot(
+                                 sensor_id=radar.id, timestamp=current_time,
+                                 x=mx, y=my, z=mz, vx=mvx, vy=mvy,
+                                 amplitude=amp, track_id=track.id
+                             ))
+
+        # Add clutter (Plots only usually, but maybe false beacons?)
+        num_clutter = int(len(measurements) * 0.1)
         for _ in range(num_clutter):
              cx = np.random.uniform(-50000, 50000)
              cy = np.random.uniform(-50000, 50000)
@@ -116,24 +110,42 @@ class DataGenerator:
              camp = np.random.uniform(5, 50)
              cradar = np.random.choice([r.id for r in self.radars])
              
-             reports_list.append([cx, cy, cz, cvx, cvy, camp, cradar])
-             labels_list.append(-1) # Clutter ID
+             measurements.append(RadarPlot(
+                 sensor_id=cradar, timestamp=current_time,
+                 x=cx, y=cy, z=cz, vx=cvx, vy=cvy,
+                 amplitude=camp, track_id=-1
+             ))
              
-        if not reports_list:
-            return torch.empty(0, 7), torch.empty(0, dtype=torch.long)
-            
-        return torch.tensor(reports_list, dtype=torch.float32), torch.tensor(labels_list, dtype=torch.long)
+        return BatchFrame(timestamp=current_time, measurements=measurements)
 
 def create_default_scenario():
     radars = [
         RadarConfig(id=0, x=0, y=0, z=0),
         RadarConfig(id=1, x=20000, y=10000, z=50)
     ]
-    gen = DataGenerator(radars, num_tracks=5)
+    gen = DataGenerator(radars, num_tracks=10)
     return gen
 
-if __name__ == "__main__":
+class NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super(NumpyEncoder, self).default(obj)
+
+def generate_dataset(output_file: str, num_frames: int = 50):
     gen = create_default_scenario()
-    reports, labels = gen.generate_batch(0.0)
-    print(f"Generated {len(reports)} reports for tracks {labels.unique()}")
-    print("Sample report:", reports[0] if len(reports)>0 else "None")
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    
+    with open(output_file, 'w') as f:
+        for i in range(num_frames):
+            frame = gen.generate_frame(i * 3.0)
+            f.write(json.dumps(frame.to_dict(), cls=NumpyEncoder) + '\n')
+    
+    print(f"Generated {num_frames} frames to {output_file}")
+
+if __name__ == "__main__":
+    generate_dataset("data/sim_001.jsonl", num_frames=50)

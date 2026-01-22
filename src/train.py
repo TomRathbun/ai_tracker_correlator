@@ -1,62 +1,100 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from data_generation import create_default_scenario
+import json
+import os
+from torch.utils.data import IterableDataset, DataLoader
+from schema import BatchFrame, RadarPlot, RadarBeacon
 from model import RecurrentGATTracker, build_fully_connected_edge_index
 from tqdm import tqdm
 
+class RadarDataset(IterableDataset):
+    def __init__(self, data_file):
+        self.data_file = data_file
+        
+    def __iter__(self):
+        with open(self.data_file, 'r') as f:
+            for line in f:
+                data = json.loads(line)
+                # Parse back to objects if needed, or just use dict
+                # Here we reconstruct for clarity but could stream dicts
+                yield data
+
+def collate_fn(batch_list):
+    # Since we are processing sequential frames in a loop inside train(), 
+    # and "batch" here usually implies parallel samples, but for RNN we want sequence.
+    # However, standard DataLoader collates into a batch of items.
+    # Our "item" is one Frame (which contains N measurements).
+    # We will just return the list of frames and handle tensor construction in the loop
+    # or construct a batch of graphs here.
+    
+    # Simple approach: Return the single frame's data as tensors
+    # Assuming batch_size=1 for streaming sequence
+    frame_dict = batch_list[0] 
+    measurements = frame_dict['measurements']
+    
+    tensor_data = []
+    # Vector: [x, y, z, vx, vy, amplitude, code, sensor_id]
+    
+    for m in measurements:
+        is_beacon = (m['type'] == 'beacon')
+        
+        row = [
+            m['x'], m['y'], m['z'],
+            m['vx'], m['vy'],
+            0.0 if is_beacon else m.get('amplitude', 0.0),
+            float(m.get('identity_code', 0)) if is_beacon else 0.0,
+            float(m['sensor_id'])
+        ]
+        tensor_data.append(row)
+        
+    if not tensor_data:
+        return torch.empty(0, 8)
+        
+    return torch.tensor(tensor_data, dtype=torch.float32)
+
 def train():
+    data_file = "data/sim_001.jsonl"
+    if not os.path.exists(data_file):
+        print(f"File {data_file} not found. Run data_generation.py first.")
+        return
+
     # Setup
-    gen = create_default_scenario()
-    model = RecurrentGATTracker(input_dim=7, hidden_dim=64, output_dim=7)
+    dataset = RadarDataset(data_file)
+    # batch_size=1 because each line is already a "batch" of simultaneous readings (a frame)
+    loader = DataLoader(dataset, batch_size=1, collate_fn=collate_fn) 
+    
+    # Input dim 8 now
+    model = RecurrentGATTracker(input_dim=8, hidden_dim=64, output_dim=7)
     optimizer = optim.AdamW(model.parameters(), lr=1e-3)
     criterion = nn.MSELoss()
     
-    # Training Loop
     model.train()
     hidden_state = None
-    
     losses = []
     
-    # Simulate a sequence of 50 steps
-    print("Starting training sequence...")
-    for t in tqdm(range(50)):
-        # 1. Generate data
-        # Note: in a real loop we'd have a dataloader, here we simulate on the fly
-        reports, labels = gen.generate_batch(t * 3.0)
-        
-        if len(reports) == 0:
+    print("Starting training from file...")
+    for reports in tqdm(loader):
+        # reports is [N, 8] tensor
+        if reports.size(0) == 0:
             continue
             
-        # 2. Build graph (fully connected for now)
-        num_items = reports.shape[0]
+        num_items = reports.size(0)
         edge_index = build_fully_connected_edge_index(num_items)
         
-        # 3. Forward
-        # We need to manage hidden state size mismatch if objects appear/disappear
-        # For this simple feasibility demo, we'll reset hidden state if size changes (coarse approximation)
-        # A real implementation requires ID-based matching or max-prop sizing.
-        
+        # Hidden state management (naive reset if size changes)
         if hidden_state is not None and hidden_state.shape[0] != num_items:
-            # Re-init hidden for new items or just zero out for simplicity in this demo
-            # In production: strict ID matching required
-            hidden_state = None # Force reset for demo
+            hidden_state = None
             
         out, hidden_state = model(reports, edge_index, hidden_state)
-        
-        # Detach hidden state to prevent backprop through entire history (TBPTT could be used)
         hidden_state = hidden_state.detach()
         
-        # 4. Loss (Self-supervised / Auto-regressive reconstruction for this demo)
-        # We try to predict the input itself (auto-encoder style) or next step
-        # Ideally we have GT labels. Let's assume 'reports' contains GT for training if we treat it as such
-        # or we generate next step GT.
-        # For simplicity: reconstruction loss
-        target = reports # Simple AE objective
+        # Self-supervised dummy target: predict input [x,y,z,vx,vy,amp,code] (ignoring sensor_id for loss maybe?)
+        # Only first 7 dims match output_dim=7
+        target = reports[:, :7] 
         
         loss = criterion(out, target)
         
-        # 5. Backward
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
