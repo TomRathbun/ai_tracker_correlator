@@ -5,7 +5,7 @@ import json
 import os
 from torch.utils.data import IterableDataset, DataLoader
 from schema import BatchFrame, RadarPlot, RadarBeacon
-from model import RecurrentGATTracker, build_fully_connected_edge_index
+from src.model_v2 import RecurrentGATTracker, build_fully_connected_edge_index
 from tqdm import tqdm
 
 class RadarDataset(IterableDataset):
