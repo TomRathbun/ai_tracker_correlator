@@ -1,3 +1,5 @@
+from typing import List, Dict, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,8 +8,7 @@ from torch_geometric.nn import GATv2Conv
 from scipy.optimize import linear_sum_assignment
 from tqdm import tqdm
 import numpy as np
-
-# Model unchanged
+import json
 class RecurrentGATTrackerV3(nn.Module):
     def __init__(self, num_sensors=3, hidden_dim=64, state_dim=6, num_heads=4, edge_dim=6, emb_dim=8):
         super().__init__()
@@ -36,6 +37,8 @@ class RecurrentGATTrackerV3(nn.Module):
             nn.Linear(hidden_dim, state_dim + 1)
         )
 
+        nn.init.constant_(self.decoder[-1].bias[state_dim], 5.0)  # ~0.993 initial prob
+
     def forward(self, x, node_type, sensor_id, edge_index, edge_attr, hidden_state=None):
         N = x.shape[0]
 
@@ -45,11 +48,11 @@ class RecurrentGATTrackerV3(nn.Module):
         h = torch.cat([x, type_emb, sensor_emb], dim=-1)
         h = self.encoder(h)
 
-        h, (_, alpha1) = self.gat1(h, edge_index, edge_attr=edge_attr,
-                                   return_attention_weights=True)
+        h, (edge_index1, alpha1) = self.gat1(h, edge_index, edge_attr=edge_attr,
+                                             return_attention_weights=True)
         h = F.relu(h)
-        h, (_, alpha2) = self.gat2(h, edge_index, edge_attr=edge_attr,
-                                   return_attention_weights=True)
+        h, (edge_index2, alpha2) = self.gat2(h, edge_index, edge_attr=edge_attr,
+                                             return_attention_weights=True)
 
         if hidden_state is None:
             hidden_full = torch.zeros(N, self.hidden_dim, device=h.device)
@@ -67,7 +70,7 @@ class RecurrentGATTrackerV3(nn.Module):
         new_hidden_full = self.gru(h, hidden_full)
         out = self.decoder(new_hidden_full)
 
-        return out, new_hidden_full, [alpha1, alpha2]
+        return out, new_hidden_full, alpha2  # Return final alpha for suppression
 
 def build_sparse_edges(x, max_dist=60000.0, k=10):
     pos = x[:, :3]
@@ -100,9 +103,10 @@ def generate_synthetic_frame(t_step, true_trajectories, num_sensors, sensor_nois
                              p_detect=0.85, clutter_rate=10):
     meas_list = []
     sensor_list = []
+    is_true_list = []
     gt_states = []
 
-    for traj in true_trajectories:  # Fixed: direct iteration
+    for traj in true_trajectories:
         true_pos = traj['initial_pos'] + traj['vel'] * t_step
         true_vel = traj['vel']
         gt_states.append(torch.cat([true_pos, true_vel]))
@@ -115,8 +119,8 @@ def generate_synthetic_frame(t_step, true_trajectories, num_sensors, sensor_nois
                 m = torch.cat([true_pos + pos_noise, true_vel + vel_noise, amp])
                 meas_list.append(m)
                 sensor_list.append(s)
+                is_true_list.append(True)
 
-    # Clutter (independent)
     for _ in range(clutter_rate):
         clutter_pos = torch.randn(3) * 50000.0
         clutter_vel = torch.randn(3) * 30.0
@@ -124,64 +128,294 @@ def generate_synthetic_frame(t_step, true_trajectories, num_sensors, sensor_nois
         m = torch.cat([clutter_pos, clutter_vel, amp])
         meas_list.append(m)
         sensor_list.append(torch.randint(0, num_sensors, (1,)).item())
+        is_true_list.append(False)
 
     if meas_list:
         meas = torch.stack(meas_list)
         sensor_ids = torch.tensor(sensor_list, dtype=torch.long)
+        is_true_meas = torch.tensor(is_true_list, dtype=torch.bool)
     else:
         meas = torch.empty((0, 7))
         sensor_ids = torch.empty((0,), dtype=torch.long)
+        is_true_meas = torch.empty((0,), dtype=torch.bool)
 
     gt_states = torch.stack(gt_states) if gt_states else torch.empty((0, 6))
 
-    return meas, sensor_ids, gt_states
+    return meas, sensor_ids, gt_states, is_true_meas
 
-def train_model(num_epochs=20, steps_per_epoch=100, num_objects=4, num_sensors=3):
+
+# 1. Data loading / preparation (one-time or per epoch)
+def load_frames(data_file: str) -> List[Dict]:
+    """Load all frames from jsonl into memory."""
+    frames = []
+    with open(data_file, 'r') as f:
+        for line in f:
+            try:
+                frames.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    print(f"Loaded {len(frames)} frames")
+    return frames
+
+# 2. Convert one frame's measurements → tensors
+def frame_to_tensors(frame_data: Dict, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Parse measurements → [N, 7] feature tensor + sensor_id tensor"""
+    measurements = frame_data['measurements']
+    meas_list = []
+    sensor_ids_list = []
+
+    for m in measurements:
+        row = [
+            m['x'], m['y'], m['z'],
+            m['vx'], m['vy'],
+            m.get('amplitude', 0.0),
+            float(m.get('identity_code', 0)) if 'identity_code' in m else 0.0
+        ]
+        meas_list.append(row)
+        sensor_ids_list.append(m['sensor_id'])
+
+    if not meas_list:
+        return torch.empty((0, 7), device=device), torch.empty((0,), dtype=torch.long, device=device)
+
+    meas = torch.tensor(meas_list, dtype=torch.float32, device=device)
+    sensor_ids = torch.tensor(sensor_ids_list, dtype=torch.long, device=device)
+    return meas, sensor_ids
+
+# 3. Build full input (tracks + measurements)
+def build_full_input(active_tracks: List[Dict], meas: torch.Tensor, meas_sensor_ids: torch.Tensor,
+                     num_sensors: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Combine persistent tracks + new measurements into full_x, full_sensor_id, hidden_state, num_tracks"""
+    if active_tracks:
+        track_kin = torch.stack([tr['state'] for tr in active_tracks])
+        track_amp = torch.zeros(len(active_tracks), 1, device=device)
+        track_features = torch.cat([track_kin, track_amp], dim=1)
+
+        track_hiddens = torch.stack([tr['hidden'] for tr in active_tracks])
+        track_sensor_ids = torch.full((len(active_tracks),), num_sensors, dtype=torch.long, device=device)
+
+        full_x = torch.cat([track_features, meas], dim=0)
+        full_sensor_id = torch.cat([track_sensor_ids, meas_sensor_ids])
+        hidden_state = track_hiddens
+        num_tracks = len(active_tracks)
+    else:
+        full_x = meas
+        full_sensor_id = meas_sensor_ids
+        hidden_state = None
+        num_tracks = 0
+
+    return full_x, full_sensor_id, hidden_state, num_tracks
+
+# 4. Model forward + existence probs
+def model_forward(model, full_x, node_type, full_sensor_id, edge_index, edge_attr, hidden_state):
+    out, new_hidden_full, alpha = model(full_x, node_type, full_sensor_id, edge_index, edge_attr, hidden_state)
+    existence_logits = out[:, 6]
+    existence_probs = torch.sigmoid(existence_logits)
+    return out, new_hidden_full, alpha, existence_probs, existence_logits
+
+# 5. Track management (selection, suppression, deletion, cap)
+def manage_tracks(active_tracks, out, new_hidden_full, existence_probs, existence_logits, alpha, edge_index,
+                  num_tracks, num_meas, init_thresh, coast_thresh, suppress_thresh, del_exist, del_age, track_cap):
+    meas_offset = num_tracks
+
+    # Softer suppression (only strong associations block)
+    attn_suppress = torch.zeros(num_meas, dtype=torch.bool, device=out.device)
+    if num_meas > 0 and alpha is not None and alpha.numel() > 0:
+        alpha_mean = alpha.mean(dim=-1)
+        src, dst = edge_index
+        meas_mask = dst >= num_tracks
+        if meas_mask.any():
+            meas_edges = meas_mask.nonzero(as_tuple=False).squeeze(-1)
+            meas_dst = dst[meas_edges] - num_tracks
+            meas_incoming = torch.zeros(num_meas, device=out.device)
+            meas_incoming.scatter_add_(0, meas_dst, alpha_mean[meas_edges])
+            attn_suppress = meas_incoming > suppress_thresh
+
+    selected = []
+
+    # Coast existing with bonus when few measurements
+    if num_tracks > 0:
+        coast_boost = 0.5 if num_meas < 30 else 0.0  # help coasting in sparse frames
+        for i in range(num_tracks):
+            prob = existence_probs[i] + coast_boost
+            if prob > coast_thresh:
+                age = active_tracks[i].get('age', 0) + 1
+                age = 0 if prob > 0.8 else age  # reset on strong update
+                selected.append({
+                    'state': out[i, :6].detach(),
+                    'hidden': new_hidden_full[i].detach(),
+                    'logit': existence_logits[i],
+                    'age': age
+                })
+
+    # Initiate new
+    if num_meas > 0:
+        for i in range(num_meas):
+            idx = meas_offset + i
+            prob = existence_probs[idx]
+            if prob > init_thresh and not attn_suppress[i]:
+                selected.append({
+                    'state': out[idx, :6].detach(),
+                    'hidden': new_hidden_full[idx].detach(),
+                    'logit': existence_logits[idx],
+                    'age': 0
+                })
+
+    # Softer deletion: keep young tracks even if low prob
+    selected = [tr for tr in selected if torch.sigmoid(tr['logit']) > del_exist or tr['age'] < del_age]
+
+    # Cap
+    if len(selected) > track_cap:
+        probs = torch.stack([torch.sigmoid(tr['logit']) for tr in selected])
+        top_idx = torch.topk(probs, track_cap).indices
+        selected = [selected[i.item()] for i in top_idx]
+
+    return selected
+
+
+# 6. Compute loss (using GT from frame)
+def compute_loss(
+    pred_states: torch.Tensor,
+    pred_logits: torch.Tensor,
+    gt_states_dev: torch.Tensor,
+    num_gt: int,
+    match_gate: float,
+    miss_penalty: float,
+    fp_mult: float,
+    out: torch.Tensor,
+    epoch: int,
+    num_meas: int,
+    meas: torch.Tensor = None,          # optional for pseudo-aux
+    existence_logits: torch.Tensor = None,  # optional but useful for pseudo-aux
+    num_tracks: int = 0,                # optional for slicing
+):
+    """
+    Compute the full tracking loss.
+    Works even when pred_states is empty.
+    """
+    device = out.device
+
+    reg_loss = torch.tensor(0.0, device=device)
+    exist_matched_loss = torch.tensor(0.0, device=device)
+    exist_fp_loss = torch.tensor(0.0, device=device)
+    miss_loss = torch.tensor(miss_penalty * num_gt, device=device)
+    matched_exist_loss = torch.tensor(0.0, device=device)
+
+    row_ind_torch = None
+    if pred_states.shape[0] > 0 and num_gt > 0:
+        cost_matrix = torch.cdist(pred_states[:, :3], gt_states_dev[:, :3])
+        cost_np = cost_matrix.detach().cpu().numpy()
+        row_ind, col_ind = linear_sum_assignment(cost_np)
+
+        valid = cost_np[row_ind, col_ind] < match_gate
+        row_ind = row_ind[valid]
+        col_ind = col_ind[valid]
+        row_ind_torch = torch.from_numpy(row_ind).to(device)
+
+        if len(row_ind) > 0:
+            reg_loss = F.mse_loss(pred_states[row_ind_torch], gt_states_dev[col_ind])
+            exist_matched_loss = F.binary_cross_entropy_with_logits(
+                pred_logits[row_ind_torch],
+                torch.ones_like(pred_logits[row_ind_torch])
+            )
+
+            # Matched existence target: push matched tracks' logits high
+            target_logits = torch.full_like(pred_logits[row_ind_torch], 4.0)
+            matched_exist_loss = F.mse_loss(pred_logits[row_ind_torch], target_logits)
+
+        matched_mask = torch.zeros(len(pred_logits), dtype=torch.bool, device=device)
+        if len(row_ind) > 0:
+            matched_mask[row_ind_torch] = True
+        fp_mask = ~matched_mask
+        if fp_mask.any():
+            exist_fp_loss = fp_mult * F.binary_cross_entropy_with_logits(
+                pred_logits[fp_mask],
+                torch.zeros_like(pred_logits[fp_mask])
+            )
+
+        miss_loss = torch.tensor(miss_penalty * (num_gt - len(row_ind)), device=device)
+
+    loss = reg_loss + exist_matched_loss + exist_fp_loss + miss_loss + 2.0 * matched_exist_loss
+
+    # Strong dummy gradient path
+    dummy = out.sum() * 0.01
+    loss = loss + dummy
+
+    # Pseudo-aux on measurements (amplitude > 40 → likely true)
+    if num_meas > 0 and meas is not None and existence_logits is not None:
+        meas_logits = existence_logits[num_tracks : num_tracks + num_meas]
+        pseudo_target = torch.where(meas[:, 5] > 40.0, 0.8, 0.2).to(device)
+        pseudo_aux = F.binary_cross_entropy_with_logits(meas_logits, pseudo_target)
+        loss = loss + 3.0 * pseudo_aux
+
+    # Early bonus for predicting anything
+    if num_meas > 10 and epoch < 5 and pred_states.shape[0] == 0:
+        loss = loss - 2.0
+
+    # Prevent extreme negative logits
+    if existence_logits is not None:
+        logit_reg = 0.001 * (existence_logits ** 2).mean()
+        loss = loss + logit_reg
+
+    return loss
+
+# 7. Main training loop (now clean and readable)
+def train_model(num_epochs=30, data_file="data/sim_realistic_003.jsonl"):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    num_sensors = 3
     model = RecurrentGATTrackerV3(num_sensors=num_sensors).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
+
+    # Hyperparameters (easy to change or sweep)
+    del_exist = 0.05
+    del_age = 8
+    track_cap = 150
     match_gate = 15000.0
-    miss_penalty = 2.0
+    miss_penalty = 10.0
+
+    frames = load_frames(data_file)
 
     for epoch in range(num_epochs):
-        true_trajectories = []
-        for _ in range(num_objects):
-            init_pos = torch.randn(3) * 30000.0
-            vel = torch.randn(3) * 100.0 + torch.tensor([100.0, 0.0, 0.0])
-            true_trajectories.append({'initial_pos': init_pos, 'vel': vel})
-
-        sensor_noises = [20.0 + 30.0 * i for i in range(num_sensors)]
-
         active_tracks = []
         epoch_losses = []
+        epoch_gt_counts = []
 
-        for t in tqdm(range(steps_per_epoch), desc=f"Epoch {epoch+1}/{num_epochs}"):
-            meas, meas_sensor_ids, gt_states = generate_synthetic_frame(
-                t, true_trajectories, num_sensors, sensor_noises, clutter_rate=10)
+        if epoch < 3:
+            suppress_thresh = 1.0  # off
+        else:
+            suppress_thresh = 0.8
 
+        if epoch < 5:
+            init_thresh = 0.25
+            coast_thresh = 0.1
+            fp_mult = 0.2
+        else:
+            init_thresh = 0.35
+            coast_thresh = 0.15
+            fp_mult = 0.8
+
+
+        frame_idx = 0
+        for frame_data in tqdm(frames, desc=f"Epoch {epoch+1}/{num_epochs}"):
+            frame_idx += 1
+            meas, meas_sensor_ids = frame_to_tensors(frame_data, device)
             num_meas = meas.shape[0]
+            if num_meas == 0:
+                continue
 
-            # Build graph input
-            if active_tracks:
-                track_states = torch.stack([tr['state'] for tr in active_tracks])
-                track_hiddens = torch.stack([tr['hidden'] for tr in active_tracks])
-                track_sensor_ids = torch.full((len(active_tracks),), num_sensors, dtype=torch.long)
-                full_x = torch.cat([track_states, meas.to(device)], dim=0)
-                full_sensor_id = torch.cat([track_sensor_ids, meas_sensor_ids.to(device)])
-                hidden_state = track_hiddens
-                num_tracks = len(active_tracks)
-            else:
-                full_x = meas.to(device)
-                full_sensor_id = meas_sensor_ids.to(device)
-                hidden_state = None
-                num_tracks = 0
+            gt_tracks = frame_data.get('gt_tracks', [])
+            gt_states_dev = torch.tensor(
+                [[gt['x'], gt['y'], gt['z'], gt['vx'], gt['vy'], gt['vz']] for gt in gt_tracks],
+                dtype=torch.float32, device=device
+            )
+            num_gt = gt_states_dev.shape[0]
+            epoch_gt_counts.append(num_gt)
+
+            full_x, full_sensor_id, hidden_state, num_tracks = build_full_input(
+                active_tracks, meas, meas_sensor_ids, num_sensors, device
+            )
 
             N = full_x.shape[0]
             if N == 0:
-                # Empty scene: log miss penalty but no gradient update (no information)
-                num_gt = gt_states.shape[0]
-                loss_val = miss_penalty * num_gt
-                epoch_losses.append(loss_val)
                 continue
 
             node_type = torch.cat([torch.ones(num_tracks, dtype=torch.long, device=device),
@@ -189,78 +423,56 @@ def train_model(num_epochs=20, steps_per_epoch=100, num_objects=4, num_sensors=3
 
             edge_index, edge_attr = build_sparse_edges(full_x)
 
-            out, new_hidden_full, _ = model(full_x, node_type, full_sensor_id,
-                                            edge_index.to(device), edge_attr.to(device),
-                                            hidden_state)
+            out, new_hidden_full, alpha, existence_probs, existence_logits = model_forward(
+                model, full_x, node_type, full_sensor_id, edge_index, edge_attr, hidden_state
+            )
 
-            existence_logits = out[:, 6]
-            existence_probs = torch.sigmoid(existence_logits)
+            print(
+                f"Frame {frame_idx} | N={N}, num_tracks={num_tracks}, num_meas={num_meas}, existence_probs.mean()={existence_probs.mean().item():.4f}")
 
-            # Clean track management
-            selected_states = []
-            selected_hiddens = []
-            selected_logits = []
+            selected = manage_tracks(
+                active_tracks=active_tracks,
+                out=out,
+                new_hidden_full=new_hidden_full,
+                existence_probs=existence_probs,
+                existence_logits=existence_logits,
+                alpha=alpha,
+                edge_index=edge_index,
+                num_tracks=num_tracks,
+                num_meas=num_meas,
+                init_thresh=init_thresh,
+                coast_thresh=coast_thresh,
+                suppress_thresh=suppress_thresh,
+                del_exist=del_exist,
+                del_age=del_age,
+                track_cap=track_cap
+            )
 
-            if num_tracks > 0:
-                for i in range(num_tracks):
-                    if existence_probs[i] > 0.3:
-                        selected_states.append(out[i, :6])
-                        selected_hiddens.append(new_hidden_full[i])
-                        selected_logits.append(existence_logits[i])
+            active_tracks = selected
 
-            meas_offset = num_tracks
-            if num_meas > 0:
-                for i in range(num_meas):
-                    idx = meas_offset + i
-                    if existence_probs[idx] > 0.75:
-                        selected_states.append(out[idx, :6])
-                        selected_hiddens.append(new_hidden_full[idx])
-                        selected_logits.append(existence_logits[idx])
-
-            active_tracks = [{'state': s, 'hidden': h} 
-                             for s, h in zip(selected_states, selected_hiddens)]
-
-            # Supervised loss
-            gt_states_dev = gt_states.to(device)
-            num_gt = gt_states_dev.shape[0]
-
-            if len(selected_states) == 0:
+            # Get pred tensors
+            if len(selected) == 0:
                 pred_states = torch.empty((0, model.state_dim), device=device)
                 pred_logits = torch.empty((0,), device=device)
             else:
-                pred_states = torch.stack(selected_states)
-                pred_logits = torch.stack(selected_logits)
+                pred_states = torch.stack([tr['state'] for tr in selected])
+                pred_logits = torch.stack([tr['logit'] for tr in selected])
 
-            reg_loss = torch.tensor(0.0, device=device)
-            exist_matched_loss = torch.tensor(0.0, device=device)
-            exist_fp_loss = torch.tensor(0.0, device=device)
-            miss_loss = miss_penalty * num_gt
-
-            if pred_states.shape[0] > 0 and num_gt > 0:
-                cost_matrix = torch.cdist(pred_states[:, :3], gt_states_dev[:, :3])
-                cost_np = cost_matrix.cpu().numpy()
-                row_ind, col_ind = linear_sum_assignment(cost_np)
-
-                valid = cost_np[row_ind, col_ind] < match_gate
-                row_ind = row_ind[valid]
-                col_ind = col_ind[valid]
-                row_ind_torch = torch.from_numpy(row_ind).to(device)
-
-                if len(row_ind) > 0:
-                    reg_loss = F.mse_loss(pred_states[row_ind_torch], gt_states_dev[col_ind])
-                    exist_matched_loss = F.binary_cross_entropy_with_logits(
-                        pred_logits[row_ind_torch], torch.ones_like(pred_logits[row_ind_torch]))
-
-                matched_mask = torch.zeros(len(pred_logits), dtype=torch.bool, device=device)
-                matched_mask[row_ind_torch] = True
-                fp_mask = ~matched_mask
-                if fp_mask.any():
-                    exist_fp_loss = F.binary_cross_entropy_with_logits(
-                        pred_logits[fp_mask], torch.zeros_like(pred_logits[fp_mask]))
-
-                miss_loss = miss_penalty * (num_gt - len(row_ind))
-
-            loss = reg_loss + exist_matched_loss + exist_fp_loss + miss_loss
+            loss = compute_loss(
+                pred_states=pred_states,
+                pred_logits=pred_logits,
+                gt_states_dev=gt_states_dev,
+                num_gt=num_gt,
+                match_gate=match_gate,
+                miss_penalty=miss_penalty,
+                fp_mult=fp_mult,
+                out=out,
+                existence_logits=existence_logits,  # added
+                num_tracks=num_tracks,  # added
+                epoch=epoch,
+                num_meas=num_meas,
+                meas=meas  # for pseudo-aux
+            )
 
             optimizer.zero_grad()
             loss.backward()
@@ -269,8 +481,10 @@ def train_model(num_epochs=20, steps_per_epoch=100, num_objects=4, num_sensors=3
 
             epoch_losses.append(loss.item())
 
-        print(f"Epoch {epoch+1} complete | Avg loss: {np.mean(epoch_losses):.4f} | Final tracks: {len(active_tracks)} (GT: {num_objects})")
+        avg_loss = np.mean(epoch_losses)
+        avg_gt = np.mean(epoch_gt_counts)
+        print(f"Epoch {epoch+1} complete | Avg loss: {avg_loss:.4f} | Final tracks: {len(active_tracks)} "
+              f"(Avg GT unique: {avg_gt:.1f})")
 
 if __name__ == "__main__":
-    train_model(num_epochs=30, steps_per_epoch=120, num_objects=5, num_sensors=4) 
-
+    train_model(num_epochs=5, data_file="data/sim_realistic_003.jsonl")
