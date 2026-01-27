@@ -15,7 +15,7 @@ class RecurrentGATTrackerV2(nn.Module):
 
         # Feature encoder (kinematic + amplitude + type embedding)
         self.encoder = nn.Sequential(
-            nn.Linear(input_dim + 8, hidden_dim),  # +8 from type emb
+            nn.Linear(input_dim + 3 + 8, hidden_dim),  # +3 pos, +8 type emb
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim)
         )
@@ -54,7 +54,7 @@ class RecurrentGATTrackerV2(nn.Module):
         """
         # Embed node type and concatenate
         type_emb = self.type_emb(node_type)
-        h = torch.cat([x, type_emb], dim=-1)
+        h = torch.cat([x, pos, type_emb], dim=-1)
 
         # Encode
         h = self.encoder(h)
@@ -79,8 +79,28 @@ class RecurrentGATTrackerV2(nn.Module):
 
         # Decode
         out = self.decoder(new_hidden_full)
-
-        return out, new_hidden_tracks, [alpha1, alpha2]
+        
+        # Simple Residual Connection in Normalized Space:
+        # Both position and velocity predict DELTAS (corrections)
+        # next_pos = prev_pos + delta_pos
+        # next_vel = prev_vel + delta_vel
+        #
+        # x[:, :3] contains the input velocity
+        # out[:, :3] is the position DELTA
+        # out[:, 3:6] is the velocity DELTA
+        
+        input_vel = x[:, :3]  # Normalized velocity from features
+        
+        # Clone to avoid inplace mod errors
+        final_out = out.clone()
+        
+        # Position: prev_pos + delta
+        final_out[:, :3] = pos + out[:, :3]
+        
+        # Velocity: prev_vel + delta
+        final_out[:, 3:6] = input_vel + out[:, 3:6]
+        
+        return final_out, new_hidden_full, [alpha1, alpha2]
 
 
 def build_sparse_edges(pos, vel, max_dist=50000.0, k=8):

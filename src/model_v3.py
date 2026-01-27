@@ -37,7 +37,8 @@ class RecurrentGATTrackerV3(nn.Module):
             nn.Linear(hidden_dim, state_dim + 1)
         )
 
-        nn.init.constant_(self.decoder[-1].bias[state_dim], 5.0)  # ~0.993 initial prob
+        # Initialize existence bias to 0.0 for neutral starting point (~0.5 probability)
+        nn.init.constant_(self.decoder[-1].bias[state_dim], 0.0)
 
     def forward(self, x, node_type, sensor_id, edge_index, edge_attr, hidden_state=None):
         N = x.shape[0]
@@ -336,20 +337,12 @@ def compute_loss(
 
     loss = reg_loss + exist_matched_loss + exist_fp_loss + miss_loss + 2.0 * matched_exist_loss
 
-    # Strong dummy gradient path
-    dummy = out.sum() * 0.01
-    loss = loss + dummy
-
     # Pseudo-aux on measurements (amplitude > 40 → likely true)
     if num_meas > 0 and meas is not None and existence_logits is not None:
         meas_logits = existence_logits[num_tracks : num_tracks + num_meas]
         pseudo_target = torch.where(meas[:, 5] > 40.0, 0.8, 0.2).to(device)
         pseudo_aux = F.binary_cross_entropy_with_logits(meas_logits, pseudo_target)
         loss = loss + 3.0 * pseudo_aux
-
-    # Early bonus for predicting anything
-    if num_meas > 10 and epoch < 5 and pred_states.shape[0] == 0:
-        loss = loss - 2.0
 
     # Prevent extreme negative logits
     if existence_logits is not None:

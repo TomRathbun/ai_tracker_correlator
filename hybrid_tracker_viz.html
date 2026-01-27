@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hybrid Tracker Visualization</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 20px;
+            font-family: 'Segoe UI', Arial, sans-serif;
+            background: #1a1a1a;
+            color: #e0e0e0;
+        }
+
+        h1 {
+            text-align: center;
+            color: #4CAF50;
+            margin-bottom: 5px;
+        }
+
+        #container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        #canvas {
+            background: #0d1117;
+            border: 2px solid #30363d;
+            border-radius: 8px;
+            display: block;
+            margin: 20px auto;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+        }
+
+        #controls {
+            text-align: center;
+            padding: 20px;
+            background: #161b22;
+            border-radius: 8px;
+            margin: 20px auto;
+            max-width: 800px;
+        }
+
+        button {
+            background: #238636;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            margin: 5px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 600;
+            transition: background 0.2s;
+        }
+
+        button:hover {
+            background: #2ea043;
+        }
+
+        button:disabled {
+            background: #484f58;
+            cursor: not-allowed;
+        }
+
+        #info {
+            display: flex;
+            justify-content: space-around;
+            margin: 20px auto;
+            max-width: 800px;
+            background: #161b22;
+            padding: 15px;
+            border-radius: 8px;
+        }
+
+        .info-item {
+            text-align: center;
+        }
+
+        .info-label {
+            color: #8b949e;
+            font-size: 12px;
+            text-transform: uppercase;
+            margin-bottom: 5px;
+        }
+
+        .info-value {
+            color: #58a6ff;
+            font-size: 24px;
+            font-weight: bold;
+        }
+
+        #legend {
+            display: flex;
+            justify-content: center;
+            gap: 30px;
+            margin: 20px auto;
+            flex-wrap: wrap;
+        }
+
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .legend-color {
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+        }
+
+        #slider {
+            width: 100%;
+            margin: 15px 0;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="container">
+        <h1>🛰️ Hybrid Tracker Visualization</h1>
+        <p style="text-align: center; color: #8b949e;">Multi-Sensor Fusion with Learned Association</p>
+
+        <div id="legend">
+            <div class="legend-item">
+                <div class="legend-color" style="background: #ff6b6b;"></div>
+                <span>Measurements (Sensor 0)</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: #4ecdc4;"></div>
+                <span>Measurements (Sensor 1)</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: #ffe66d;"></div>
+                <span>Measurements (Sensor 2)</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: #45b7d1; border: 2px solid #fff;"></div>
+                <span>Fused Tracks</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: #f7b731; opacity: 0.3;"></div>
+                <span>Ground Truth</span>
+            </div>
+        </div>
+
+        <canvas id="canvas" width="1200" height="800"></canvas>
+
+        <div id="info">
+            <div class="info-item">
+                <div class="info-label">Frame</div>
+                <div class="info-value" id="frameNum">0 / 0</div>
+            </div>
+            <div class="info-item">
+                <div class="info-label">Measurements</div>
+                <div class="info-value" id="measCount">0</div>
+            </div>
+            <div class="info-item">
+                <div class="info-label">Fused Tracks</div>
+                <div class="info-value" id="trackCount">0</div>
+            </div>
+            <div class="info-item">
+                <div class="info-label">Ground Truth</div>
+                <div class="info-value" id="gtCount">0</div>
+            </div>
+        </div>
+
+        <div id="controls">
+            <input type="range" id="slider" min="0" max="0" value="0" step="1">
+            <div>
+                <button id="firstBtn" onclick="goToFirst()">⏮ First</button>
+                <button id="prevBtn" onclick="stepBackward()">⏪ Prev</button>
+                <button id="playBtn" onclick="togglePlay()">▶ Play</button>
+                <button id="nextBtn" onclick="stepForward()">Next ⏩</button>
+                <button id="lastBtn" onclick="goToLast()">Last ⏭</button>
+            </div>
+            <div style="margin-top: 15px;">
+                <label>Speed: </label>
+                <input type="range" id="speedSlider" min="100" max="1000" value="500" step="100">
+                <span id="speedLabel">500ms</span>
+            </div>
+        </div>
+    </div>
+
+    <script src="hybrid_tracker_viz_data.js"></script>
+    <script>
+        let currentFrame = 0;
+        let isPlaying = false;
+        let playInterval = null;
+        let playSpeed = 500;
+
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+
+        // Load data from embedded script
+        const data = typeof VISUALIZATION_DATA !== 'undefined' ? VISUALIZATION_DATA : [];
+
+        if (data.length > 0) {
+            document.getElementById('slider').max = data.length - 1;
+            renderFrame(0);
+        } else {
+            ctx.fillStyle = '#ff6b6b';
+            ctx.font = '20px Arial';
+            ctx.fillText('Error: No visualization data loaded', 50, 50);
+        }
+
+        function renderFrame(frameIdx) {
+            if (!data || data.length === 0) return;
+
+            currentFrame = Math.max(0, Math.min(frameIdx, data.length - 1));
+            const frame = data[currentFrame];
+
+            // Clear canvas
+            ctx.fillStyle = '#0d1117';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            // Find bounds
+            let minX = Infinity, maxX = -Infinity;
+            let minY = Infinity, maxY = -Infinity;
+
+            data.forEach(f => {
+                [...f.measurements, ...f.fused_tracks, ...f.ground_truth].forEach(p => {
+                    minX = Math.min(minX, p.x);
+                    maxX = Math.max(maxX, p.x);
+                    minY = Math.min(minY, p.y);
+                    maxY = Math.max(maxY, p.y);
+                });
+            });
+
+            const padding = 50;
+            const scaleX = (canvas.width - 2 * padding) / (maxX - minX);
+            const scaleY = (canvas.height - 2 * padding) / (maxY - minY);
+            const scale = Math.min(scaleX, scaleY);
+
+            function toCanvas(x, y) {
+                return [
+                    padding + (x - minX) * scale,
+                    canvas.height - (padding + (y - minY) * scale)
+                ];
+            }
+
+            // Draw grid
+            ctx.strokeStyle = '#21262d';
+            ctx.lineWidth = 1;
+            for (let i = 0; i <= 10; i++) {
+                const x = padding + i * (canvas.width - 2 * padding) / 10;
+                ctx.beginPath();
+                ctx.moveTo(x, padding);
+                ctx.lineTo(x, canvas.height - padding);
+                ctx.stroke();
+
+                const y = padding + i * (canvas.height - 2 * padding) / 10;
+                ctx.beginPath();
+                ctx.moveTo(padding, y);
+                ctx.lineTo(canvas.width - padding, y);
+                ctx.stroke();
+            }
+
+            // Draw ground truth
+            frame.ground_truth.forEach(gt => {
+                const [cx, cy] = toCanvas(gt.x, gt.y);
+                ctx.fillStyle = 'rgba(247, 183, 49, 0.3)';
+                ctx.beginPath();
+                ctx.arc(cx, cy, 12, 0, 2 * Math.PI);
+                ctx.fill();
+                ctx.strokeStyle = 'rgba(247, 183, 49, 0.6)';
+                ctx.lineWidth = 2;
+                ctx.stroke();
+            });
+
+            frame.measurements.forEach(m => {
+                const [cx, cy] = toCanvas(m.x, m.y);
+                let color = '#7f8c8d'; // Default grey
+                if (m.sensor_id === 0) color = '#ff6b6b';
+                else if (m.sensor_id === 1) color = '#4ecdc4';
+                else if (m.sensor_id === 2) color = '#ffe66d';
+                ctx.fillStyle = color;
+                ctx.beginPath();
+                ctx.arc(cx, cy, 4, 0, 2 * Math.PI);
+                ctx.fill();
+            });
+
+            // Draw fused tracks
+            frame.fused_tracks.forEach(t => {
+                const [cx, cy] = toCanvas(t.x, t.y);
+                ctx.fillStyle = '#45b7d1';
+                ctx.beginPath();
+                ctx.arc(cx, cy, 8, 0, 2 * Math.PI);
+                ctx.fill();
+                ctx.strokeStyle = '#fff';
+                ctx.lineWidth = 2;
+                ctx.stroke();
+
+                // Label
+                ctx.fillStyle = '#fff';
+                ctx.font = '12px Arial';
+                ctx.fillText(`T${t.track_id}`, cx + 10, cy - 10);
+            });
+
+            // Update info
+            document.getElementById('frameNum').textContent = `${currentFrame + 1} / ${data.length}`;
+            document.getElementById('measCount').textContent = frame.measurements.length;
+            document.getElementById('trackCount').textContent = frame.fused_tracks.length;
+            document.getElementById('gtCount').textContent = frame.ground_truth.length;
+            document.getElementById('slider').value = currentFrame;
+        }
+
+        function togglePlay() {
+            isPlaying = !isPlaying;
+            const playBtn = document.getElementById('playBtn');
+
+            if (isPlaying) {
+                playBtn.textContent = '⏸ Pause';
+                playInterval = setInterval(() => {
+                    if (currentFrame < data.length - 1) {
+                        renderFrame(currentFrame + 1);
+                    } else {
+                        togglePlay();
+                    }
+                }, playSpeed);
+            } else {
+                playBtn.textContent = '▶ Play';
+                if (playInterval) {
+                    clearInterval(playInterval);
+                }
+            }
+        }
+
+        function stepForward() {
+            if (currentFrame < data.length - 1) renderFrame(currentFrame + 1);
+        }
+
+        function stepBackward() {
+            if (currentFrame > 0) renderFrame(currentFrame - 1);
+        }
+
+        function goToFirst() {
+            renderFrame(0);
+        }
+
+        function goToLast() {
+            renderFrame(data.length - 1);
+        }
+
+        document.getElementById('slider').addEventListener('input', (e) => {
+            renderFrame(parseInt(e.target.value));
+        });
+
+        document.getElementById('speedSlider').addEventListener('input', (e) => {
+            playSpeed = parseInt(e.target.value);
+            document.getElementById('speedLabel').textContent = playSpeed + 'ms';
+            if (isPlaying) {
+                togglePlay();
+                togglePlay();
+            }
+        });
+
+        // Keyboard controls
+        document.addEventListener('keydown', (e) => {
+            if (e.key === ' ') {
+                e.preventDefault();
+                togglePlay();
+            } else if (e.key === 'ArrowRight') {
+                stepForward();
+            } else if (e.key === 'ArrowLeft') {
+                stepBackward();
+            }
+        });
+    </script>
+</body>
+
+</html>

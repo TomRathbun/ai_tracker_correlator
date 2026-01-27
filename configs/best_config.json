@@ -1,0 +1,52 @@
+{
+  "model": {
+    "num_sensors": 3,
+    "hidden_dim": 256,
+    "state_dim": 6,
+    "num_heads": 8,
+    "edge_dim": 6,
+    "emb_dim": 8
+  },
+  "training": {
+    "num_epochs": 30,
+    "learning_rate": 0.005082772116058193,
+    "weight_decay": 9.985251110342874e-06,
+    "batch_size": 1,
+    "grad_clip": 1.0,
+    "use_scheduler": true,
+    "scheduler_patience": 3,
+    "scheduler_factor": 0.5,
+    "early_stopping_patience": 10,
+    "save_every": 5,
+    "checkpoint_dir": "checkpoints"
+  },
+  "tracking": {
+    "init_thresh_early": 0.25,
+    "init_thresh_late": 0.3388423891088584,
+    "coast_thresh_early": 0.1,
+    "coast_thresh_late": 0.10402737118098067,
+    "suppress_thresh_early": 1.0,
+    "suppress_thresh_late": 0.8,
+    "del_exist": 0.04791256364989824,
+    "del_age": 6,
+    "track_cap": 150,
+    "max_edge_dist": 50334.739050447344,
+    "k_neighbors": 16
+  },
+  "loss": {
+    "match_gate": 12622.252849770644,
+    "miss_penalty": 6.1251552642149685,
+    "fp_mult_early": 0.2,
+    "fp_mult_late": 0.8269556564009157,
+    "pseudo_aux_weight": 3.0,
+    "matched_exist_weight": 2.0,
+    "logit_reg_weight": 0.001
+  },
+  "data": {
+    "data_file": "data/sim_realistic_003.jsonl",
+    "train_split": 0.7,
+    "val_split": 0.15,
+    "test_split": 0.15,
+    "seed": 42
+  }
+}
