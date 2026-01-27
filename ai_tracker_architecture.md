@@ -57,21 +57,21 @@ Figure 1 visualizes the architecture:
 #### Clutter Classifier (MLP)
 The clutter classifier is a 3-layer MLP processing unitary features \( \mathbf{f} = [amp, v_x, v_y, v_z, x_{norm}, y_{norm}, z_{norm}, type] \):
 
-\[
+$$
 \mathbf{h_1} = \text{ReLU}(\text{BN}(W_1 \mathbf{f} + b_1))
-\]
+$$
 
-\[
+$$
 \mathbf{h_2} = \text{ReLU}(W_2 \mathbf{h_1} + b_2)
-\]
+$$
 
-\[
+$$
 \text{logit} = W_3 \mathbf{h_2} + b_3
-\]
+$$
 
-\[
+$$
 P(\text{clutter}) = \sigma(\text{logit})
-\]
+$$
 
 Trained with BCE loss, weighted for imbalance.
 
@@ -85,33 +85,33 @@ Forward pass similar to clutter MLP, outputting \( P(\text{same}) = \sigma(\text
 Loss: Weighted BCE.
 
 #### GNN Tracker (GAT + GRU)
-Graph: Nodes with features \( \mathbf{n} = [x,y,z,v_x,v_y,v_z,amp,type,m_{3a},m_s] \), edges with \( \mathbf{e} = [prob, dist/1000, \dots] \).
+Graph: Nodes with features $ \mathbf{n} = [x,y,z,v_x,v_y,v_z,amp,type,m_{3a},m_s] $, edges with $ \mathbf{e} = [prob, dist/1000, \dots] $.
 
 GAT attention:
 
-\[
+$$
 \mathbf{wh} = W \mathbf{h}
-\]
+$$
 
-\[
+$$
 \mathbf{e'} = \text{LeakyReLU}(A [\mathbf{wh_{src}} || \mathbf{wh_{dst}} || \mathbf{e}])
-\]
+$$
 
-\[
+$$
 \alpha = \text{softmax}(\mathbf{e'})
-\]
+$$
 
 Aggregation: Weighted sum of neighbors.
 
 GRU update:
 
-\[
+$$
 \mathbf{h_t} = \text{GRU}(\mathbf{h_{gat}}, \mathbf{h_{t-1}})
-\]
+$$
 
-State output: \( \Delta \mathbf{s} = \text{Linear}(\mathbf{h_t}) \), added residually.
+State output: $ \Delta \mathbf{s} = \text{Linear}(\mathbf{h_t}) $, added residually.
 
-Existence: \( P(\text{exist}) = \sigma(\text{Linear}(\mathbf{h_t})) \).
+Existence: $ P(\text{exist}) = \sigma(\text{Linear}(\mathbf{h_t})) $.
 
 Loss: MSE on states + BCE on existence.
 
