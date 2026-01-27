@@ -38,14 +38,14 @@ Figure 1 visualizes the architecture:
     | Inputs          | --> | Transform to      | --> | Filter (MLP)   |
     | (Asterix msgs)  |     | Cartesian         |     |                |
     +-----------------+     +-------------------+     +----------------+
-                                                     |
-                                                     v
+                                                             |
+                                                             v
     +-----------------+     +-------------------+     +----------------+
     | Dual Pairwise   | <-- | Graph             | <-- | GNN Tracker    |
     | Classifiers     |     | Construction      |     | (GAT + GRU)    |
     +-----------------+     +-------------------+     +----------------+
-                                                     |
-                                                     v
+            |
+            v
     +-----------------+     +-------------------+
     | Track Management| --> | Correlated Output |
     | (M/N Initiation)|     | Tracks            |
