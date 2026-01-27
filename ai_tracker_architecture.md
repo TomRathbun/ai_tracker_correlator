@@ -85,7 +85,7 @@ Forward pass similar to clutter MLP, outputting \( P(\text{same}) = \sigma(\text
 Loss: Weighted BCE.
 
 #### GNN Tracker (GAT + GRU)
-Graph: Nodes with features $ \mathbf{n} = [x,y,z,v_x,v_y,v_z,amp,type,m_{3a},m_s] $, edges with $ \mathbf{e} = [prob, dist/1000, \dots] $.
+Graph: Nodes with features \( \mathbf{n} = [x,y,z,v_x,v_y,v_z,amp,type,m_{3a},m_s] \), edges with \( \mathbf{e} = [prob, dist/1000, \dots] \).
 
 GAT attention:
 
@@ -109,9 +109,9 @@ $$
 \mathbf{h_t} = \text{GRU}(\mathbf{h_{gat}}, \mathbf{h_{t-1}})
 $$
 
-State output: $ \Delta \mathbf{s} = \text{Linear}(\mathbf{h_t}) $, added residually.
+State output: \( \Delta \mathbf{s} = \text{Linear}(\mathbf{h_t}) \), added residually.
 
-Existence: $ P(\text{exist}) = \sigma(\text{Linear}(\mathbf{h_t})) $.
+Existence: \( P(\text{exist}) = \sigma(\text{Linear}(\mathbf{h_t})) \).
 
 Loss: MSE on states + BCE on existence.
 
