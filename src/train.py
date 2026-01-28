@@ -40,11 +40,11 @@ def collate_fn(batch_list):
         is_beacon = (m['type'] == 'beacon')
         
         row = [
-            m['x'], m['y'], m['z'],
-            m['vx'], m['vy'],
+            m.get('x', 0.0), m.get('y', 0.0), m.get('z', 0.0),
+            m.get('vx', 0.0), m.get('vy', 0.0),
             0.0 if is_beacon else m.get('amplitude', 0.0),
             float(m.get('identity_code', 0)) if is_beacon else 0.0,
-            float(m['sensor_id'])
+            float(m.get('sensor_id', 0))
         ]
         tensor_data.append(row)
         

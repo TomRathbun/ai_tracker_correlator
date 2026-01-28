@@ -19,3 +19,13 @@ build/
 # IDE
 .vscode/
 .idea/
+
+# Experiments & Checkpoints
+mlruns/
+runs/
+checkpoints/
+dashboard_checkpoints/
+evaluation_results/
+optimization_reports/
+*.jsonl
+*.pt

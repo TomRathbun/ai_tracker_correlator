@@ -19,14 +19,18 @@ from src.model_v3 import (
 )
 from src.metrics import TrackingMetrics, format_metrics
 from src.config import ExperimentConfig
+import mlflow
+import mlflow.pytorch
+from torchviz import make_dot
 
 
 class Trainer:
     """Enhanced trainer with validation, checkpointing, and metrics."""
     
-    def __init__(self, config: ExperimentConfig, device: torch.device = None):
+    def __init__(self, config: ExperimentConfig, device: torch.device = None, mlflow_tags: Dict[str, str] = None):
         self.config = config
         self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.mlflow_tags = mlflow_tags or {}
         
         # Create directories
         self.checkpoint_dir = Path(config.training.checkpoint_dir)
@@ -138,7 +142,8 @@ class Trainer:
             # Ground truth
             gt_tracks = frame_data.get('gt_tracks', [])
             gt_states_dev = torch.tensor(
-                [[gt['x'], gt['y'], gt['z'], gt['vx'], gt['vy'], gt['vz']] for gt in gt_tracks],
+                [[gt.get('x', 0.0), gt.get('y', 0.0), gt.get('z', 0.0), 
+                  gt.get('vx', 0.0), gt.get('vy', 0.0), gt.get('vz', 0.0)] for gt in gt_tracks],
                 dtype=torch.float32, device=self.device
             )
             num_gt = gt_states_dev.shape[0]
@@ -247,7 +252,8 @@ class Trainer:
                 # Ground truth
                 gt_tracks = frame_data.get('gt_tracks', [])
                 gt_states_dev = torch.tensor(
-                    [[gt['x'], gt['y'], gt['z'], gt['vx'], gt['vy'], gt['vz']] for gt in gt_tracks],
+                    [[gt.get('x', 0.0), gt.get('y', 0.0), gt.get('z', 0.0), 
+                      gt.get('vx', 0.0), gt.get('vy', 0.0), gt.get('vz', 0.0)] for gt in gt_tracks],
                     dtype=torch.float32, device=self.device
                 )
                 num_gt = gt_states_dev.shape[0]
@@ -392,6 +398,20 @@ class Trainer:
                 if isinstance(value, (int, float)):
                     self.writer.add_scalar(f'Metrics/{key}', value, epoch)
             
+            # Log to MLflow if active
+            if mlflow.active_run():
+                # Log with Title Case to match dashboard and evaluation expectations
+                mlflow.log_metric('MOTA', val_metrics.get('mota', 0.0), step=epoch)
+                mlflow.log_metric('MOTP', val_metrics.get('motp', 15000.0), step=epoch)
+                mlflow.log_metric('Precision', val_metrics.get('precision', 0.0), step=epoch)
+                mlflow.log_metric('Recall', val_metrics.get('recall', 0.0), step=epoch)
+                mlflow.log_metric('F1', val_metrics.get('f1', 0.0), step=epoch)
+                
+                # Log other metrics as well
+                for key, value in val_metrics.items():
+                    if key not in ['mota', 'motp', 'precision', 'recall', 'f1'] and isinstance(value, (int, float)):
+                        mlflow.log_metric(key.title(), value, step=epoch)
+            
             # Print summary
             print(f"\nEpoch {epoch+1}/{self.config.training.num_epochs}")
             print(f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
@@ -403,8 +423,8 @@ class Trainer:
             
             # Check for improvement
             is_best = False
-            if val_metrics['MOTA'] > self.best_val_mota:
-                self.best_val_mota = val_metrics['MOTA']
+            if val_metrics['mota'] > self.best_val_mota:
+                self.best_val_mota = val_metrics['mota']
                 self.best_val_loss = val_loss
                 self.epochs_without_improvement = 0
                 is_best = True
@@ -438,7 +458,7 @@ class Trainer:
         axes[0, 0].grid(True)
         
         # MOTA
-        mota_values = [m['MOTA'] for m in self.history['val_metrics']]
+        mota_values = [m['mota'] for m in self.history['val_metrics']]
         axes[0, 1].plot(mota_values)
         axes[0, 1].set_xlabel('Epoch')
         axes[0, 1].set_ylabel('MOTA')

@@ -1,0 +1,31 @@
+# Example Pipeline Configuration
+# This YAML file demonstrates the modular pipeline configuration
+
+clutter_filter:
+  enabled: true
+  threshold: 0.5
+  model_path: "checkpoints/clutter_classifier.pt"
+
+pairwise:
+  psr_psr_threshold: 0.35
+  ssr_any_threshold: 0.5
+  psr_model_path: "checkpoints/pairwise_psr_psr.pt"
+  ssr_model_path: "checkpoints/pairwise_ssr_any.pt"
+
+state_updater:
+  type: "gnn"  # Options: "gnn", "kalman", "hybrid"
+  gnn_model_path: "checkpoints/gnn_tracker.pt"
+  process_noise: 1.0
+  measurement_noise: 1.0
+
+track_manager:
+  min_hits: 5
+  max_age: 5
+  association_threshold: 0.35
+
+# Experiment metadata
+experiment_name: "gnn_hybrid_baseline"
+tags:
+  architecture: "gnn_hybrid"
+  dataset: "sim_hetero"
+  purpose: "feasibility_test"

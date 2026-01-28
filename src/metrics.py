@@ -3,6 +3,7 @@ Tracking evaluation metrics: MOTA, MOTP, ID switches, etc.
 """
 import torch
 import numpy as np
+import traceback
 from scipy.optimize import linear_sum_assignment
 from typing import List, Dict, Tuple
 
@@ -28,19 +29,56 @@ class TrackingMetrics:
         # For ID switch tracking
         self.prev_assignments = {}  # gt_id -> pred_idx
     
-    def update(self, pred_states: torch.Tensor, gt_states: torch.Tensor, 
+    def _dicts_to_tensor(self, data: List[Dict], keys: List[str] = ['x', 'y', 'z', 'vx', 'vy', 'vz']) -> torch.Tensor:
+        """Convert a list of dictionaries to a PyTorch tensor."""
+        if not data:
+            return torch.empty((0, len(keys)), dtype=torch.float32)
+        
+        # If it's already a tensor, return it (handle nested tensors if needed)
+        if isinstance(data, torch.Tensor):
+            return data
+            
+        tensor_data = []
+        for d in data:
+            # Case 1: Dict has a 'state' key which is a tensor or array
+            if 'state' in d and isinstance(d['state'], (torch.Tensor, np.ndarray)):
+                s = d['state']
+                if isinstance(s, torch.Tensor):
+                    s = s.detach().cpu().numpy()
+                # Ensure it's flattened and matches the expected length
+                tensor_data.append(s.flatten()[:len(keys)])
+            # Case 2: Dict has individual keys like 'x', 'y', 'z'
+            else:
+                tensor_data.append([float(d.get(k, 0.0)) for k in keys])
+                
+        return torch.tensor(tensor_data, dtype=torch.float32)
+
+    def update(self, pred_states: List[Dict], gt_states: List[Dict], 
                pred_ids: List[int] = None):
         """
         Update metrics for one frame.
         
         Args:
-            pred_states: [N_pred, 6] predicted track states (x,y,z,vx,vy,vz)
-            gt_states: [N_gt, 6] ground truth states
-            pred_ids: Optional list of predicted track IDs for ID switch tracking
+            pred_states: List of dicts or [N_pred, 6] tensor
+            gt_states: List of dicts or [N_gt, 6] tensor
+            pred_ids: Optional list of predicted track IDs
         """
+        # Convert lists to tensors if necessary
+        if isinstance(pred_states, list):
+            pred_states = self._dicts_to_tensor(pred_states)
+        if isinstance(gt_states, list):
+            gt_states = self._dicts_to_tensor(gt_states)
+            
         self.num_frames += 1
-        num_pred = pred_states.shape[0]
-        num_gt = gt_states.shape[0]
+        try:
+            num_pred = pred_states.shape[0]
+            num_gt = gt_states.shape[0]
+        except AttributeError as e:
+            print(f"ERROR in metrics.update: {e}")
+            print(f"pred_states type: {type(pred_states)}")
+            print(f"gt_states type: {type(gt_states)}")
+            traceback.print_exc()
+            raise e
         
         self.total_gt += num_gt
         self.total_pred += num_pred
@@ -90,8 +128,8 @@ class TrackingMetrics:
         """Compute final metrics."""
         if self.num_frames == 0:
             return {
-                'MOTA': 0.0,
-                'MOTP': 0.0,
+                'mota': 0.0,
+                'motp': 0.0,
                 'precision': 0.0,
                 'recall': 0.0,
                 'f1': 0.0,
@@ -110,7 +148,7 @@ class TrackingMetrics:
         if self.total_matches > 0:
             motp = self.total_distance / self.total_matches
         else:
-            motp = float('inf')
+            motp = 15000.0
         
         # Precision and Recall
         precision = self.total_matches / self.total_pred if self.total_pred > 0 else 0.0
@@ -122,9 +160,9 @@ class TrackingMetrics:
         else:
             f1 = 0.0
         
-        return {
-            'MOTA': mota,
-            'MOTP': motp,
+        results = {
+            'mota': mota,
+            'motp': motp,
             'precision': precision,
             'recall': recall,
             'f1': f1,
@@ -132,16 +170,17 @@ class TrackingMetrics:
             'fp_rate': self.total_fp / self.num_frames,
             'fn_rate': self.total_fn / self.num_frames,
             'total_matches': self.total_matches,
-            'total_fp': self.total_fp,
-            'total_fn': self.total_fn,
+            'fp': self.total_fp,
+            'fn': self.total_fn,
         }
+        return results
 
 
 def format_metrics(metrics: Dict[str, float]) -> str:
     """Format metrics for display."""
     return (
-        f"MOTA: {metrics['MOTA']:.3f} | "
-        f"MOTP: {metrics['MOTP']:.1f} | "
+        f"MOTA: {metrics['mota']:.3f} | "
+        f"MOTP: {metrics['motp']:.1f} | "
         f"Precision: {metrics['precision']:.3f} | "
         f"Recall: {metrics['recall']:.3f} | "
         f"F1: {metrics['f1']:.3f} | "

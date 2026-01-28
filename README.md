@@ -12,6 +12,17 @@ A deep learning-based multi-target tracker using Graph Attention Networks (GAT) 
 - **Hyperparameter optimization** using Optuna
 - **Rich visualizations** for attention weights, track predictions, and training progress
 
+## 🆕 New: Modular Research Platform
+
+- **🏗️ Modular Pipeline**: Sensor-aware architecture with PSR/SSR branching
+- **🔄 Hybrid State Estimation**: GNN with Kalman filter fallback
+- **📊 MLflow Integration**: Experiment tracking with custom metrics (ID switches, FP/frame)
+- **🎛️ Interactive Dashboard**: Streamlit interface with one-click ablations
+- **🔬 Data Augmentation**: SSR ID dropouts, noise injection, sensor bias
+- **✅ Pydantic Validation**: Type-safe configuration management
+
+See [TRAINING.md](TRAINING.md) for the new training workflow.
+
 ## Installation
 
 ```bash

@@ -167,13 +167,13 @@ def frame_to_tensors(frame_data: Dict, device: torch.device) -> Tuple[torch.Tens
 
     for m in measurements:
         row = [
-            m['x'], m['y'], m['z'],
-            m['vx'], m['vy'],
+            m.get('x', 0.0), m.get('y', 0.0), m.get('z', 0.0),
+            m.get('vx', 0.0), m.get('vy', 0.0),
             m.get('amplitude', 0.0),
             float(m.get('identity_code', 0)) if 'identity_code' in m else 0.0
         ]
         meas_list.append(row)
-        sensor_ids_list.append(m['sensor_id'])
+        sensor_ids_list.append(m.get('sensor_id', 0))
 
     if not meas_list:
         return torch.empty((0, 7), device=device), torch.empty((0,), dtype=torch.long, device=device)
@@ -208,8 +208,18 @@ def build_full_input(active_tracks: List[Dict], meas: torch.Tensor, meas_sensor_
 
 # 4. Model forward + existence probs
 def model_forward(model, full_x, node_type, full_sensor_id, edge_index, edge_attr, hidden_state):
-    out, new_hidden_full, alpha = model(full_x, node_type, full_sensor_id, edge_index, edge_attr, hidden_state)
-    existence_logits = out[:, 6]
+    raw_out, new_hidden_full, alpha = model(full_x, node_type, full_sensor_id, edge_index, edge_attr, hidden_state)
+    
+    # Residual logic: Add input state to model's predicted deltas
+    # full_x features [0:6] are [x, y, z, vx, vy, vz]
+    state_delta = raw_out[:, :6]
+    existence_logits = raw_out[:, 6]
+    
+    updated_state = full_x[:, :6] + state_delta
+    
+    # Reassemble output
+    out = torch.cat([updated_state, existence_logits.unsqueeze(-1)], dim=-1)
+    
     existence_probs = torch.sigmoid(existence_logits)
     return out, new_hidden_full, alpha, existence_probs, existence_logits
 
@@ -313,7 +323,7 @@ def compute_loss(
         row_ind_torch = torch.from_numpy(row_ind).to(device)
 
         if len(row_ind) > 0:
-            reg_loss = F.mse_loss(pred_states[row_ind_torch], gt_states_dev[col_ind])
+            reg_loss = F.smooth_l1_loss(pred_states[row_ind_torch], gt_states_dev[col_ind])
             exist_matched_loss = F.binary_cross_entropy_with_logits(
                 pred_logits[row_ind_torch],
                 torch.ones_like(pred_logits[row_ind_torch])
@@ -397,7 +407,8 @@ def train_model(num_epochs=30, data_file="data/sim_realistic_003.jsonl"):
 
             gt_tracks = frame_data.get('gt_tracks', [])
             gt_states_dev = torch.tensor(
-                [[gt['x'], gt['y'], gt['z'], gt['vx'], gt['vy'], gt['vz']] for gt in gt_tracks],
+                [[gt.get('x', 0.0), gt.get('y', 0.0), gt.get('z', 0.0), 
+                  gt.get('vx', 0.0), gt.get('vy', 0.0), gt.get('vz', 0.0)] for gt in gt_tracks],
                 dtype=torch.float32, device=device
             )
             num_gt = gt_states_dev.shape[0]
