@@ -24,6 +24,7 @@ dependencies = [
     "pydantic>=2.7.0",
     "fpdf2>=2.7.0",
     "onnx>=1.16.0",
+    "seaborn>=0.13.2",
 ]
 
 [[tool.uv.index]]

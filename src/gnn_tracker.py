@@ -22,18 +22,27 @@ class GATLayer(nn.Module):
         edge_attr: [E, edge_dim]
         """
         wh = self.w(h) # [N, out_dim]
+        outSize = wh.size(0)
         
         row, col = edge_index
         # Concatenate src, dst, and edge features
         a_input = torch.cat([wh[row], wh[col], edge_attr], dim=-1)
         e = F.leaky_relu(self.a(a_input)) # [E, 1]
         
-        # Softmax over neighbors
-        alpha = torch.exp(e)
+        # Softmax over neighbors (numerically stable)
+        # Find max for each node (row)
+        max_e = torch.zeros((outSize, 1), device=wh.device)
+        # Scatter max isn't native, but we can do it with index_reduce_ or similar
+        # For simplicity, we'll find max manually
+        max_e.fill_(-1e9)
+        max_e.index_reduce_(0, row, e, reduce='amax', include_self=False)
+        
+        # Sub max and exp
+        e_stable = e - max_e[row]
+        alpha = torch.exp(e_stable)
         
         # Aggregate using vectorized index_add_
         weighted_wh = alpha * wh[col]
-        outSize = wh.size(0)
         
         # Sum neighbor features
         out = torch.zeros((outSize, wh.size(1)), device=wh.device)

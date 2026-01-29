@@ -168,9 +168,8 @@ def frame_to_tensors(frame_data: Dict, device: torch.device) -> Tuple[torch.Tens
     for m in measurements:
         row = [
             m.get('x', 0.0), m.get('y', 0.0), m.get('z', 0.0),
-            m.get('vx', 0.0), m.get('vy', 0.0),
-            m.get('amplitude', 0.0),
-            float(m.get('identity_code', 0)) if 'identity_code' in m else 0.0
+            m.get('vx', 0.0), m.get('vy', 0.0), m.get('vz', 0.0),
+            m.get('amplitude', 0.0)
         ]
         meas_list.append(row)
         sensor_ids_list.append(m.get('sensor_id', 0))
@@ -187,7 +186,19 @@ def build_full_input(active_tracks: List[Dict], meas: torch.Tensor, meas_sensor_
                      num_sensors: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
     """Combine persistent tracks + new measurements into full_x, full_sensor_id, hidden_state, num_tracks"""
     if active_tracks:
-        track_kin = torch.stack([tr['state'] for tr in active_tracks])
+        track_kin_list = []
+        for tr in active_tracks:
+            if 'state_tensor' in tr:
+                track_kin_list.append(tr['state_tensor'])
+            else:
+                # Reconstruct from scalar fields if state_tensor is missing (e.g. from KF mode)
+                s = torch.tensor([
+                    tr.get('x', 0.0), tr.get('y', 0.0), tr.get('z', 0.0),
+                    tr.get('vx', 0.0), tr.get('vy', 0.0), tr.get('vz', 0.0)
+                ], device=device)
+                track_kin_list.append(s)
+        
+        track_kin = torch.stack(track_kin_list)
         track_amp = torch.zeros(len(active_tracks), 1, device=device)
         track_features = torch.cat([track_kin, track_amp], dim=1)
 
@@ -243,20 +254,32 @@ def manage_tracks(active_tracks, out, new_hidden_full, existence_probs, existenc
 
     selected = []
 
-    # Coast existing with bonus when few measurements
+    # Coast/Update existing
     if num_tracks > 0:
         coast_boost = 0.5 if num_meas < 30 else 0.0  # help coasting in sparse frames
         for i in range(num_tracks):
             prob = existence_probs[i] + coast_boost
             if prob > coast_thresh:
-                age = active_tracks[i].get('age', 0) + 1
-                age = 0 if prob > 0.8 else age  # reset on strong update
-                selected.append({
-                    'state': out[i, :6].detach(),
-                    'hidden': new_hidden_full[i].detach(),
-                    'logit': existence_logits[i],
-                    'age': age
-                })
+                track = active_tracks[i].copy()
+                track['state_tensor'] = out[i, :6].detach()
+                track['hidden'] = new_hidden_full[i].detach()
+                track['logit'] = existence_logits[i]
+                
+                # Check if it was updated by a measurement
+                # Simple check: was the probability strong?
+                # Lowered from 0.8 for legacy GNN compatibility (which peaks around 0.6-0.7)
+                if existence_probs[i] > 0.4:
+                    track['age'] = 0
+                    track['hits'] = track.get('hits', 0) + 1
+                else:
+                    track['age'] = track.get('age', 0) + 1
+                
+                # Sync tensor state to x,y,z if needed for metrics
+                s = track['state_tensor']
+                track['x'], track['y'], track['z'] = s[0].item(), s[1].item(), s[2].item()
+                track['vx'], track['vy'], track['vz'] = s[3].item(), s[4].item(), s[5].item()
+                
+                selected.append(track)
 
     # Initiate new
     if num_meas > 0:
@@ -264,11 +287,16 @@ def manage_tracks(active_tracks, out, new_hidden_full, existence_probs, existenc
             idx = meas_offset + i
             prob = existence_probs[idx]
             if prob > init_thresh and not attn_suppress[i]:
+                s = out[idx, :6].detach()
                 selected.append({
-                    'state': out[idx, :6].detach(),
+                    'state_tensor': s,
+                    'x': s[0].item(), 'y': s[1].item(), 'z': s[2].item(),
+                    'vx': s[3].item(), 'vy': s[4].item(), 'vz': s[5].item(),
                     'hidden': new_hidden_full[idx].detach(),
                     'logit': existence_logits[idx],
-                    'age': 0
+                    'age': 0,
+                    'hits': 1,
+                    'is_new': True
                 })
 
     # Softer deletion: keep young tracks even if low prob

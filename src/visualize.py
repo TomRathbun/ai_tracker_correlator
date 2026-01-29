@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Circle
 import matplotlib.animation as animation
 from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 import seaborn as sns
 
 
@@ -16,7 +16,8 @@ def visualize_attention_weights(
     attention_weights: torch.Tensor,
     positions: torch.Tensor,
     num_tracks: int,
-    save_path: str = "attention_viz.png"
+    save_path: Optional[str] = "attention_viz.png",
+    return_fig: bool = False
 ):
     """
     Visualize attention weights as a graph.
@@ -73,16 +74,21 @@ def visualize_attention_weights(
     ax.grid(True, alpha=0.3)
     
     plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"Saved attention visualization: {save_path}")
+    
+    if return_fig:
+        return fig
     plt.close()
-    print(f"Saved attention visualization: {save_path}")
 
 
 def visualize_track_predictions(
     pred_states: torch.Tensor,
     gt_states: torch.Tensor,
     measurements: torch.Tensor,
-    save_path: str = "track_predictions.png"
+    save_path: Optional[str] = "track_predictions.png",
+    return_fig: bool = False
 ):
     """
     Visualize predicted tracks vs ground truth.
@@ -139,16 +145,21 @@ def visualize_track_predictions(
     axes[1].grid(True, alpha=0.3)
     
     plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"Saved track predictions: {save_path}")
+    
+    if return_fig:
+        return fig
     plt.close()
-    print(f"Saved track predictions: {save_path}")
 
 
 def plot_confusion_matrix(
     pred_states: torch.Tensor,
     gt_states: torch.Tensor,
     match_threshold: float = 15000.0,
-    save_path: str = "confusion_matrix.png"
+    save_path: Optional[str] = "confusion_matrix.png",
+    return_fig: bool = False
 ):
     """
     Plot confusion matrix for track assignments.
@@ -183,9 +194,13 @@ def plot_confusion_matrix(
     ax.set_ylabel('Predicted Tracks')
     
     plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"Saved confusion matrix: {save_path}")
+    
+    if return_fig:
+        return fig
     plt.close()
-    print(f"Saved confusion matrix: {save_path}")
 
 
 def create_tracking_animation(
@@ -244,7 +259,8 @@ def create_tracking_animation(
 def plot_existence_probabilities(
     existence_probs: torch.Tensor,
     num_tracks: int,
-    save_path: str = "existence_probs.png"
+    save_path: Optional[str] = "existence_probs.png",
+    return_fig: bool = False
 ):
     """
     Plot histogram of existence probabilities for tracks vs measurements.
@@ -268,6 +284,10 @@ def plot_existence_probabilities(
     ax.grid(True, alpha=0.3)
     
     plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"Saved existence probabilities: {save_path}")
+    
+    if return_fig:
+        return fig
     plt.close()
-    print(f"Saved existence probabilities: {save_path}")

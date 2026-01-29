@@ -21,43 +21,76 @@ A deep learning-based multi-target tracker using Graph Attention Networks (GAT) 
 - **🔬 Data Augmentation**: SSR ID dropouts, noise injection, sensor bias
 - **✅ Pydantic Validation**: Type-safe configuration management
 
-See [TRAINING.md](TRAINING.md) for the new training workflow.
+## 🛠️ Installation & Setup
 
-## Installation
+### Prerequisites
+- **Python 3.12+**
+- **uv** (high-performance Python package manager)
+- **FFmpeg** (Required for video export features)
 
-```bash
-# Clone the repository
+```powershell
+# 1. Clone the repository
 git clone https://github.com/TomRathbun/ai_tracker_correlator.git
 cd ai_tracker_correlator
 
-# Install dependencies and setup environment using uv
+# 2. Setup Python environment
 uv sync
+
+# 3. Install FFmpeg (Windows)
+# Open PowerShell as Administrator and run:
+winget install "FFmpeg (Essentials Build)"
+# Note: Restart your terminal after installing winget packages.
 ```
 
-## Quick Start
+## 📖 Usage Guide
 
-### Training
+### 📊 Interactive Dashboard
+The research platform includes a Streamlit dashboard for one-click experiments and visual debugging.
 
-Train the model with default heterogeneous configuration:
+```powershell
+uv run streamlit run dashboard/app.py
+```
+**Features:**
+- Real-time training monitoring
+- One-click ablation studies (GNN Only, Kalman Only, Hybrid)
+- **Interactive Simulation**: Frame-by-frame tracker replay
+- **Video Export**: Save tracking results to .mp4/ .mov (Requires FFmpeg)
 
+### 🚀 Command Line Interface (CLI)
+For batch processing and scripting, use the `run_cli.py` interface.
+
+```powershell
+# Run the Hybrid tracker on default data
+uv run run_cli.py --mode hybrid --arch gnn_hybrid
+
+# Run the GNN baseline with custom parameters
+uv run run_cli.py --mode gnn --arch gnn_only --run-name "GNN_Test_01" --threshold 0.45
+```
+
+**Key Arguments:**
+- `--mode`: `gnn`, `kalman`, or `hybrid`
+- `--arch`: Archive tag for MLflow categorization
+- `--data`: Path to dataset (JSONL)
+- `--no-mlflow`: Disable experiment logging
+
+### 📈 Experiment Tracking (MLflow)
+All experiments are automatically logged to **MLflow**.
+
+```powershell
+uv run mlflow ui
+```
+Open [http://localhost:5000](http://localhost:5000) to compare MOTA, Precision, and Recall across different runs.
+
+## 🛠️ Advanced Training & Optimization
+
+### Training Scripts
 ```bash
 uv run scripts/train_hetero_pairwise.py
 uv run scripts/train_clutter_filter.py
 uv run scripts/train_gnn_tracker.py
 ```
 
-### Evaluation
-
-Evaluate the final Hybrid Tracker:
-
-```bash
-uv run hybrid_tracker.py
-```
-
 ### Hyperparameter Optimization
-
-Run Optuna optimization study:
-
 ```bash
 uv run python -m src.optimize --n-trials 50 --study-name my_optimization
 ```
@@ -66,27 +99,21 @@ uv run python -m src.optimize --n-trials 50 --study-name my_optimization
 
 ```
 ai_tracker_correlator/
-├── hybrid_tracker.py      # Main tracking engine (Core)
-├── src/                  # Library implementation
-│   ├── gnn_tracker.py    # GNN-based graph building & inference
-│   ├── clutter_classifier.py
-│   ├── pairwise_classifier.py
-│   ├── kalman_filter.py
+├── run_cli.py             # Main entry point for evaluation
+├── src/                   # Core implementation
+│   ├── gnn_tracker.py     # GNN-based graph building
+│   ├── pipeline.py        # Tracking pipeline logic
 │   └── ...
-├── scripts/              # Active training & viz scripts
+├── scripts/               # Training scripts
 │   ├── train_gnn_tracker.py
 │   ├── train_clutter_filter.py
-│   ├── train_hetero_pairwise.py
-│   ├── visualize_hybrid_tracker.py
-│   ├── gen_hetero_data.py
-│   └── update_viz_data.py
-├── tools/                # Utilities & Benchmarking
+│   └── train_hetero_pairwise.py
+├── tools/                 # Utilities
 │   ├── evaluate_model.py
 │   └── diagnose_model.py
-├── legacy/               # Archived experiments
-├── data/                 # Simulation data
-├── checkpoints/          # Model checkpoints
-└── runs/                 # TensorBoard logs
+├── legacy/                # Archived experiments and scripts
+├── data/                  # Simulation data
+└── checkpoints/           # Model checkpoints
 ```
 
 ## Model Architecture
@@ -133,29 +160,6 @@ The model is evaluated using standard multi-object tracking metrics:
 - **F1 Score**: Harmonic mean of precision and recall
 - **ID Switches**: Number of track identity changes
 - **FP/FN Rates**: False positive and false negative rates per frame
-
-## Visualization
-
-To visualize the tracking results interactively:
-
-1. **Generate Visualization Data**:
-   ```bash
-   uv run scripts/visualize_hybrid_tracker.py
-   ```
-
-2. **Update Web Data**:
-   ```bash
-   uv run scripts/update_viz_data.py
-   ```
-
-3. **Open Visualization**:
-   Open [hybrid_tracker_viz.html](file:///c:/Users/USER/ai_tracker_correlator/hybrid_tracker_viz.html) in your web browser.
-
-The interactive visualizer allows you to:
-- Play/Pause the tracking sequence.
-- Step through frames using keyboard arrows (Left/Right) or the slider.
-- View PSR (red/teal) and SSR (yellow) detections vs Fused Tracks (blue) vs Ground Truth (white).
-- Monitor measurement and track counts in real-time.
 
 ---
 

@@ -8,6 +8,7 @@ import mlflow
 import subprocess
 import sys
 import threading
+import torch
 import traceback
 from pathlib import Path
 from typing import Dict, Any, Optional
@@ -21,6 +22,7 @@ from src.augmentor import DataAugmentor
 from src.pipeline import Pipeline
 from src.metrics import TrackingMetrics
 from src.trainer import Trainer
+from src.visualize import visualize_track_predictions, visualize_attention_weights, plot_existence_probabilities
 
 
 class TrainingRunner:
@@ -112,6 +114,8 @@ class TrainingRunner:
             # Initialize metrics
             metrics_tracker = TrackingMetrics()
             
+            interactive_data = []
+            
             # Process validation frames
             for frame_idx, frame in enumerate(val_frames):
                 measurements = frame.get('measurements', [])
@@ -122,6 +126,23 @@ class TrainingRunner:
                 
                 # Update metrics
                 metrics_tracker.update(predicted_tracks, gt_tracks)
+                
+                # Collect for interactive visualization
+                interactive_data.append({
+                    'frame': frame_idx,
+                    'measurements': [
+                        {'x': m['x'], 'y': m['y'], 'z': m['z'], 'sensor_id': m.get('sensor_id', 0)}
+                        for m in measurements
+                    ],
+                    'fused_tracks': [
+                        {'x': t['x'], 'y': t['y'], 'z': t['z'], 'track_id': t['track_id']}
+                        for t in predicted_tracks
+                    ],
+                    'ground_truth': [
+                        {'x': gt['x'], 'y': gt['y'], 'z': gt['z']}
+                        for gt in gt_tracks
+                    ]
+                })
                 
                 # Log progress
                 if (frame_idx + 1) % 10 == 0:
@@ -144,6 +165,49 @@ class TrainingRunner:
             mlflow.log_metric("FP_per_frame", final_metrics.get('fp', 0.0) / val_frame_count)
             mlflow.log_metric("FN_per_frame", final_metrics.get('fn', 0.0) / val_frame_count)
             
+            # Generate and log visualizations for the last frame
+            if val_frames:
+                last_frame = val_frames[-1]
+                measurements = last_frame.get('measurements', [])
+                gt_tracks = last_frame.get('gt_tracks', [])
+                
+                # We need torch tensors for visualization
+                # Re-run pipeline to get attention weights if possible
+                # For now, let's just log the track predictions
+                
+                # Plot track predictions
+                pred_states = torch.tensor([[t.get('x', 0.0), t.get('y', 0.0), t.get('z', 0.0), t.get('vx', 0.0), t.get('vy', 0.0), t.get('vz', 0.0)] for t in predicted_tracks])
+                gt_states = torch.tensor([[t.get('x', 0.0), t.get('y', 0.0), t.get('z', 0.0), t.get('vx', 0.0), t.get('vy', 0.0), t.get('vz', 0.0)] for t in gt_tracks])
+                
+                # Get measurements as tensor [N_meas, 7]
+                meas_list = []
+                for m in measurements:
+                    meas_list.append([
+                        m.get('x', 0.0), m.get('y', 0.0), m.get('z', 0.0),
+                        m.get('vx', 0.0), m.get('vy', 0.0), m.get('vz', 0.0),
+                        m.get('sensor_type', 0)
+                    ])
+                meas_tensor = torch.tensor(meas_list) if meas_list else torch.empty((0, 7))
+                
+                viz_dir = Path("dashboard/temp_viz")
+                viz_dir.mkdir(parents=True, exist_ok=True)
+                
+                pred_path = viz_dir / f"preds_{run_id[:8]}.png"
+                visualize_track_predictions(pred_states, gt_states, meas_tensor, save_path=str(pred_path))
+                mlflow.log_artifact(str(pred_path), "visualizations")
+                
+                # Save interactive visualization data
+                interactive_path = viz_dir / f"interactive_viz.json"
+                with open(interactive_path, 'w') as f:
+                    json.dump(interactive_data, f)
+                mlflow.log_artifact(str(interactive_path), "visualizations")
+                
+                # Cleanup temp files
+                if pred_path.exists():
+                    pred_path.unlink()
+                if interactive_path.exists():
+                    interactive_path.unlink()
+
             mlflow.end_run()
             
             return run_id

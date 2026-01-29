@@ -5,6 +5,7 @@ Interactive Streamlit dashboard for experiment management, model visualization,
 and feasibility analysis.
 """
 import streamlit as st
+import streamlit.components.v1 as components
 import mlflow
 import pandas as pd
 import plotly.express as px
@@ -14,6 +15,8 @@ from pathlib import Path
 import json
 import sys
 from datetime import datetime
+import os
+from PIL import Image
 
 # Add parent directory to path
 sys.path.append(str(Path(__file__).parent.parent))
@@ -372,9 +375,164 @@ with tab2:
 with tab3:
     st.header("Component Debugging")
     
-    component = st.selectbox("Select Component", ["Clutter Filter", "GNN Tracker", "Pairwise Classifiers"])
+    component = st.selectbox("Select Component", ["General Tracking", "Clutter Filter", "GNN Tracker", "Pairwise Classifiers"])
     
-    if component == "Clutter Filter":
+    if component == "General Tracking":
+        st.subheader("📍 Track Predictions")
+        
+        # Select run to view visualization
+        viz_run_id = st.selectbox(
+            "Select Run for Visualization", 
+            runs_df['run_id'].tolist() if not runs_df.empty else [],
+            key="viz_run_select"
+        )
+        
+        if viz_run_id:
+            if st.button("🖼️ Load Visualization"):
+                try:
+                    client = mlflow.tracking.MlflowClient()
+                    artifact_path = "visualizations/preds_" + viz_run_id[:8] + ".png"
+                    
+                    # Check if artifact exists
+                    artifacts = client.list_artifacts(viz_run_id, "visualizations")
+                    artifact_exists = any(a.path == artifact_path for a in artifacts)
+                    
+                    if not artifact_exists:
+                        st.info("No visualization artifact found for this run.")
+                    else:
+                        temp_dir = Path("dashboard/temp_viz")
+                        temp_dir.mkdir(parents=True, exist_ok=True)
+                        
+                        with st.spinner("Downloading visualization..."):
+                            local_path = mlflow.artifacts.download_artifacts(
+                                run_id=viz_run_id,
+                                artifact_path=artifact_path,
+                                dst_path=str(temp_dir)
+                            )
+                        
+                        if os.path.exists(local_path):
+                            st.image(local_path, caption=f"Track Predictions for Run {viz_run_id[:8]}", use_container_width=True)
+                        else:
+                            st.error("Failed to download visualization.")
+                except Exception as e:
+                    st.warning(f"Could not load visualization: {e}")
+            
+            st.divider()
+            
+            if st.button("💻 Run Interactive Simulation"):
+                try:
+                    client = mlflow.tracking.MlflowClient()
+                    artifact_path = "visualizations/interactive_viz.json"
+                    
+                    # Check if artifact exists
+                    artifacts = client.list_artifacts(viz_run_id, "visualizations")
+                    artifact_exists = any(a.path == artifact_path for a in artifacts)
+                    
+                    if not artifact_exists:
+                        st.warning("No interactive simulation data found for this run. Please re-run the experiment with the latest code.")
+                    else:
+                        temp_dir = Path("dashboard/temp_viz")
+                        temp_dir.mkdir(parents=True, exist_ok=True)
+                        
+                        with st.spinner("Preparing interactive simulation..."):
+                            # Download data
+                            data_path = mlflow.artifacts.download_artifacts(
+                                run_id=viz_run_id,
+                                artifact_path=artifact_path,
+                                dst_path=str(temp_dir)
+                            )
+                            
+                            # Read JSON data
+                            with open(data_path, 'r') as f:
+                                viz_json = f.read()
+                            
+                            # Read HTML template
+                            template_path = Path("hybrid_tracker_viz.html")
+                            if not template_path.exists():
+                                st.error("Visualization template 'hybrid_tracker_viz.html' not found in project root.")
+                            else:
+                                with open(template_path, 'r', encoding='utf-8') as f:
+                                    html_content = f.read()
+                                
+                                # Inject data
+                                # Replace the external script tag with inline data
+                                replacement = f"<script>const VISUALIZATION_DATA = {viz_json};</script>"
+                                html_content = html_content.replace('<script src="hybrid_tracker_viz_data.js"></script>', replacement)
+                                
+                                # Display in dashboard
+                                components.html(html_content, height=900, scrolling=True)
+                                
+                except Exception as e:
+                    st.error(f"Failed to launch interactive simulation: {e}")
+
+            if st.button("📽️ Export to Video (MP4)"):
+                # Prerequisite check
+                import shutil
+                if not shutil.which("ffmpeg"):
+                    st.error("❌ FFmpeg not found!")
+                    st.markdown("""
+                    This feature requires **FFmpeg** to be installed and in your system PATH.
+                    
+                    **How to install on Windows:**
+                    1. Open PowerShell as Administrator.
+                    2. Run: `winget install "FFmpeg (Essentials Build)"`
+                    3. **Restart your terminal and this dashboard** after installation.
+                    """)
+                    st.stop()
+                    
+                try:
+                    client = mlflow.tracking.MlflowClient()
+                    artifact_path = "visualizations/interactive_viz.json"
+                    
+                    artifacts = client.list_artifacts(viz_run_id, "visualizations")
+                    artifact_exists = any(a.path == artifact_path for a in artifacts)
+                    
+                    if not artifact_exists:
+                        st.warning("No interactive simulation data found for this run.")
+                    else:
+                        temp_dir = Path("dashboard/temp_viz")
+                        temp_dir.mkdir(parents=True, exist_ok=True)
+                        
+                        with st.spinner("Rendering video (this may take a minute)..."):
+                            # Download data
+                            data_path = mlflow.artifacts.download_artifacts(
+                                run_id=viz_run_id,
+                                artifact_path=artifact_path,
+                                dst_path=str(temp_dir)
+                            )
+                            
+                            video_name = f"tracker_viz_{viz_run_id[:8]}.mp4"
+                            video_output = os.path.abspath(os.path.join(str(temp_dir), video_name))
+                            
+                            import subprocess
+                            
+                            # Run the export script
+                            result = subprocess.run([
+                                "uv", "run", "python", "scripts/export_tracker_video.py",
+                                "--input", os.path.abspath(data_path),
+                                "--output", video_output
+                            ], capture_output=True, text=True)
+                            
+                            if result.returncode == 0 and os.path.exists(video_output):
+                                st.success(f"Video exported successfully: {video_name}")
+                                with open(video_output, "rb") as file:
+                                    st.download_button(
+                                        label="💾 Download Video",
+                                        data=file,
+                                        file_name=video_name,
+                                        mime="video/mp4"
+                                    )
+                            else:
+                                st.error("Error rendering video.")
+                                st.code(result.stderr)
+                                if "FFMpegWriter" in result.stdout or "FFMpegWriter" in result.stderr:
+                                    st.warning("💡 It looks like FFmpeg is not installed. Please install FFmpeg to use this feature.")
+                except Exception as e:
+                    st.error(f"Failed to start export: {e}")
+        else:
+            st.info("Select a run to view track predictions.")
+
+    elif component == "Clutter Filter":
         st.subheader("🎯 Clutter Filter Performance")
         st.info("Confusion matrix and ROC curves will appear here after training")
         

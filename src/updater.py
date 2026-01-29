@@ -48,9 +48,11 @@ class GNNUpdater(StateUpdater):
         Args:
             config: Pipeline configuration
         """
+        self.full_config = config
         self.config = config.state_updater
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = None
+        self.frame_count = 0
         
         if self.config.gnn_model_path:
             self._load_model()
@@ -69,6 +71,21 @@ class GNNUpdater(StateUpdater):
                 state_dict = checkpoint
             
             # Identify architecture by keys
+            if "gat1.att" in state_dict or "gat1.lin_l.weight" in state_dict:
+                self.model = RecurrentGATTrackerV3()
+                self.model_type = "v3"
+            elif "gat.w.weight" in state_dict or "node_enc.weight" in state_dict:
+                # Check dimension from state_dict to handle legacy 32 vs 64
+                node_dim = 32
+                if "node_enc.weight" in state_dict:
+                    node_dim = state_dict["node_enc.weight"].shape[0]
+                elif "gat.w.weight" in state_dict:
+                    node_dim = state_dict["gat.w.weight"].shape[0]
+                    
+                self.model = GNNTracker(node_dim=node_dim)
+                self.model_type = "legacy"
+            else:
+                # Default to V3
                 self.model = RecurrentGATTrackerV3()
                 self.model_type = "v3"
                 
@@ -101,10 +118,15 @@ class GNNUpdater(StateUpdater):
         )
         
         # 3. Create graph
-        node_type = torch.cat([
-            torch.ones(num_tracks, dtype=torch.long, device=self.device),
-            torch.zeros(num_meas, dtype=torch.long, device=self.device)
-        ])
+        # 3. Create graph nodes (Tracks + Measurements)
+        # Type: 1.0 for established tracks and SSR measurements, 0.0 for PSR measurements
+        track_types = torch.ones(num_tracks, dtype=torch.long, device=self.device)
+        meas_types = torch.tensor([
+            1 if m.get('type') != 'PSR' else 0 
+            for m in measurements
+        ], dtype=torch.long, device=self.device)
+        
+        node_type = torch.cat([track_types, meas_types])
         
         edge_index, edge_attr = build_sparse_edges(full_x)
         
@@ -121,30 +143,65 @@ class GNNUpdater(StateUpdater):
                 else:
                     # Legacy GNNTracker architecture
                     # Mapping features: [x,y,z,vx,vy,vz,amp,type,m3a,ms]
-                    # node_type: 0 for meas, 1 for track. GNNTracker expectations might vary.
-                    # Assuming 10 dimensions for node_feats
-                    # full_x is [N, 7] -> [x,y,z,vx,vy,vz,amp]
-                    # We need 3 more: node_type (1), m3a (0), ms (sensor_id)
+                    # Note: Legacy GNN expects km-scaled inputs for numerical stability
                     N = full_x.shape[0]
-                    m3a = torch.zeros(N, 1, device=self.device) # Placeholder for m3a, not present in v3's full_x
+                    m3a = torch.zeros(N, 1, device=self.device)
                     node_type_feat = node_type.float().unsqueeze(1)
                     sensor_id_feat = sensor_ids.float().unsqueeze(1)
-                    node_feats = torch.cat([full_x[:, :7], node_type_feat, m3a, sensor_id_feat], dim=1)
+                    
+                    # Local scaling for model forward
+                    x_scale = full_x.clone()
+                    x_scale[:, 0:3] *= 1e-4 # 100km -> 10.0
+                    x_scale[:, 3:6] *= 1e-2 # 500m/s -> 5.0
+                    
+                    # Reconstruct edge features specifically for legacy architecture
+                    # Legacy expects [prob, dist/1000.0, 0, 0, 0, 0, 0, 0]
+                    row, col = edge_index
+                    dist = torch.norm(full_x[row, :3] - full_x[col, :3], dim=1)
+                    edge_attr_legacy = torch.zeros(edge_index.shape[1], 8, device=self.device)
+                    edge_attr_legacy[:, 0] = 0.5 # Neutral association probability
+                    edge_attr_legacy[:, 1] = dist / 1000.0 # Meters to km
+                    
+                    node_feats = torch.cat([x_scale, node_type_feat, m3a, sensor_id_feat], dim=1)
+                    edge_attr_padded = edge_attr_legacy
                     
                     # Hidden state handling
                     if hidden_state is None:
                         hidden_state = torch.zeros(N, self.model.gru.hidden_size, device=self.device)
+                    else:
+                        # Pad hidden state for new measurements
+                        # Legacy GNN requires a hidden state for all N nodes (tracks + measurements)
+                        num_h = hidden_state.shape[0]
+                        if num_h < N:
+                            pad = torch.zeros(N - num_h, self.model.gru.hidden_size, device=self.device)
+                            hidden_state = torch.cat([hidden_state, pad], dim=0)
                     
                     # Forward pass
                     state_deltas, existence_logits, new_hidden_full = self.model(
-                        node_feats, edge_index, edge_attr, hidden_state
+                        node_feats, edge_index, edge_attr_padded, hidden_state
                     )
                     
+                    # existence_logits shape is (N, 1), we need (N,)
+                    existence_logits = existence_logits.squeeze(-1)
+                    
+                    # Apply deltas to RAW meters. 
+                    # If model was trained on scaled space, state_deltas are scaled.
+                    # Unscale them: delta_meters = delta_scaled / scale_factor
+                    unscaled_deltas = state_deltas.clone()
+                    unscaled_deltas[:, 0:3] /= 1e-4
+                    unscaled_deltas[:, 3:6] /= 1e-2
+                    
+                    absolute_state = full_x[:, :6] + unscaled_deltas
+                    
                     # Reconstruct 'out' for management: [x,y,z,vx,vy,vz,exists]
-                    # For legacy, state_deltas is probably the full update or delta
-                    # We'll treat it as full state for now to match v3's 'out'
-                    out = torch.cat([state_deltas, existence_logits], dim=1)
-                    existence_probs = torch.sigmoid(existence_logits).squeeze(-1)
+                    out = torch.cat([absolute_state, existence_logits.unsqueeze(-1)], dim=1)
+                    existence_probs = torch.sigmoid(existence_logits)
+                    
+                    # Instrumentation
+                    self.frame_count += 1
+                    if self.frame_count % 20 == 0:
+                        print(f"DEBUG [GNN Legacy]: Max Exist Prob = {existence_probs.max().item():.4f}, Mean = {existence_probs.mean().item():.4f}")
+                    
                     alpha = None # Alpha not returned by legacy forward
         except Exception as e:
             print(f"Error during GNN forward pass: {e}")
@@ -160,6 +217,11 @@ class GNNUpdater(StateUpdater):
         existence_probs = torch.sigmoid(existence_logits)
         
         # Use config values for management
+        # Higher threshold (0.6) for legacy initiation to reduce clutter tracks
+        init_thresh = getattr(self.full_config.track_manager, 'association_threshold', 0.6)
+        if self.model_type != "v3":
+            init_thresh = max(init_thresh, 0.6)
+        
         updated_tracks = manage_tracks(
             active_tracks=tracks,
             out=out,
@@ -170,7 +232,7 @@ class GNNUpdater(StateUpdater):
             edge_index=edge_index,
             num_tracks=num_tracks,
             num_meas=num_meas,
-            init_thresh=0.35,  # Fixed for now, can be parameterized
+            init_thresh=init_thresh,
             coast_thresh=0.15,
             suppress_thresh=0.8,
             del_exist=0.05,
@@ -210,38 +272,52 @@ class FallbackUpdater(StateUpdater):
         """
         Initialize Kalman filter updater.
         """
+        self.full_config = config
         self.config = config.state_updater
         # We'll create filters on demand per track or use a simplified one
     
     def update(self, measurements: List[Dict], tracks: List[Dict]) -> List[Dict]:
-        """Update tracks using simplified Kalman logic."""
+        """Update tracks using simplified Kalman logic with initiation."""
         updated_tracks = []
+        matched_meas_indices = set()
         
+        # 1. Update existing tracks
         for track in tracks:
-            # Find closest measurement (simplified association)
-            closest_meas = self._find_closest_measurement(track, measurements)
+            closest_meas, meas_idx = self._find_closest_measurement(track, measurements)
             
-            if closest_meas:
-                # Update track attributes
-                # Simplified weighted update (acting as a fixed-gain filter)
+            # Simple gating: 15km
+            if closest_meas and meas_idx not in matched_meas_indices:
+                matched_meas_indices.add(meas_idx)
+                
+                # Smoothed update (Fixed gain ~0.7)
                 alpha = 0.7
-                track['x'] = alpha * closest_meas['x'] + (1 - alpha) * track['x']
-                track['y'] = alpha * closest_meas['y'] + (1 - alpha) * track['y']
-                track['z'] = alpha * closest_meas['z'] + (1 - alpha) * track['z']
                 
-                # Velocity estimation
-                track['vx'] = (closest_meas['x'] - track['x']) * 0.1
-                track['vy'] = (closest_meas['y'] - track['y']) * 0.1
-                track['vz'] = (closest_meas['z'] - track['z']) * 0.1
+                # Estimate velocity if possible
+                if 'x' in track:
+                    track['vx'] = (closest_meas['x'] - track['x']) * 0.2
+                    track['vy'] = (closest_meas['y'] - track['y']) * 0.2
+                    track['vz'] = (closest_meas['z'] - track['z']) * 0.2
                 
-                track['age'] = 0 # Reset age on update
+                track['x'] = alpha * closest_meas['x'] + (1 - alpha) * track.get('x', closest_meas['x'])
+                track['y'] = alpha * closest_meas['y'] + (1 - alpha) * track.get('y', closest_meas['y'])
+                track['z'] = alpha * closest_meas['z'] + (1 - alpha) * track.get('z', closest_meas['z'])
+                
+                track['age'] = 0 
+                track['hits'] = track.get('hits', 0) + 1
             else:
                 track['age'] = track.get('age', 0) + 1
                 
             updated_tracks.append(track)
         
-        # Minimal track initiation for Kalman mode 
-        # (This would normally be in TrackManager, but kept for standalone parity)
+        # 2. Initiate from unmatched measurements
+        for i, meas in enumerate(measurements):
+            if i not in matched_meas_indices:
+                new_track = meas.copy()
+                new_track['is_new'] = True
+                new_track['hits'] = 1
+                new_track['age'] = 0
+                updated_tracks.append(new_track)
+                
         return updated_tracks
     
     def predict(self, tracks: List[Dict]) -> List[Dict]:
@@ -255,19 +331,20 @@ class FallbackUpdater(StateUpdater):
             predicted.append(pred)
         return predicted
     
-    def _find_closest_measurement(self, track: Dict, measurements: List[Dict]) -> Dict:
-        """Find the closest measurement to a track."""
+    def _find_closest_measurement(self, track: Dict, measurements: List[Dict]) -> Tuple[Optional[Dict], Optional[int]]:
+        """Find the closest measurement to a track and return its index."""
         if not measurements:
-            return None
+            return None, None
         
         min_dist = float('inf')
         closest = None
+        closest_idx = None
         
-        tx = track.get('x', track.get('state', [0])[0] if isinstance(track.get('state'), torch.Tensor) else 0)
-        ty = track.get('y', track.get('state', [0, 0])[1] if isinstance(track.get('state'), torch.Tensor) else 0)
-        tz = track.get('z', track.get('state', [0, 0, 0])[2] if isinstance(track.get('state'), torch.Tensor) else 0)
+        tx = track.get('x', 0)
+        ty = track.get('y', 0)
+        tz = track.get('z', 0)
 
-        for meas in measurements:
+        for i, meas in enumerate(measurements):
             dist = np.sqrt(
                 (meas['x'] - tx)**2 +
                 (meas['y'] - ty)**2 +
@@ -276,8 +353,11 @@ class FallbackUpdater(StateUpdater):
             if dist < min_dist:
                 min_dist = dist
                 closest = meas
+                closest_idx = i
         
-        return closest if min_dist < 15000.0 else None # 15km threshold
+        if min_dist < 15000.0: # 15km threshold
+            return closest, closest_idx
+        return None, None
 
 
 class NewHybridUpdater(StateUpdater):
