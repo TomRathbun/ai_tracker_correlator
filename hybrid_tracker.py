@@ -424,8 +424,8 @@ def evaluate_hybrid_tracker():
     print("\n" + "="*60)
     print("HYBRID TRACKER RESULTS")
     print("="*60)
-    print(f"MOTA:      {metrics['MOTA']:.3f}")
-    print(f"MOTP:      {metrics['MOTP']:.1f}m")
+    print(f"MOTA:      {metrics['mota']:.3f}")
+    print(f"MOTP:      {metrics['motp']:.1f}m")
     print(f"Precision: {metrics['precision']:.3f}")
     print(f"Recall:    {metrics['recall']:.3f}")
     print(f"F1:        {metrics['f1']:.3f}")
@@ -437,7 +437,7 @@ def evaluate_hybrid_tracker():
     print("\nComparison:")
     print("  V2 Model:  Recall=31.1%")
     print("  SORT:      Recall=30.0%, MOTA=0.07")
-    print(f"  Hybrid:    Recall={metrics['recall']*100:.1f}%, MOTA={metrics['MOTA']:.2f}")
+    print(f"  Hybrid:    Recall={metrics['recall']*100:.1f}%, MOTA={metrics['mota']:.2f}")
 
 
 if __name__ == "__main__":
