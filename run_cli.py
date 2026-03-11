@@ -16,6 +16,7 @@ from src.config_schemas import PipelineConfig
 from src.pipeline import Pipeline
 from src.metrics import TrackingMetrics, format_metrics
 from src.mlflow_config import init_mlflow
+from src.stream_utils import load_stream_and_truth, get_truth_at_time
 
 def run_cli():
     parser = argparse.ArgumentParser(description="AI Tracker Command Line Interface")
@@ -94,51 +95,71 @@ def run_cli():
     print(f"\n🚀 Initializing AI Tracker ({args.mode.upper()} mode)...")
     pipeline = Pipeline(config)
     
-    # 4. Load Data
+    # 4. Load & Detect Format
     if not os.path.exists(args.data):
         print(f"❌ Error: Data file {args.data} not found.")
         return
 
     import json
     with open(args.data, 'r') as f:
-        # Check if it's a streaming file (.jsonl) or frame-based
-        # For evaluation, we expect frame-based sim_hetero format
-        # If it's a stream file, we might need a different loader or grouping
-        try:
-            line = f.readline()
-            sample = json.loads(line)
-            f.seek(0)
-            if 'measurements' not in sample and 't' in sample:
-                print("⚠️ Warning: Data appears to be in streaming format. Evaluation expects frame-based format.")
-                print("Hint: Use 'data/sim_hetero_001.jsonl' for evaluation mode.")
-        except:
-            f.seek(0)
-
-    with open(args.data, 'r') as f:
-        frames = [json.loads(line) for line in f]
+        first_line = f.readline()
+        if not first_line: return
+        sample = json.loads(first_line)
     
-    if args.val_only:
-        print(f"🧪 Val-only mode: Using frames 240-300")
-        frames = frames[240:300]
+    is_stream = 'measurements' not in sample and 't' in sample
     
-    print(f"📈 Loaded {len(frames)} frames. Starting tracking...")
-    
-    # 5. Process
-    metrics_tracker = TrackingMetrics(match_threshold=args.match_threshold)
-    
-    for frame_idx, frame in enumerate(tqdm(frames, desc="Processing")):
-        measurements = frame.get('measurements', [])
-        gt_tracks = frame.get('gt_tracks', [])
+    if is_stream:
+        print("🌊 Detected STREAMING data format. Switching to windowed evaluation...")
+        measurements_all, truth_trajectories, all_track_ids = load_stream_and_truth(args.data)
+        measurements_all.sort(key=lambda x: x['t'])
         
-        # Run pipeline (returns only confirmed tracks)
-        predicted_tracks = pipeline.process_frame(measurements)
+        t_start = measurements_all[0]['t']
+        t_end = measurements_all[-1]['t']
+        window_size = 1.0 # 1s evaluation windows
         
-        # Update metrics
-        metrics_tracker.update(predicted_tracks, gt_tracks)
+        current_t = t_start
+        meas_idx = 0
+        metrics_tracker = TrackingMetrics(match_threshold=args.match_threshold)
         
-        # Periodic debug (optional but helpful)
-        if (frame_idx + 1) % 20 == 0:
-            tqdm.write(f"Frame {frame_idx+1}: {len(measurements)} meas -> {len(predicted_tracks)} confirmed tracks")
+        pbar = tqdm(total=int(t_end - t_start), desc="Streaming Eval")
+        while current_t < t_end:
+            # Group into window
+            window_meas = []
+            while meas_idx < len(measurements_all) and measurements_all[meas_idx]['t'] < current_t + window_size:
+                window_meas.append(measurements_all[meas_idx])
+                meas_idx += 1
+            
+            # Predict
+            predicted_tracks = pipeline.process_frame(window_meas)
+            
+            # Get Truth for this window
+            gt_tracks = get_truth_at_time(truth_trajectories, current_t + window_size/2, set(all_track_ids))
+            
+            # Update metrics
+            metrics_tracker.update(predicted_tracks, gt_tracks)
+            
+            current_t += window_size
+            pbar.update(1)
+        pbar.close()
+    else:
+        # Standard Frame-based Evaluation
+        with open(args.data, 'r') as f:
+            frames = [json.loads(line) for line in f]
+        
+        if args.val_only:
+            print(f"🧪 Val-only mode: Using frames 240-300")
+            frames = frames[240:300]
+        
+        print(f"📈 Loaded {len(frames)} frames. Starting tracking...")
+        metrics_tracker = TrackingMetrics(match_threshold=args.match_threshold)
+        
+        for frame_idx, frame in enumerate(tqdm(frames, desc="Processing")):
+            measurements = frame.get('measurements', [])
+            gt_tracks = frame.get('gt_tracks', [])
+            predicted_tracks = pipeline.process_frame(measurements)
+            metrics_tracker.update(predicted_tracks, gt_tracks)
+            if (frame_idx + 1) % 20 == 0:
+                tqdm.write(f"Frame {frame_idx+1}: {len(measurements)} meas -> {len(predicted_tracks)} confirmed tracks")
         
     # 6. Finalize
     metrics = metrics_tracker.compute()
