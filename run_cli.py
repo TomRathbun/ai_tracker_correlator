@@ -22,7 +22,7 @@ def run_cli():
     
     # Core arguments
     parser.add_argument("--data", type=str, default="data/sim_hetero_001.jsonl", help="Dataset path")
-    parser.add_argument("--mode", type=str, choices=["gnn", "kalman", "hybrid"], default="hybrid", help="State updater type")
+    parser.add_argument("--mode", type=str, choices=["gnn", "kalman", "hybrid", "train"], default="hybrid", help="Operation mode (updater type or train)")
     parser.add_argument("--arch", type=str, default="gnn_hybrid", help="Architecture tag")
     parser.add_argument("--val-only", action="store_true", help="Only evaluate on validation split (frames 240-300)")
     parser.add_argument("--gnn-model-path", type=str, default="checkpoints/model_v3.pt",
@@ -33,6 +33,11 @@ def run_cli():
     parser.add_argument("--threshold", type=float, default=0.35, help="Association threshold")
     parser.add_argument("--clutter-threshold", type=float, default=0.7, help="Clutter filter threshold")
     parser.add_argument("--match-threshold", type=float, default=5000.0, help="Metrics match threshold (m)")
+    
+    # Training arguments
+    parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
+    parser.add_argument("--window-size", type=float, default=2.0, help="Streaming window size (seconds)")
+    parser.add_argument("--split-ratio", type=float, default=0.8, help="Train/test track ID split ratio")
     
     # MLflow
     parser.add_argument("--no-mlflow", action="store_true", help="Disable MLflow logging")
@@ -60,6 +65,22 @@ def run_cli():
         # Log params
         mlflow.log_params(vars(args))
 
+    if args.mode == "train":
+        from src.train_streaming_v3 import train_streaming
+        print(f"\n🏋️ Starting Streaming Training...")
+        print(f"Epochs: {args.epochs} | Window: {args.window_size}s | Split: {args.split_ratio}")
+        
+        train_streaming(
+            num_epochs=args.epochs,
+            data_file=args.data,
+            window_size=args.window_size,
+            split_ratio=args.split_ratio
+        )
+        
+        if use_mlflow:
+            mlflow.end_run()
+        return
+
     # 2. Build Config
     config = PipelineConfig()
     config.state_updater.type = args.mode
@@ -78,6 +99,20 @@ def run_cli():
         return
 
     import json
+    with open(args.data, 'r') as f:
+        # Check if it's a streaming file (.jsonl) or frame-based
+        # For evaluation, we expect frame-based sim_hetero format
+        # If it's a stream file, we might need a different loader or grouping
+        try:
+            line = f.readline()
+            sample = json.loads(line)
+            f.seek(0)
+            if 'measurements' not in sample and 't' in sample:
+                print("⚠️ Warning: Data appears to be in streaming format. Evaluation expects frame-based format.")
+                print("Hint: Use 'data/sim_hetero_001.jsonl' for evaluation mode.")
+        except:
+            f.seek(0)
+
     with open(args.data, 'r') as f:
         frames = [json.loads(line) for line in f]
     
