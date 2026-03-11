@@ -39,8 +39,8 @@ class StateUpdaterConfig(BaseModel):
 
 class TrackManagerConfig(BaseModel):
     """Configuration for track management."""
-    min_hits: int = Field(3, ge=1)
-    max_age: int = Field(5, ge=1)
+    min_hits: int = Field(2, ge=1)
+    max_age: int = Field(10, ge=1)
     association_threshold: float = Field(0.35, ge=0.0, le=1.0)
 
 

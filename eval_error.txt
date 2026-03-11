@@ -1,0 +1,13 @@
+C:\Users\USER\ai_tracker_correlator\.venv\Lib\site-packages\mlflow\tracking\_tracking_service\utils.py:178: FutureWarning: The filesystem tracking backend (e.g., './mlruns') will be deprecated in February 2026. Consider transitioning to a database backend (e.g., 'sqlite:///mlflow.db') to take advantage of the latest MLflow features. See https://github.com/mlflow/mlflow/issues/18534 for more details and migration guidance. For migrating existing data, https://github.com/mlflow/mlflow-export-import can be used.
+  return FileStore(store_uri, store_uri)
+Traceback (most recent call last):
+  File "C:\Users\USER\ai_tracker_correlator\run_cli.py", line 237, in <module>
+    run_cli()
+  File "C:\Users\USER\ai_tracker_correlator\run_cli.py", line 86, in run_cli
+    init_mlflow()
+  File "C:\Users\USER\ai_tracker_correlator\src\mlflow_config.py", line 26, in init_mlflow
+    print(f"\u2713 MLflow initialized: {MLFLOW_TRACKING_URI}")
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\u2713' in position 0: character maps to <undefined>

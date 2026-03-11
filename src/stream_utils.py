@@ -52,9 +52,14 @@ def load_stream_and_truth(data_file: str):
             if tid not in truth_trajectories:
                 truth_trajectories[tid] = []
             
-            # Use calibrated origin to reconstruct 'True' X/Y from original source L/L
-            tx = (m['source_lon'] - origin_lon) * lon_scale
-            ty = (m['source_lat'] - origin_lat) * lat_scale
+            # Use gt_x/gt_y if available (exact simulator coordinates)
+            # Fallback to calibrated lat/lon reconstruction
+            if 'gt_x' in m and 'gt_y' in m:
+                tx = m['gt_x']
+                ty = m['gt_y']
+            else:
+                tx = (m['source_lon'] - origin_lon) * lon_scale
+                ty = (m['source_lat'] - origin_lat) * lat_scale
             
             truth_trajectories[tid].append({
                 't': m['t'],
@@ -66,35 +71,6 @@ def load_stream_and_truth(data_file: str):
                 'vz': 0,
                 'track_id': tid
             })
-            
-    # Create a time-bucketed map for O(1) lookup during evaluation
-    # Key: int(t), Value: List of aircraft states at that second
-    # We DEDUPLICATE: If a track has multiple measurements in 1s, we take the mean
-    # This truth_map is no longer used by get_truth_at_time, which now interpolates directly from truth_trajectories
-    # print("Bucketing and deduplicating ground truth...")
-    # for tid, states in truth_trajectories.items():
-    #     # Group points of this track by second
-    #     buckets_for_track = {}
-    #     for s in states:
-    #         tb = int(s['t'])
-    #         if tb not in buckets_for_track: buckets_for_track[tb] = []
-    #         buckets_for_track[tb].append(s)
-            
-    #     # For each second, compute average state for this track
-    #     for tb, s_list in buckets_for_track.items():
-    #         if tb not in truth_map: truth_map[tb] = []
-            
-    #         avg_state = {
-    #             't': tb + 0.5,
-    #             'x': np.mean([s['x'] for s in s_list]),
-    #             'y': np.mean([s['y'] for s in s_list]),
-    #             'z': np.mean([s['z'] for s in s_list]),
-    #             'vx': np.mean([s['vx'] for s in s_list]),
-    #             'vy': np.mean([s['vy'] for s in s_list]),
-    #             'vz': 0,
-    #             'track_id': tid
-    #         }
-    #         truth_map[tb].append(avg_state)
             
     return measurements, truth_trajectories, sorted(list(unique_track_ids))
 

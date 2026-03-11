@@ -309,6 +309,12 @@ def generate(input_path: Path, output_path: Path) -> None:
                 # Stagger the exact detection time within the current scan
                 bearing_frac = rng.uniform(0.0, 1.0)
                 meas_t = scan_t + bearing_frac * radar["scan_period"] * 0.95
+                
+                # Motion Compensation: Project position to meas_t
+                # Otherwise measurements are 'stale' by (meas_t - wall_t) seconds!
+                dt_sim = meas_t - wall_t
+                tx = trk["x"] + trk.get("vx", 0) * dt_sim
+                ty = trk["y"] + trk.get("vy", 0) * dt_sim
 
                 # Add Gaussian position noise
                 nx = float(rng.normal(0, POS_NOISE_STD_M))
@@ -331,6 +337,8 @@ def generate(input_path: Path, output_path: Path) -> None:
                         "z":          round(max(0.0, tz + nz), 2),
                         "vx":         round(trk["vx"] + nvx, 3),
                         "vy":         round(trk["vy"] + nvy, 3),
+                        "gt_x":       round(tx, 2), # Ground Truth
+                        "gt_y":       round(ty, 2), # Ground Truth
                         "amplitude":  round(amp, 2),
                         "track_id":   int(trk["track_number"]),
                         "source_lat": trk["lat"],
@@ -354,6 +362,8 @@ def generate(input_path: Path, output_path: Path) -> None:
                         "x":          round(tx + nx2, 2),
                         "y":          round(ty + ny2, 2),
                         "z":          round(max(0.0, tz + nz2), 2),
+                        "gt_x":       round(tx, 2),
+                        "gt_y":       round(ty, 2),
                         "mode3a":     trk["mode3a"],
                         "mode_s":     get_mode_s(int(trk["track_number"])),
                         "track_id":   int(trk["track_number"]),

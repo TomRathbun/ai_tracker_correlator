@@ -229,13 +229,13 @@ class GNNUpdater(StateUpdater):
             print(f"GNN Frame {self.frame_count} | meas probs: mean={meas_probs.mean():.3f} max={meas_probs.max():.3f} "
                   f"initiated={sum((meas_probs > getattr(self.config, 'init_thresh', 0.30))).item()}")
 
-        # Use config values from state_updater
-        init_thresh = self.config.state_updater.init_thresh
-        coast_thresh = self.config.state_updater.coast_thresh
-        suppress_thresh = self.config.state_updater.suppress_thresh
-        del_exist = self.config.state_updater.del_exist
-        del_age = self.config.state_updater.del_age
-        track_cap = self.config.state_updater.track_cap
+        # Use config values from state_updater (self.config IS state_updater)
+        init_thresh = self.config.init_thresh
+        coast_thresh = self.config.coast_thresh
+        suppress_thresh = self.config.suppress_thresh
+        del_exist = self.config.del_exist
+        del_age = self.config.del_age
+        track_cap = self.config.track_cap
         
         updated_tracks = manage_tracks(
             active_tracks=tracks,
@@ -491,7 +491,13 @@ class NewHybridUpdater(StateUpdater):
             # Initialize KF immediately
             from src.kalman_filter import SimpleKalmanFilter
             kf = SimpleKalmanFilter()
+            
+            # Initial Velocity Estimate: If we have a track at this position, try to estimate
+            # However, new_track is just being born. Let's look at nearby dead tracks? No.
+            # Best is to initialize with measurement velocity if PSR, else 0.
+            # BUT: We give it a high velocity covariance so it learns fast.
             kf.x = np.array([meta['x'], meta['y'], meta['z'], meta.get('vx', 0), meta.get('vy', 0), meta.get('vz', 0)])
+            kf.P[3:6, 3:6] *= 100.0 # High velocity uncertainty
             new_track['kf'] = kf
             
             updated_tracks.append(new_track)
@@ -505,6 +511,13 @@ class NewHybridUpdater(StateUpdater):
                 track['kf'].predict(dt=dt)
                 # Sync back to track dict
                 track['x'], track['y'], track['z'], track['vx'], track['vy'], track['vz'] = track['kf'].x[:6].flatten().tolist()
+                
+                # --- Two Point Initialization for new SSR tracks ---
+                if track.get('hits', 0) == 2 and track.get('vx', 0) == 0:
+                    # If this is the second hit and we still have 0 velocity, it might be an SSR-only track.
+                    # We can estimate velocity from the current and previous position.
+                    # Note: x/y already updated by KF.update? No, predict just happened.
+                    pass 
             else:
                 # Fallback to simple motion if no KF yet
                 track['x'] += track.get('vx', 0) * dt
@@ -541,7 +554,7 @@ class NewHybridUpdater(StateUpdater):
             dist_sq = (m1['x'] - m2['x'])**2 + (m1['y'] - m2['y'])**2
             if dist_sq > 5000.0**2: continue
             
-            t1, t2 = m1.get('type', 'PSR'), m2.get('type', 'PSR')
+            t1, t2 = m1.get('meas_type', 'PSR'), m2.get('meas_type', 'PSR')
             if t1 == 'PSR' and t2 == 'PSR':
                 psr_pairs.append((i, j, compute_psr_psr_features(m1, m2)))
             else:
@@ -581,7 +594,17 @@ class NewHybridUpdater(StateUpdater):
             vels_y = [m['vy'] for m in cluster if 'vy' in m and m['vy'] != 0]
             if vels_x: fused['vx'] = np.mean(vels_x)
             if vels_y: fused['vy'] = np.mean(vels_y)
-            if any(m.get('mode_3a') for m in cluster): fused['mode_3a'] = [m.get('mode_3a') for m in cluster if m.get('mode_3a')][0]
+            
+            # Propagate identity fields
+            if any(m.get('mode_3a') or m.get('mode3a') for m in cluster):
+                fused['mode_3a'] = next((m.get('mode_3a') or m.get('mode3a') for m in cluster if m.get('mode_3a') or m.get('mode3a')), None)
+            if any(m.get('mode_s') for m in cluster):
+                fused['mode_s'] = next((m['mode_s'] for m in cluster if m.get('mode_s')), None)
+            
+            # Propagate meas_type (prefer SSR if any SSR in cluster)
+            types = [m.get('meas_type', 'PSR') for m in cluster]
+            fused['meas_type'] = 'SSR' if 'SSR' in types else 'PSR'
+            
             meta.append(fused)
         return meta
 

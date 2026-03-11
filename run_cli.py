@@ -230,8 +230,16 @@ def run_cli():
             "Recall": metrics['recall'],
             "F1": metrics['f1']
         })
-        print(f"✓ Results logged to MLflow (Run ID: {mlflow.active_run().info.run_id})")
+        print(f"Results logged to MLflow (Run ID: {mlflow.active_run().info.run_id})")
         mlflow.end_run()
 
 if __name__ == "__main__":
-    run_cli()
+    import traceback
+    try:
+        run_cli()
+    except Exception as e:
+        with open("eval_error_log.txt", "w") as f:
+            f.write(str(e) + "\n")
+            f.write(traceback.format_exc())
+        print("CRITICAL ERROR: See eval_error_log.txt")
+        traceback.print_exc()

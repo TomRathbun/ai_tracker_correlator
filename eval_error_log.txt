@@ -1,0 +1,16 @@
+'StateUpdaterConfig' object has no attribute 'state_updater'
+Traceback (most recent call last):
+  File "C:\Users\USER\ai_tracker_correlator\run_cli.py", line 239, in <module>
+    run_cli()
+  File "C:\Users\USER\ai_tracker_correlator\run_cli.py", line 165, in run_cli
+    predicted_tracks = pipeline.process_frame(window_meas, t=current_t + window_size)
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\USER\ai_tracker_correlator\src\pipeline.py", line 140, in process_frame
+    self.tracks = self.state_updater.update(filtered_measurements, self.tracks, dt=dt)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\USER\ai_tracker_correlator\src\updater.py", line 233, in update
+    init_thresh = self.config.state_updater.init_thresh
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\USER\ai_tracker_correlator\.venv\Lib\site-packages\pydantic\main.py", line 1026, in __getattr__
+    raise AttributeError(f'{type(self).__name__!r} object has no attribute {item!r}')
+AttributeError: 'StateUpdaterConfig' object has no attribute 'state_updater'
