@@ -8,15 +8,12 @@ from abc import ABC, abstractmethod
 from typing import List, Dict, Optional, Tuple
 import numpy as np
 import torch
-from pathlib import Path
 
 from src.config_schemas import PipelineConfig
-from src.kalman_filter import SimpleKalmanFilter
 from src.model_v3 import RecurrentGATTrackerV3, build_sparse_edges
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
 from scipy.optimize import linear_sum_assignment
-import traceback
 
 
 class StateUpdater(ABC):
@@ -71,23 +68,10 @@ class GNNUpdater(StateUpdater):
                 state_dict = checkpoint
             
             # Identify architecture by keys
-            if "gat1.att" in state_dict or "gat1.lin_l.weight" in state_dict:
-                self.model = RecurrentGATTrackerV3()
-                self.model_type = "v3"
-            elif "gat.w.weight" in state_dict or "node_enc.weight" in state_dict:
-                # Check dimension from state_dict to handle legacy 32 vs 64
-                node_dim = 32
-                if "node_enc.weight" in state_dict:
-                    node_dim = state_dict["node_enc.weight"].shape[0]
-                elif "gat.w.weight" in state_dict:
-                    node_dim = state_dict["gat.w.weight"].shape[0]
-                    
-                self.model = GNNTracker(node_dim=node_dim)
-                self.model_type = "legacy"
-            else:
-                # Default to V3
-                self.model = RecurrentGATTrackerV3()
-                self.model_type = "v3"
+            if "gat1.att" not in str(state_dict.keys()) and "gat1.lin_l.weight" not in str(state_dict.keys()):
+                raise RuntimeError("Only RecurrentGATTrackerV3 supported. Legacy path removed.")
+            self.model = RecurrentGATTrackerV3()
+            self.model_type = "v3"
                 
             self.model.load_state_dict(state_dict)
             self.model.to(self.device)
@@ -216,11 +200,18 @@ class GNNUpdater(StateUpdater):
         existence_logits = out[:, 6]
         existence_probs = torch.sigmoid(existence_logits)
         
+        self.frame_count += 1
+        if self.frame_count % 10 == 0 and num_tracks < len(existence_probs):
+            meas_probs = existence_probs[num_tracks:]
+            print(f"GNN Frame {self.frame_count} | meas probs: mean={meas_probs.mean():.3f} max={meas_probs.max():.3f} "
+                  f"initiated={sum((meas_probs > getattr(self.config, 'init_thresh', 0.30))).item()}")
+
         # Use config values for management
-        # Higher threshold (0.6) for legacy initiation to reduce clutter tracks
-        init_thresh = getattr(self.full_config.track_manager, 'association_threshold', 0.6)
-        if self.model_type != "v3":
-            init_thresh = max(init_thresh, 0.6)
+        init_thresh = getattr(self.config, 'init_thresh', 0.30)
+        coast_thresh = getattr(self.config, 'coast_thresh', 0.12)
+        suppress_thresh = getattr(self.config, 'suppress_thresh', 0.75)
+        del_exist = getattr(self.config, 'del_exist', 0.08)
+        del_age = getattr(self.config, 'del_age', 8)
         
         updated_tracks = manage_tracks(
             active_tracks=tracks,
@@ -233,26 +224,43 @@ class GNNUpdater(StateUpdater):
             num_tracks=num_tracks,
             num_meas=num_meas,
             init_thresh=init_thresh,
-            coast_thresh=0.15,
-            suppress_thresh=0.8,
-            del_exist=0.05,
-            del_age=8,
+            coast_thresh=coast_thresh,
+            suppress_thresh=suppress_thresh,
+            del_exist=del_exist,
+            del_age=del_age,
             track_cap=100
         )
         
         return updated_tracks
     
     def predict(self, tracks: List[Dict]) -> List[Dict]:
-        """Predict next state using constant velocity model."""
-        # Simple constant velocity prediction
+        """Predict next state for tracks, using GRU to evolve hidden state."""
         predicted = []
         for track in tracks:
             pred = track.copy()
+            if 'state_tensor' in track and 'hidden' in track and self.model is not None:
+                # Evolve GRU hidden states
+                with torch.no_grad():
+                    dummy_x = track['state_tensor']
+                    # Project dummy_x back to hidden_dim if necessary, or just GRU step with zeros
+                    # The full forward usually expects encoder input.
+                    # We can use the gru cell directly with the encoded embedding or just pad:
+                    # For simplicity, we can do a dummy forward of the GRU cell with a zero tensor 
+                    # as 'input' to let the hidden state decay/evolve, or just with a projection of state
+                    # Here we just feed zero input of size hidden_dim.
+                    dummy_input = torch.zeros(1, self.model.hidden_dim, device=self.device)
+                    new_hidden = self.model.gru(dummy_input, track['hidden'].unsqueeze(0))
+                    pred['hidden'] = new_hidden.squeeze(0)
+
             # If state is a tensor, update it
-            if isinstance(pred['state'], torch.Tensor):
-                state = pred['state'].clone()
+            if isinstance(pred.get('state_tensor', pred.get('state')), torch.Tensor):
+                state_key = 'state_tensor' if 'state_tensor' in pred else 'state'
+                state = pred[state_key].clone()
                 state[0:3] += state[3:6] * 1.0 # Assuming dt=1 for step
-                pred['state'] = state
+                pred[state_key] = state
+                pred['x'] = state[0].item()
+                pred['y'] = state[1].item()
+                pred['z'] = state[2].item()
             else:
                 pred['x'] += track.get('vx', 0)
                 pred['y'] += track.get('vy', 0)

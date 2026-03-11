@@ -25,7 +25,8 @@ def run_cli():
     parser.add_argument("--mode", type=str, choices=["gnn", "kalman", "hybrid"], default="hybrid", help="State updater type")
     parser.add_argument("--arch", type=str, default="gnn_hybrid", help="Architecture tag")
     parser.add_argument("--val-only", action="store_true", help="Only evaluate on validation split (frames 240-300)")
-    
+    parser.add_argument("--gnn-model-path", type=str, default="checkpoints/model_v3.pt",
+                        help="Path to GNN model checkpoint")
     # Hyperparameters
     parser.add_argument("--min-hits", type=int, default=5, help="Min hits for track confirmation")
     parser.add_argument("--max-age", type=int, default=5, help="Max age for track coasting")
@@ -38,6 +39,11 @@ def run_cli():
     parser.add_argument("--run-name", type=str, help="Custom MLflow run name")
 
     args = parser.parse_args()
+
+    config = PipelineConfig()
+    config.state_updater.type = args.mode
+    config.state_updater.gnn_model_path = "checkpoints/model_v3.pt"  # Add this line
+    config.state_updater.gnn_model_path = args.gnn_model_path
 
     # 1. Initialize MLflow
     use_mlflow = not args.no_mlflow

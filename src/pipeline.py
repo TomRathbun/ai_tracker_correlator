@@ -6,13 +6,10 @@ support for branching logic (PSR vs SSR) and fallback mechanisms.
 """
 
 from abc import ABC, abstractmethod
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 import torch
-import numpy as np
-from pathlib import Path
-
 from src.config_schemas import PipelineConfig
-from src.updater import StateUpdater, GNNUpdater, FallbackUpdater, NewHybridUpdater
+from src.updater import GNNUpdater, FallbackUpdater, NewHybridUpdater
 from src.clutter_classifier import ClutterClassifier, extract_clutter_features
 
 
