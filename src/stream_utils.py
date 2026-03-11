@@ -44,28 +44,40 @@ def load_stream_and_truth(data_file: str):
                     'track_id': tid
                 })
             
-    # Sort trajectories by time
+    # Sort trajectories and pre-extract times for binary search
+    truth_arrays = {}
     for tid in truth_trajectories:
-        truth_trajectories[tid].sort(key=lambda x: x['t'])
+        states = sorted(truth_trajectories[tid], key=lambda x: x['t'])
+        truth_trajectories[tid] = states
+        truth_arrays[tid] = np.array([s['t'] for s in states])
         
-    return measurements, truth_trajectories, sorted(list(unique_track_ids))
+    return measurements, (truth_trajectories, truth_arrays), sorted(list(unique_track_ids))
 
-def get_truth_at_time(truth_trajectories: Dict, t: float, allowed_ids: set) -> List[Dict]:
-    """Retrieves the state of all tracks at time t."""
+def get_truth_at_time(truth_data: Tuple[Dict, Dict], t: float, allowed_ids: set) -> List[Dict]:
+    """Retrieves the state of all tracks at time t using binary search."""
+    truth_trajectories, truth_arrays = truth_data
     active_gt = []
+    
     for tid in allowed_ids:
-        if tid not in truth_trajectories: continue
-        states = truth_trajectories[tid]
+        if tid not in truth_arrays: continue
         
-        # Binary search or closest neighbor
-        closest = None
-        min_dt = 5.0 # Max 5s lookback/ahead for truth matching
-        for s in states:
-            dt = abs(s['t'] - t)
-            if dt < min_dt:
-                min_dt = dt
-                closest = s
+        times = truth_arrays[tid]
+        # Find index where t would be inserted
+        idx = np.searchsorted(times, t)
         
-        if closest:
-            active_gt.append(closest)
+        # Check if the closest point is within a reasonable window (e.g. 5s)
+        best_s = None
+        min_dt = 5.0
+        
+        # Check index and neighbor
+        for i in [idx - 1, idx]:
+            if 0 <= i < len(times):
+                dt = abs(times[i] - t)
+                if dt < min_dt:
+                    min_dt = dt
+                    best_s = truth_trajectories[tid][i]
+        
+        if best_s:
+            active_gt.append(best_s)
+            
     return active_gt
