@@ -18,11 +18,11 @@ class SimpleKalmanFilter:
         # Covariance matrix
         self.P = np.eye(6) * 5000.0**2
         
-        # Process noise
-        self.Q = np.eye(6) * 100.0**2
+        # Process noise (how much state can change per step)
+        self.Q = np.eye(6) * 20.0**2
         
-        # Measurement noise
-        self.R = np.eye(6) * 2000.0**2
+        # Measurement noise (radar accuracy)
+        self.R = np.eye(6) * 150.0**2
     
     def _update_F(self, dt):
         """Update state transition matrix for current dt."""

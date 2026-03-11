@@ -569,6 +569,7 @@ class NewHybridUpdater(StateUpdater):
             idxs = np.where(labels == c)[0]
             cluster = [measurements[idx] for idx in idxs]
             fused = {
+                't': np.mean([m['t'] for m in cluster]),
                 'x': np.mean([m['x'] for m in cluster]),
                 'y': np.mean([m['y'] for m in cluster]),
                 'z': np.mean([m['z'] for m in cluster]),

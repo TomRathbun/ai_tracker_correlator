@@ -27,9 +27,9 @@ class StateUpdaterConfig(BaseModel):
     """Configuration for state estimation."""
     type: Literal["gnn", "kalman", "hybrid"] = "gnn"
     gnn_model_path: Optional[Path] = Path("checkpoints/gnn_tracker.pt")
-    process_noise: float = Field(1.0, gt=0.0)
-    measurement_noise: float = Field(1.0, gt=0.0)
-    init_thresh: float = 0.55
+    process_noise: float = Field(20.0, gt=0.0)
+    measurement_noise: float = Field(150.0, gt=0.0)
+    init_thresh: float = 0.45
     coast_thresh: float = 0.15
     suppress_thresh: float = 0.75
     del_exist: float = 0.05
@@ -39,7 +39,7 @@ class StateUpdaterConfig(BaseModel):
 
 class TrackManagerConfig(BaseModel):
     """Configuration for track management."""
-    min_hits: int = Field(5, ge=1)
+    min_hits: int = Field(3, ge=1)
     max_age: int = Field(5, ge=1)
     association_threshold: float = Field(0.35, ge=0.0, le=1.0)
 
