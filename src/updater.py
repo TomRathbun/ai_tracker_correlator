@@ -436,6 +436,9 @@ class NewHybridUpdater(StateUpdater):
             for t in tracks: t['age'] = t.get('age', 0) + 1
             return tracks
             
+        # Current frame time (from pipeline, passed as dt since last frame)
+        frame_t = measurements[-1].get('t', None)  # approximate frame end time
+        
         # 1. Spatial Fusion (Cluster reports within this frame)
         meta_measurements = self._spatial_cluster(measurements)
         
@@ -454,7 +457,6 @@ class NewHybridUpdater(StateUpdater):
                 # Update logic (Kalman)
                 track['age'] = 0
                 track['hits'] = track.get('hits', 0) + meta['cluster_size']
-                
                 
                 # Use KF for state update
                 if 'kf' not in track:
