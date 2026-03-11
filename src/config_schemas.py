@@ -29,10 +29,10 @@ class StateUpdaterConfig(BaseModel):
     gnn_model_path: Optional[Path] = Path("checkpoints/gnn_tracker.pt")
     process_noise: float = Field(1.0, gt=0.0)
     measurement_noise: float = Field(1.0, gt=0.0)
-    init_thresh: float = 0.30
-    coast_thresh: float = 0.12
+    init_thresh: float = 0.55
+    coast_thresh: float = 0.15
     suppress_thresh: float = 0.75
-    del_exist: float = 0.08
+    del_exist: float = 0.05
     del_age: int = 15
     track_cap: int = 500
 

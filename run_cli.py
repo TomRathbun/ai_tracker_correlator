@@ -70,11 +70,15 @@ def run_cli():
 
     args = parser.parse_args()
 
+    # 2. Build Config
     config = PipelineConfig()
     config.state_updater.type = args.mode
-    config.state_updater.gnn_model_path = "checkpoints/model_v3.pt"  # Add this line
     config.state_updater.gnn_model_path = args.gnn_model_path
-
+    config.track_manager.min_hits = args.min_hits
+    config.state_updater.del_age = args.max_age
+    config.state_updater.track_cap = args.track_cap
+    config.clutter_filter.threshold = args.clutter_threshold
+    
     # 1. Initialize MLflow
     use_mlflow = not args.no_mlflow
     if use_mlflow:

@@ -70,42 +70,69 @@ def load_stream_and_truth(data_file: str):
     # Create a time-bucketed map for O(1) lookup during evaluation
     # Key: int(t), Value: List of aircraft states at that second
     # We DEDUPLICATE: If a track has multiple measurements in 1s, we take the mean
-    truth_map = {}
-    
-    print("Bucketing and deduplicating ground truth...")
+    # This truth_map is no longer used by get_truth_at_time, which now interpolates directly from truth_trajectories
+    # print("Bucketing and deduplicating ground truth...")
+    # for tid, states in truth_trajectories.items():
+    #     # Group points of this track by second
+    #     buckets_for_track = {}
+    #     for s in states:
+    #         tb = int(s['t'])
+    #         if tb not in buckets_for_track: buckets_for_track[tb] = []
+    #         buckets_for_track[tb].append(s)
+            
+    #     # For each second, compute average state for this track
+    #     for tb, s_list in buckets_for_track.items():
+    #         if tb not in truth_map: truth_map[tb] = []
+            
+    #         avg_state = {
+    #             't': tb + 0.5,
+    #             'x': np.mean([s['x'] for s in s_list]),
+    #             'y': np.mean([s['y'] for s in s_list]),
+    #             'z': np.mean([s['z'] for s in s_list]),
+    #             'vx': np.mean([s['vx'] for s in s_list]),
+    #             'vy': np.mean([s['vy'] for s in s_list]),
+    #             'vz': 0,
+    #             'track_id': tid
+    #         }
+    #         truth_map[tb].append(avg_state)
+            
+    return measurements, truth_trajectories, sorted(list(unique_track_ids))
+
+def get_truth_at_time(truth_trajectories: Dict[int, List[Dict]], t: float, allowed_ids: set = None) -> List[Dict]:
+    """Retrieves the exact interpolated state of all tracks at time t."""
+    results = []
     for tid, states in truth_trajectories.items():
-        # Group points of this track by second
-        buckets_for_track = {}
-        for s in states:
-            tb = int(s['t'])
-            if tb not in buckets_for_track: buckets_for_track[tb] = []
-            buckets_for_track[tb].append(s)
+        if allowed_ids is not None and tid not in allowed_ids:
+            continue
             
-        # For each second, compute average state for this track
-        for tb, s_list in buckets_for_track.items():
-            if tb not in truth_map: truth_map[tb] = []
+        if not states: continue
+        
+        # Binary search for interpolation window
+        times = [s['t'] for s in states]
+        if t < times[0] or t > times[-1]:
+            continue
             
-            avg_state = {
-                't': tb + 0.5,
-                'x': np.mean([s['x'] for s in s_list]),
-                'y': np.mean([s['y'] for s in s_list]),
-                'z': np.mean([s['z'] for s in s_list]),
-                'vx': np.mean([s['vx'] for s in s_list]),
-                'vy': np.mean([s['vy'] for s in s_list]),
+        # Linear Interpolation
+        idx = np.searchsorted(times, t)
+        if idx == 0:
+            results.append(states[0])
+        elif idx == len(times):
+            results.append(states[-1])
+        else:
+            s1, s2 = states[idx-1], states[idx]
+            dt = s2['t'] - s1['t']
+            if dt < 1e-6:
+                results.append(s1)
+                continue
+            f = (t - s1['t']) / dt
+            results.append({
+                't': t,
+                'x': s1['x'] + f * (s2['x'] - s1['x']),
+                'y': s1['y'] + f * (s2['y'] - s1['y']),
+                'z': s1['z'] + f * (s2['z'] - s1['z']),
+                'vx': s1['vx'] + f * (s2['vx'] - s1['vx']),
+                'vy': s1['vy'] + f * (s2['vy'] - s1['vy']),
                 'vz': 0,
                 'track_id': tid
-            }
-            truth_map[tb].append(avg_state)
-            
-    return measurements, truth_map, sorted(list(unique_track_ids))
-
-def get_truth_at_time(truth_map: Dict[int, List[Dict]], t: float, allowed_ids: set) -> List[Dict]:
-    """Retrieves the state of all tracks at time t using a pre-bucketed map."""
-    # We check the current second and adjacent seconds to ensure we don't miss 
-    # transitions due to rounding
-    t_int = int(t)
-    candidates = truth_map.get(t_int, [])
-    
-    # Optional: If you want to be extremely precise, you could filter by allowed_ids
-    # but the buckets are already filtered by the loader.
-    return candidates
+            })
+    return results

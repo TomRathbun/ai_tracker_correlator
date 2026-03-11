@@ -115,7 +115,7 @@ class GNNUpdater(StateUpdater):
         # 2. Build full input (tracks + measurements)
         # Note: RecurrentGATTrackerV3 expects hidden state in track dicts
         full_x, sensor_ids, hidden_state, num_tracks = build_full_input(
-            tracks, meas, meas_sensor_ids, num_sensors=3, device=self.device
+            tracks, meas, meas_sensor_ids, num_sensors=5, device=self.device
         )
         
         # 3. Create graph
@@ -226,12 +226,13 @@ class GNNUpdater(StateUpdater):
             print(f"GNN Frame {self.frame_count} | meas probs: mean={meas_probs.mean():.3f} max={meas_probs.max():.3f} "
                   f"initiated={sum((meas_probs > getattr(self.config, 'init_thresh', 0.30))).item()}")
 
-        # Use config values for management
-        init_thresh = getattr(self.config, 'init_thresh', 0.30)
-        coast_thresh = getattr(self.config, 'coast_thresh', 0.12)
-        suppress_thresh = getattr(self.config, 'suppress_thresh', 0.75)
-        del_exist = getattr(self.config, 'del_exist', 0.08)
-        del_age = getattr(self.config, 'del_age', 8)
+        # Use config values from state_updater
+        init_thresh = self.config.state_updater.init_thresh
+        coast_thresh = self.config.state_updater.coast_thresh
+        suppress_thresh = self.config.state_updater.suppress_thresh
+        del_exist = self.config.state_updater.del_exist
+        del_age = self.config.state_updater.del_age
+        track_cap = self.config.state_updater.track_cap
         
         updated_tracks = manage_tracks(
             active_tracks=tracks,
@@ -248,7 +249,7 @@ class GNNUpdater(StateUpdater):
             suppress_thresh=suppress_thresh,
             del_exist=del_exist,
             del_age=del_age,
-            track_cap=100
+            track_cap=track_cap
         )
         
         return updated_tracks
