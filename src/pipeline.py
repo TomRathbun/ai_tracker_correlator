@@ -137,7 +137,7 @@ class Pipeline:
         
         # Step 3: State update & Association
         # The updater returns a list of updated tracks and potentially new candidates
-        self.tracks = self.state_updater.update(filtered_measurements, self.tracks)
+        self.tracks = self.state_updater.update(filtered_measurements, self.tracks, dt=dt)
         
         # Step 4: Track Management (Promotion / Deletion)
         confirmed = []

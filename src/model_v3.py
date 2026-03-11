@@ -22,7 +22,7 @@ from src.metrics import TrackingMetrics   # your existing metrics
 
 class RecurrentGATTrackerV3(nn.Module):
     """Single ML component for the entire multi-radar fusion pipeline."""
-    def __init__(self, num_sensors=3, hidden_dim=64, state_dim=6, num_heads=4, edge_dim=7):
+    def __init__(self, num_sensors=5, hidden_dim=64, state_dim=6, num_heads=4, edge_dim=7):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.state_dim = state_dim
@@ -216,7 +216,7 @@ def focal_bce(logits, targets, alpha=0.25, gamma=2.0):
 
 
 def manage_tracks(active_tracks, out, new_hidden_full, existence_probs, existence_logits, alpha, edge_index,
-                  num_tracks, num_meas, init_thresh, coast_thresh, suppress_thresh, del_exist, del_age, track_cap):
+                  num_tracks, num_meas, init_thresh, coast_thresh, suppress_thresh, del_exist, del_age, track_cap, dt=1.0):
     meas_offset = num_tracks
     attn_suppress = torch.zeros(num_meas, dtype=torch.bool, device=out.device)
     if num_meas > 0 and alpha is not None and alpha.numel() > 0:
@@ -237,7 +237,10 @@ def manage_tracks(active_tracks, out, new_hidden_full, existence_probs, existenc
             prob = existence_probs[i] + coast_boost
             if prob > coast_thresh:
                 track = active_tracks[i].copy()
-                track['state_tensor'] = out[i, :6].detach()
+                # Apply motion model for existing tracks
+                state = out[i, :6].detach()
+                state[0:3] += state[3:6] * dt # Use dt here
+                track['state_tensor'] = state
                 track['hidden'] = new_hidden_full[i].detach()
                 track['logit'] = existence_logits[i]
                 if existence_probs[i] > 0.4:

@@ -155,7 +155,8 @@ def train_streaming(num_epochs=10, data_file="data/stream_radar_001.jsonl", wind
             active_tracks = manage_tracks(
                 active_tracks, out, new_hidden_full, existence_probs, existence_logits, 
                 alpha, edge_index, num_tracks, num_meas, 
-                init_thresh, coast_thresh, suppress_thresh, del_exist, del_age, track_cap
+                init_thresh, coast_thresh, suppress_thresh, del_exist, del_age, track_cap,
+                dt=window_size
             )
             
             # 6. Loss Calculation (Supervision)

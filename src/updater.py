@@ -20,12 +20,12 @@ class StateUpdater(ABC):
     """Abstract base class for state estimation modules."""
     
     @abstractmethod
-    def update(self, measurements: List[Dict], tracks: List[Dict]) -> List[Dict]:
+    def update(self, measurements: List[Dict], tracks: List[Dict], dt: float = 1.0) -> List[Dict]:
         """Update track states given measurements."""
         pass
     
     @abstractmethod
-    def predict(self, tracks: List[Dict]) -> List[Dict]:
+    def predict(self, tracks: List[Dict], dt: float = 1.0) -> List[Dict]:
         """Predict next state for tracks."""
         pass
 
@@ -69,7 +69,7 @@ class GNNUpdater(StateUpdater):
             # Identify architecture by keys
             if "gat1.att" not in str(state_dict.keys()) and "gat1.lin_l.weight" not in str(state_dict.keys()):
                 raise RuntimeError("Only RecurrentGATTrackerV3 supported. Legacy path removed.")
-            self.model = RecurrentGATTrackerV3()
+            self.model = RecurrentGATTrackerV3(num_sensors=5)
             self.model_type = "v3"
                 
             self.model.load_state_dict(state_dict)
@@ -98,7 +98,7 @@ class GNNUpdater(StateUpdater):
             self.model_type = None
             self.psr_clf = self.ssr_clf = None
     
-    def update(self, measurements: List[Dict], tracks: List[Dict]) -> List[Dict]:
+    def update(self, measurements: List[Dict], tracks: List[Dict], dt: float = 1.0) -> List[Dict]:
         """Update tracks using GNN."""
         if self.model is None or not measurements:
             return tracks
@@ -252,12 +252,13 @@ class GNNUpdater(StateUpdater):
             suppress_thresh=suppress_thresh,
             del_exist=del_exist,
             del_age=del_age,
-            track_cap=track_cap
+            track_cap=track_cap,
+            dt=dt
         )
         
         return updated_tracks
     
-    def predict(self, tracks: List[Dict]) -> List[Dict]:
+    def predict(self, tracks: List[Dict], dt: float = 1.0) -> List[Dict]:
         """Predict next state for tracks, using GRU to evolve hidden state."""
         predicted = []
         for track in tracks:
@@ -280,7 +281,7 @@ class GNNUpdater(StateUpdater):
             if isinstance(pred.get('state_tensor', pred.get('state')), torch.Tensor):
                 state_key = 'state_tensor' if 'state_tensor' in pred else 'state'
                 state = pred[state_key].clone()
-                state[0:3] += state[3:6] * 1.0 # Assuming dt=1 for step
+                state[0:3] += state[3:6] * dt
                 pred[state_key] = state
                 pred['x'] = state[0].item()
                 pred['y'] = state[1].item()
@@ -308,7 +309,7 @@ class FallbackUpdater(StateUpdater):
         self.config = config.state_updater
         # We'll create filters on demand per track or use a simplified one
     
-    def update(self, measurements: List[Dict], tracks: List[Dict]) -> List[Dict]:
+    def update(self, measurements: List[Dict], tracks: List[Dict], dt: float = 1.0) -> List[Dict]:
         """Update tracks using simplified Kalman logic with initiation."""
         updated_tracks = []
         matched_meas_indices = set()
@@ -430,7 +431,7 @@ class NewHybridUpdater(StateUpdater):
         except Exception as e:
             raise RuntimeError(f"CRITICAL: NewHybridUpdater failed to load classifiers: {e}")
 
-    def update(self, measurements: List[Dict], tracks: List[Dict]) -> List[Dict]:
+    def update(self, measurements: List[Dict], tracks: List[Dict], dt: float = 1.0) -> List[Dict]:
         if not measurements:
             for t in tracks: t['age'] = t.get('age', 0) + 1
             return tracks
@@ -498,13 +499,12 @@ class NewHybridUpdater(StateUpdater):
         return updated_tracks
 
     def predict(self, tracks: List[Dict], dt: float = 1.0) -> List[Dict]:
+        """Predict using Kalman internal state."""
         for track in tracks:
             if 'kf' in track:
                 track['kf'].predict(dt=dt)
-                # Sync back to dict
-                kf = track['kf']
-                track['x'], track['y'], track['z'] = kf.x[0], kf.x[1], kf.x[2]
-                track['vx'], track['vy'], track['vz'] = kf.x[3], kf.x[4], kf.x[5]
+                # Sync back to track dict
+                track['x'], track['y'], track['z'], track['vx'], track['vy'], track['vz'] = track['kf'].x[:6].flatten().tolist()
             else:
                 # Fallback to simple motion if no KF yet
                 track['x'] += track.get('vx', 0) * dt
