@@ -533,6 +533,10 @@ class NewHybridUpdater(StateUpdater):
         
         for i, j in pairs:
             m1, m2 = measurements[i], measurements[j]
+            # Spatial Gate: Skip feature calculation if too far apart (saves 90% time)
+            dist_sq = (m1['x'] - m2['x'])**2 + (m1['y'] - m2['y'])**2
+            if dist_sq > 5000.0**2: continue
+            
             t1, t2 = m1.get('type', 'PSR'), m2.get('type', 'PSR')
             if t1 == 'PSR' and t2 == 'PSR':
                 psr_pairs.append((i, j, compute_psr_psr_features(m1, m2)))

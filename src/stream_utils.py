@@ -15,6 +15,9 @@ def load_stream_and_truth(data_file: str):
         for line in f:
             measurements.append(json.loads(line))
             
+    # CRITICAL: Ensure stream is strictly sorted for windowing logic
+    measurements.sort(key=lambda x: x['t'])
+            
     # --- Auto-Calibration ---
     # We solve for origin_lat and origin_lon using the first 100 valid real measurements
     cal_points = [m for m in measurements[:500] if m.get('track_id', -1) != -1 and m.get('source_lat') is not None]
@@ -66,15 +69,33 @@ def load_stream_and_truth(data_file: str):
             
     # Create a time-bucketed map for O(1) lookup during evaluation
     # Key: int(t), Value: List of aircraft states at that second
+    # We DEDUPLICATE: If a track has multiple measurements in 1s, we take the mean
     truth_map = {}
     
-    print("Bucketing ground truth for fast lookup...")
+    print("Bucketing and deduplicating ground truth...")
     for tid, states in truth_trajectories.items():
+        # Group points of this track by second
+        buckets_for_track = {}
         for s in states:
-            t_bucket = int(s['t'])
-            if t_bucket not in truth_map:
-                truth_map[t_bucket] = []
-            truth_map[t_bucket].append(s)
+            tb = int(s['t'])
+            if tb not in buckets_for_track: buckets_for_track[tb] = []
+            buckets_for_track[tb].append(s)
+            
+        # For each second, compute average state for this track
+        for tb, s_list in buckets_for_track.items():
+            if tb not in truth_map: truth_map[tb] = []
+            
+            avg_state = {
+                't': tb + 0.5,
+                'x': np.mean([s['x'] for s in s_list]),
+                'y': np.mean([s['y'] for s in s_list]),
+                'z': np.mean([s['z'] for s in s_list]),
+                'vx': np.mean([s['vx'] for s in s_list]),
+                'vy': np.mean([s['vy'] for s in s_list]),
+                'vz': 0,
+                'track_id': tid
+            }
+            truth_map[tb].append(avg_state)
             
     return measurements, truth_map, sorted(list(unique_track_ids))
 
