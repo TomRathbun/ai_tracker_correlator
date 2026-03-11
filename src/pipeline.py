@@ -114,16 +114,26 @@ class Pipeline:
         
         # Track state
         self.tracks = []
+        self.last_t = None
     
-    def process_frame(self, measurements: List[Dict]) -> List[Dict]:
+    def process_frame(self, measurements: List[Dict], t: float = None) -> List[Dict]:
         """
         Process a single frame of measurements.
         """
+        if t is None and measurements:
+            t = np.mean([m['t'] for m in measurements])
+            
+        dt = 1.0 # Default fallback
+        if self.last_t is not None and t is not None:
+            dt = t - self.last_t
+        if t is not None:
+            self.last_t = t
+
         # Step 1: Clutter filtering
         filtered_measurements = self.clutter_filter.process(measurements)
         
         # Step 2: Prediction
-        self.tracks = self.state_updater.predict(self.tracks)
+        self.tracks = self.state_updater.predict(self.tracks, dt=dt)
         
         # Step 3: State update & Association
         # The updater returns a list of updated tracks and potentially new candidates

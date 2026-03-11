@@ -157,7 +157,7 @@ def run_cli():
             
             # Predict
             profiler.start("AI Pipeline")
-            predicted_tracks = pipeline.process_frame(window_meas)
+            predicted_tracks = pipeline.process_frame(window_meas, t=current_t + window_size)
             profiler.stop("AI Pipeline")
             
             # Get Truth for this window
@@ -191,7 +191,8 @@ def run_cli():
             gt_tracks = frame.get('gt_tracks', [])
             
             profiler.start("AI Pipeline")
-            predicted_tracks = pipeline.process_frame(measurements)
+            frame_t = gt_tracks[0]['t'] if gt_tracks else None
+            predicted_tracks = pipeline.process_frame(measurements, t=frame_t)
             profiler.stop("AI Pipeline")
             
             profiler.start("Metrics Calc")

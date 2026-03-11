@@ -6,19 +6,11 @@ import numpy as np
 class SimpleKalmanFilter:
     """Constant velocity Kalman filter for 3D tracking"""
     
-    def __init__(self, dt: float = 3.0):
+    def __init__(self, dt: float = 1.0):
         # State: [x, y, z, vx, vy, vz]
         self.x = np.zeros(6)
-        
-        # State transition (constant velocity)
-        self.F = np.array([
-            [1, 0, 0, dt, 0, 0],
-            [0, 1, 0, 0, dt, 0],
-            [0, 0, 1, 0, 0, dt],
-            [0, 0, 0, 1, 0, 0],
-            [0, 0, 0, 0, 1, 0],
-            [0, 0, 0, 0, 0, 1]
-        ])
+        self.dt = dt
+        self._update_F(dt)
         
         # Measurement matrix (observe all states)
         self.H = np.eye(6)
@@ -32,8 +24,23 @@ class SimpleKalmanFilter:
         # Measurement noise
         self.R = np.eye(6) * 2000.0**2
     
-    def predict(self):
-        """Predict next state"""
+    def _update_F(self, dt):
+        """Update state transition matrix for current dt."""
+        self.F = np.array([
+            [1, 0, 0, dt, 0, 0],
+            [0, 1, 0, 0, dt, 0],
+            [0, 0, 1, 0, 0, dt],
+            [0, 0, 0, 1, 0, 0],
+            [0, 0, 0, 0, 1, 0],
+            [0, 0, 0, 0, 0, 1]
+        ])
+
+    def predict(self, dt=None):
+        """Predict next state with optional variable dt."""
+        if dt is not None and dt != self.dt:
+            self.dt = dt
+            self._update_F(dt)
+            
         self.x = self.F @ self.x
         self.P = self.F @ self.P @ self.F.T + self.Q
     

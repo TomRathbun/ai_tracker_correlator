@@ -493,19 +493,19 @@ class NewHybridUpdater(StateUpdater):
             
         return updated_tracks
 
-    def predict(self, tracks: List[Dict]) -> List[Dict]:
+    def predict(self, tracks: List[Dict], dt: float = 1.0) -> List[Dict]:
         for track in tracks:
             if 'kf' in track:
-                track['kf'].predict()
+                track['kf'].predict(dt=dt)
                 # Sync back to dict
                 kf = track['kf']
                 track['x'], track['y'], track['z'] = kf.x[0], kf.x[1], kf.x[2]
                 track['vx'], track['vy'], track['vz'] = kf.x[3], kf.x[4], kf.x[5]
             else:
                 # Fallback to simple motion if no KF yet
-                track['x'] += track.get('vx', 0) * 3.0
-                track['y'] += track.get('vy', 0) * 3.0
-                track['z'] += track.get('vz', 0) * 3.0
+                track['x'] += track.get('vx', 0) * dt
+                track['y'] += track.get('vy', 0) * dt
+                track['z'] += track.get('vz', 0) * dt
         return tracks
 
     def _spatial_cluster(self, measurements: List[Dict]) -> List[Dict]:
