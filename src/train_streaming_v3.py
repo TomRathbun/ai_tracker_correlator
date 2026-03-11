@@ -161,7 +161,7 @@ def train_streaming(num_epochs=10, data_file="data/stream_radar_001.jsonl", wind
             
             # 6. Loss Calculation (Supervision)
             # Get ground truth at current time (only for tracks in training set)
-            gt_list = get_truth_at_time(truth_trajectories, current_t + window_size/2, train_ids)
+            gt_list = get_truth_at_time(truth_trajectories, current_t + window_size, train_ids)
             gt_states = torch.tensor([[g['x'], g['y'], g['z'], g['vx'], g['vy'], g['vz']] for g in gt_list], 
                                      dtype=torch.float32, device=device)
             

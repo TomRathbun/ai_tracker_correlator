@@ -167,7 +167,7 @@ def run_cli():
             
             # Get Truth for this window
             profiler.start("Truth Mapping")
-            gt_tracks = get_truth_at_time(truth_trajectories, current_t + window_size/2, set(all_track_ids))
+            gt_tracks = get_truth_at_time(truth_trajectories, current_t + window_size, set(all_track_ids))
             profiler.stop("Truth Mapping")
             
             # Update metrics

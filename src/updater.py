@@ -572,11 +572,14 @@ class NewHybridUpdater(StateUpdater):
                 'x': np.mean([m['x'] for m in cluster]),
                 'y': np.mean([m['y'] for m in cluster]),
                 'z': np.mean([m['z'] for m in cluster]),
-                'vx': np.mean([m.get('vx', 0) for m in cluster]),
-                'vy': np.mean([m.get('vy', 0) for m in cluster]),
-                'vz': np.mean([m.get('vz', 0) for m in cluster]),
                 'cluster_size': len(cluster)
             }
+            
+            # Vectorize velocity fusion: only average available velocities
+            vels_x = [m['vx'] for m in cluster if 'vx' in m and m['vx'] != 0]
+            vels_y = [m['vy'] for m in cluster if 'vy' in m and m['vy'] != 0]
+            if vels_x: fused['vx'] = np.mean(vels_x)
+            if vels_y: fused['vy'] = np.mean(vels_y)
             if any(m.get('mode_3a') for m in cluster): fused['mode_3a'] = [m.get('mode_3a') for m in cluster if m.get('mode_3a')][0]
             meta.append(fused)
         return meta
