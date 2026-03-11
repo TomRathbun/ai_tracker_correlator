@@ -35,48 +35,22 @@ def load_stream_and_truth(data_file: str):
             m = json.loads(line)
             measurements.append(m)
             
-            tid = m.get('track_id', -1)
-            if tid != -1:
-                if tid not in truth_trajectories:
-                    truth_trajectories[tid] = []
-                # Use source info (truth) from the measurement record
-                # Note: In our generator, source_lat/lon were the true coords.
-                # Since we don't have true X/Y directly in the stream fields for truth,
-                # we'll use the 'source_lat/lon' if we had them or just assume the 
-                # measurement was generated from some truth we can infer.
-                # Actually, our generator put 'source_lat' and 'source_lon' there.
-                # We should have probably put 'true_x' and 'true_y' there too.
-                # Let's check the generator code again.
-                pass
-
-    # Wait, the generator code:
-    # "source_lat": record[CAT62_LAT], "source_lon": record[CAT62_LON]
-    # It didn't store true X,Y. But we can reconstruct them or just use the records' 
-    # original X,Y if we had them. 
-    # Actually, in the generator, I calculated:
-    # x_true = (lon - origin_lon) * lon_scale
-    # y_true = (lat - origin_lat) * lat_scale
-    
-    # Simpler: The generator script knows the truth. 
-    # For training, we can just use the measurements' source_lat/lon to represent truth 
-    # (scaled back to meters).
-    
     origin_lat, origin_lon = 24.4539, 54.3773 # UAE Reference (Abu Dhabi)
     lat_scale = 111320.0
     lon_scale = 111320.0 * np.cos(np.radians(origin_lat))
 
     print("Reconstructing ground truth trajectories...")
+    unique_track_ids = set()
     for m in measurements:
         tid = m.get('track_id', -1)
         if tid != -1:
+            unique_track_ids.add(tid)
             if tid not in truth_trajectories:
                 truth_trajectories[tid] = []
             
             tx = (m['source_lon'] - origin_lon) * lon_scale
             ty = (m['source_lat'] - origin_lat) * lat_scale
             # Altitude was estimated from speed in generator, let's just use meas z as truth for now or some proxy
-            # In generator: altitude = 1000 + speed_mps * 20 + noise
-            # We don't have true altitude saved, so we'll use a smoothed version of meas z.
             truth_trajectories[tid].append({
                 't': m['t'],
                 'x': tx,
@@ -91,14 +65,15 @@ def load_stream_and_truth(data_file: str):
     for tid in truth_trajectories:
         truth_trajectories[tid].sort(key=lambda x: x['t'])
         
-    return measurements, truth_trajectories
+    return measurements, truth_trajectories, sorted(list(unique_track_ids))
 
-def get_truth_at_time(truth_trajectories: Dict, t: float) -> List[Dict]:
-    """Retrieves the state of all active tracks at time t."""
+def get_truth_at_time(truth_trajectories: Dict, t: float, allowed_ids: set) -> List[Dict]:
+    """Retrieves the state of all active tracks in allowed_ids at time t."""
     active_gt = []
-    for tid, states in truth_trajectories.items():
+    for tid in allowed_ids:
+        if tid not in truth_trajectories: continue
+        states = truth_trajectories[tid]
         # Find the state closest to time t
-        # For a more robust version, interpolate. For now, nearest neighbor within 5s.
         closest = None
         min_dt = 5.0
         for s in states:
@@ -111,11 +86,31 @@ def get_truth_at_time(truth_trajectories: Dict, t: float) -> List[Dict]:
             active_gt.append(closest)
     return active_gt
 
-def train_streaming(num_epochs=10, data_file="data/stream_radar_001.jsonl", window_size=2.0):
+def train_streaming(num_epochs=10, data_file="data/stream_radar_001.jsonl", window_size=2.0, split_ratio=0.8):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     # Load stream and truth
-    measurements, truth_trajectories = load_stream_and_truth(data_file)
+    measurements_all, truth_trajectories, all_track_ids = load_stream_and_truth(data_file)
+    
+    # Perform Track ID split
+    np.random.seed(42)
+    np.random.shuffle(all_track_ids)
+    num_train = int(len(all_track_ids) * split_ratio)
+    train_ids = set(all_track_ids[:num_train])
+    test_ids = set(all_track_ids[num_train:])
+    
+    print(f"Split Summary: {len(train_ids)} Training Tracks, {len(test_ids)} Testing Tracks")
+    
+    # Save test IDs for evaluation consistency
+    with open("data/test_track_ids.json", "w") as f:
+        json.dump(sorted(list(test_ids)), f)
+    print("✓ Saved test track IDs to data/test_track_ids.json")
+    
+    # Filter training measurements
+    # We keep all training tracks AND all clutter (track_id == -1)
+    measurements = [m for m in measurements_all if m.get('track_id', -1) in train_ids or m.get('track_id', -1) == -1]
+    
+    print(f"Training on {len(measurements)} measurements (filtered from {len(measurements_all)})")
     
     # Load pairwise classifiers for GNN features
     try:
@@ -147,6 +142,7 @@ def train_streaming(num_epochs=10, data_file="data/stream_radar_001.jsonl", wind
         t_end = measurements[-1]['t']
         
         pbar = tqdm(total=int(t_end - t_start), desc=f"Epoch {epoch+1}")
+        
         
         current_t = t_start
         meas_idx = 0
@@ -210,8 +206,8 @@ def train_streaming(num_epochs=10, data_file="data/stream_radar_001.jsonl", wind
             )
             
             # 6. Loss Calculation (Supervision)
-            # Get ground truth at current time
-            gt_list = get_truth_at_time(truth_trajectories, current_t + window_size/2)
+            # Get ground truth at current time (only for tracks in training set)
+            gt_list = get_truth_at_time(truth_trajectories, current_t + window_size/2, train_ids)
             gt_states = torch.tensor([[g['x'], g['y'], g['z'], g['vx'], g['vy'], g['vz']] for g in gt_list], 
                                      dtype=torch.float32, device=device)
             
