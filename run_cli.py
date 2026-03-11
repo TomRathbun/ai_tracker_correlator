@@ -177,6 +177,7 @@ def run_cli():
         # Standard Frame-based Evaluation
         with open(args.data, 'r') as f:
             frames = [json.loads(line) for line in f]
+        profiler.stop("Data Loading")
         
         if args.val_only:
             print(f"🧪 Val-only mode: Using frames 240-300")
@@ -188,8 +189,15 @@ def run_cli():
         for frame_idx, frame in enumerate(tqdm(frames, desc="Processing")):
             measurements = frame.get('measurements', [])
             gt_tracks = frame.get('gt_tracks', [])
+            
+            profiler.start("AI Pipeline")
             predicted_tracks = pipeline.process_frame(measurements)
+            profiler.stop("AI Pipeline")
+            
+            profiler.start("Metrics Calc")
             metrics_tracker.update(predicted_tracks, gt_tracks)
+            profiler.stop("Metrics Calc")
+            
             if (frame_idx + 1) % 20 == 0:
                 tqdm.write(f"Frame {frame_idx+1}: {len(measurements)} meas -> {len(predicted_tracks)} confirmed tracks")
         
