@@ -168,11 +168,13 @@ def train_streaming(num_epochs=10, data_file="data/stream_radar_001.jsonl", wind
             if not window_meas and not active_tracks:
                 current_t += window_size
                 pbar.update(int(window_size))
+                pbar.set_postfix({"tracks": 0, "meas": 0})
                 continue
 
             # 2. Build Tensors
             meas_tensor, meas_sensor_ids = frame_to_tensors({'measurements': window_meas}, device)
             num_meas = meas_tensor.shape[0]
+            pbar.set_postfix({"tracks": len(active_tracks), "meas": num_meas})
             
             full_x, full_sensor_id, hidden_state, num_tracks = build_full_input(
                 active_tracks, meas_tensor, meas_sensor_ids, num_sensors=5, device=device

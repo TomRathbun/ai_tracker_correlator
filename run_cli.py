@@ -84,6 +84,7 @@ def run_cli():
     # 2. Build Config
     config = PipelineConfig()
     config.state_updater.type = args.mode
+    config.state_updater.gnn_model_path = args.gnn_model_path
     config.track_manager.min_hits = args.min_hits
     config.track_manager.max_age = args.max_age
     config.track_manager.association_threshold = args.threshold
