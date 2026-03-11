@@ -77,13 +77,14 @@ class RecurrentGATTrackerV3(nn.Module):
 
 
 def build_gnn_edges(full_x, node_type, psr_clf, ssr_clf, device, max_dist=60000.0, k=12):
-    """Edge features now include pairwise association probability — the key to real correlation."""
+    """Vectorized edge feature generation - Crucial for real-time performance."""
     pos = full_x[:, :3]
     vel = full_x[:, 3:6]
     N = pos.shape[0]
     if N <= 1:
         return torch.empty((2, 0), dtype=torch.long, device=device), torch.empty((0, 7), device=device)
 
+    # 1. Spatial Adjacency
     dist = torch.cdist(pos, pos)
     mask = (dist < max_dist) & (dist > 0)
     _, indices = torch.topk(dist, min(k + 1, N), dim=1, largest=False)
@@ -94,27 +95,73 @@ def build_gnn_edges(full_x, node_type, psr_clf, ssr_clf, device, max_dist=60000.
 
     edge_index = final_mask.nonzero().t()
     row, col = edge_index
+    if edge_index.shape[1] == 0:
+        return edge_index, torch.empty((0, 7), device=device)
 
+    # 2. Vectorized Feature Extraction
+    # Node attributes for all edges
+    p1, p2 = pos[row], pos[col]
+    v1, v2 = vel[row], vel[col]
+    t1, t2 = node_type[row], node_type[col]
+    
+    # Distance feature
+    dist_feat = torch.norm(p1 - p2, dim=1) / 100000.0
+    
+    # Probabilities initialized to low
     probs = torch.zeros(edge_index.shape[1], device=device)
-    for i in range(edge_index.shape[1]):
-        n1, n2 = row[i].item(), col[i].item()
-        t1 = 'SSR' if node_type[n1].item() == 1 else 'PSR'
-        t2 = 'SSR' if node_type[n2].item() == 1 else 'PSR'
-        m1 = {'x': full_x[n1,0].item(), 'y': full_x[n1,1].item(), 'z': full_x[n1,2].item(),
-              'vx': full_x[n1,3].item(), 'vy': full_x[n1,4].item(), 'vz': full_x[n1,5].item(), 'type': t1}
-        m2 = {'x': full_x[n2,0].item(), 'y': full_x[n2,1].item(), 'z': full_x[n2,2].item(),
-              'vx': full_x[n2,3].item(), 'vy': full_x[n2,4].item(), 'vz': full_x[n2,5].item(), 'type': t2}
 
-        if t1 == 'PSR' and t2 == 'PSR':
-            feats = compute_psr_psr_features(m1, m2)
-            p = torch.sigmoid(psr_clf(torch.from_numpy(feats).float().unsqueeze(0).to(device))).item()
-        else:
-            feats = compute_ssr_any_features(m1, m2)
-            p = torch.sigmoid(ssr_clf(torch.from_numpy(feats).float().unsqueeze(0).to(device))).item()
-        probs[i] = p
+    # Mask for PSR-PSR edges (both nodes are type 0)
+    psr_mask = (t1 == 0) & (t2 == 0)
+    if psr_mask.any() and psr_clf is not None:
+        # Vectorized PSR features
+        vp1, vp2 = v1[psr_mask], v2[psr_mask]
+        v1_norm = torch.norm(vp1, dim=1, keepdim=True) + 1e-8
+        v2_norm = torch.norm(vp2, dim=1, keepdim=True) + 1e-8
+        cos_sim = torch.sum(vp1 * vp2, dim=1) / (v1_norm.squeeze() * v2_norm.squeeze())
+        mag_diff = torch.abs(v1_norm - v2_norm).squeeze() / 1000.0
+        
+        # We'll use a simplified set of vectorized features for the classifier
+        # to match what the MLP expects [pos_dist, cos_sim, mag_diff, az_diff, el_diff, amp_diff]
+        # For real-time, we approximate az/el or use the existing ones if available
+        # But for now, we'll just batch the existing CPU-style features if vectorization is too complex 
+        # Actually, let's just batch the classifier calls at minimum.
+        
+        # To keep it exact but fast, we'll still do a small loop to collect features 
+        # BUT run the classifier as one big batch. This is much faster than individual calls.
+        psr_indices = psr_mask.nonzero().squeeze(-1)
+        psr_feats_list = []
+        for idx in psr_indices:
+            n1, n2 = row[idx].item(), col[idx].item()
+            m1 = {'x': full_x[n1,0].item(), 'y': full_x[n1,1].item(), 'z': full_x[n1,2].item(),
+                  'vx': full_x[n1,3].item(), 'vy': full_x[n1,4].item(), 'vz': full_x[n1,5].item(), 'type': 'PSR'}
+            m2 = {'x': full_x[n2,0].item(), 'y': full_x[n2,1].item(), 'z': full_x[n2,2].item(),
+                  'vx': full_x[n2,3].item(), 'vy': full_x[n2,4].item(), 'vz': full_x[n2,5].item(), 'type': 'PSR'}
+            psr_feats_list.append(compute_psr_psr_features(m1, m2))
+        
+        if psr_feats_list:
+            psr_tensor = torch.from_numpy(np.array(psr_feats_list)).float().to(device)
+            probs[psr_mask] = torch.sigmoid(psr_clf(psr_tensor))
 
-    delta_pos = pos[row] - pos[col]
-    delta_vel = vel[row] - vel[col]
+    # Mask for SSR-ANY edges (either node is type 1)
+    ssr_mask = ~psr_mask
+    if ssr_mask.any() and ssr_clf is not None:
+        ssr_indices = ssr_mask.nonzero().squeeze(-1)
+        ssr_feats_list = []
+        for idx in ssr_indices:
+            n1, n2 = row[idx].item(), col[idx].item()
+            ty1 = 'SSR' if t1[idx] == 1 else 'PSR'
+            ty2 = 'SSR' if t2[idx] == 1 else 'PSR'
+            m1 = {'x': full_x[n1,0].item(), 'y': full_x[n1,1].item(), 'z': full_x[n1,2].item(), 'type': ty1}
+            m2 = {'x': full_x[n2,0].item(), 'y': full_x[n2,1].item(), 'z': full_x[n2,2].item(), 'type': ty2}
+            ssr_feats_list.append(compute_ssr_any_features(m1, m2))
+            
+        if ssr_feats_list:
+            ssr_tensor = torch.from_numpy(np.array(ssr_feats_list)).float().to(device)
+            probs[ssr_mask] = torch.sigmoid(ssr_clf(ssr_tensor))
+
+    # 3. Final Attributes
+    delta_pos = p1 - p2
+    delta_vel = v1 - v2
     edge_attr = torch.cat([delta_pos, delta_vel, probs.unsqueeze(1)], dim=-1)
     return edge_index, edge_attr
 
