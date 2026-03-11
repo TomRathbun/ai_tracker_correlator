@@ -16,9 +16,9 @@ import numpy as np
 import json
 
 # Hybrid's proven components (reused for GNN edge features)
-from pairwise_classifier import PairwiseAssociationClassifier
-from pairwise_features import compute_psr_psr_features, compute_ssr_any_features, get_psr_psr_dim, get_ssr_any_dim
-from metrics import TrackingMetrics   # your existing metrics
+from src.pairwise_classifier import PairwiseAssociationClassifier
+from src.pairwise_features import compute_psr_psr_features, compute_ssr_any_features, get_psr_psr_dim, get_ssr_any_dim
+from src.metrics import TrackingMetrics   # your existing metrics
 
 class RecurrentGATTrackerV3(nn.Module):
     """Single ML component for the entire multi-radar fusion pipeline."""

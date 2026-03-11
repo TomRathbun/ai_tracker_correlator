@@ -23,68 +23,8 @@ from src.model_v3 import (
 )
 from src.pairwise_classifier import PairwiseAssociationClassifier
 from src.pairwise_features import get_psr_psr_dim, get_ssr_any_dim
+from src.stream_utils import load_stream_and_truth, get_truth_at_time
 
-def load_stream_and_truth(data_file: str):
-    """Loads measurements and reconstructs ground truth trajectories."""
-    measurements = []
-    truth_trajectories = {} # track_id -> List[(t, x, y, z, vx, vy)]
-    
-    print(f"Loading stream data from {data_file}...")
-    with open(data_file, 'r') as f:
-        for line in f:
-            m = json.loads(line)
-            measurements.append(m)
-            
-    origin_lat, origin_lon = 24.4539, 54.3773 # UAE Reference (Abu Dhabi)
-    lat_scale = 111320.0
-    lon_scale = 111320.0 * np.cos(np.radians(origin_lat))
-
-    print("Reconstructing ground truth trajectories...")
-    unique_track_ids = set()
-    for m in measurements:
-        tid = m.get('track_id', -1)
-        if tid != -1:
-            unique_track_ids.add(tid)
-            if tid not in truth_trajectories:
-                truth_trajectories[tid] = []
-            
-            tx = (m['source_lon'] - origin_lon) * lon_scale
-            ty = (m['source_lat'] - origin_lat) * lat_scale
-            # Altitude was estimated from speed in generator, let's just use meas z as truth for now or some proxy
-            truth_trajectories[tid].append({
-                't': m['t'],
-                'x': tx,
-                'y': ty,
-                'z': m['z'], # Close enough for training
-                'vx': m.get('vx', 0), # PSR has vx/vy
-                'vy': m.get('vy', 0),
-                'vz': 0
-            })
-            
-    # Sort trajectories by time
-    for tid in truth_trajectories:
-        truth_trajectories[tid].sort(key=lambda x: x['t'])
-        
-    return measurements, truth_trajectories, sorted(list(unique_track_ids))
-
-def get_truth_at_time(truth_trajectories: Dict, t: float, allowed_ids: set) -> List[Dict]:
-    """Retrieves the state of all active tracks in allowed_ids at time t."""
-    active_gt = []
-    for tid in allowed_ids:
-        if tid not in truth_trajectories: continue
-        states = truth_trajectories[tid]
-        # Find the state closest to time t
-        closest = None
-        min_dt = 5.0
-        for s in states:
-            dt = abs(s['t'] - t)
-            if dt < min_dt:
-                min_dt = dt
-                closest = s
-        
-        if closest:
-            active_gt.append(closest)
-    return active_gt
 
 def train_streaming(num_epochs=10, data_file="data/stream_radar_001.jsonl", window_size=2.0, split_ratio=0.8):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')

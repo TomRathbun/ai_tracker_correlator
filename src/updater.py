@@ -10,7 +10,7 @@ import numpy as np
 import torch
 
 from src.config_schemas import PipelineConfig
-from src.model_v3 import RecurrentGATTrackerV3, build_sparse_edges
+from src.model_v3 import RecurrentGATTrackerV3, build_gnn_edges
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
 from scipy.optimize import linear_sum_assignment
@@ -76,11 +76,28 @@ class GNNUpdater(StateUpdater):
             self.model.load_state_dict(state_dict)
             self.model.to(self.device)
             self.model.eval()
+            
+            # Load classifiers for GNN edge features (RecurrentGATTrackerV3 uses them)
+            from src.pairwise_features import get_psr_psr_dim, get_ssr_any_dim
+            from src.pairwise_classifier import PairwiseAssociationClassifier
+            try:
+                self.psr_clf = PairwiseAssociationClassifier(feature_dim=get_psr_psr_dim()).to(self.device)
+                self.psr_clf.load_state_dict(torch.load('checkpoints/pairwise_psr_psr.pt', map_location=self.device, weights_only=True))
+                self.psr_clf.eval()
+                self.ssr_clf = PairwiseAssociationClassifier(feature_dim=get_ssr_any_dim()).to(self.device)
+                self.ssr_clf.load_state_dict(torch.load('checkpoints/pairwise_ssr_any.pt', map_location=self.device, weights_only=True))
+                self.ssr_clf.eval()
+                print("✓ GNNUpdater: Loaded pairwise classifiers for edge features")
+            except:
+                print("Warning: GNNUpdater could not load classifiers, edges will lack ML features.")
+                self.psr_clf = self.ssr_clf = None
+                
             print(f"✓ Successfully loaded {self.model_type} GNN model from {self.config.gnn_model_path}")
         except Exception as e:
             print(f"Warning: Could not load GNN model from {self.config.gnn_model_path}: {e}")
             self.model = None
             self.model_type = None
+            self.psr_clf = self.ssr_clf = None
     
     def update(self, measurements: List[Dict], tracks: List[Dict]) -> List[Dict]:
         """Update tracks using GNN."""
@@ -112,7 +129,10 @@ class GNNUpdater(StateUpdater):
         
         node_type = torch.cat([track_types, meas_types])
         
-        edge_index, edge_attr = build_sparse_edges(full_x)
+        # Build GNN edges with association features
+        edge_index, edge_attr = build_gnn_edges(
+            full_x, node_type, self.psr_clf, self.ssr_clf, self.device
+        )
         
         # 4. Forward pass
         try:
