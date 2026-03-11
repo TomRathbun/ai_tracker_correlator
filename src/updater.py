@@ -515,24 +515,44 @@ class NewHybridUpdater(StateUpdater):
             if n == 1: measurements[0]['cluster_size'] = 1
             return measurements
             
-        adj = np.zeros((n, n))
+        # 1. Prepare all pairs for batch inference
+        pairs = []
         for i in range(n):
-            adj[i, i] = 1
             for j in range(i + 1, n):
-                m1, m2 = measurements[i], measurements[j]
-                t1, t2 = m1.get('type', 'PSR'), m2.get('type', 'PSR')
-                if t1 == 'PSR' and t2 == 'PSR':
-                    f = compute_psr_psr_features(m1, m2)
-                    model = self.psr_classifier
-                else:
-                    f = compute_ssr_any_features(m1, m2)
-                    model = self.ssr_classifier
-                    
-                if model is None: continue
-                with torch.no_grad():
-                    # Avoid UserWarning by using np.array first
-                    feats_batch = np.array([f], dtype=np.float32)
-                    p = torch.sigmoid(model(torch.from_numpy(feats_batch).to(self.device))).item()
+                pairs.append((i, j))
+        
+        if not pairs:
+            for m in measurements: m['cluster_size'] = 1
+            return measurements
+
+        adj = np.eye(n)
+        
+        # Split pairs by classifier type
+        psr_pairs = []
+        ssr_pairs = []
+        
+        for i, j in pairs:
+            m1, m2 = measurements[i], measurements[j]
+            t1, t2 = m1.get('type', 'PSR'), m2.get('type', 'PSR')
+            if t1 == 'PSR' and t2 == 'PSR':
+                psr_pairs.append((i, j, compute_psr_psr_features(m1, m2)))
+            else:
+                ssr_pairs.append((i, j, compute_ssr_any_features(m1, m2)))
+
+        # Batch PSR-PSR
+        if psr_pairs and self.psr_classifier:
+            feats = torch.from_numpy(np.array([p[2] for p in psr_pairs])).float().to(self.device)
+            with torch.no_grad():
+                probs = torch.sigmoid(self.psr_classifier(feats)).cpu().numpy()
+            for (i, j, _), p in zip(psr_pairs, probs):
+                if p > 0.5: adj[i, j] = adj[j, i] = 1
+        
+        # Batch SSR-ANY
+        if ssr_pairs and self.ssr_classifier:
+            feats = torch.from_numpy(np.array([p[2] for p in ssr_pairs])).float().to(self.device)
+            with torch.no_grad():
+                probs = torch.sigmoid(self.ssr_classifier(feats)).cpu().numpy()
+            for (i, j, _), p in zip(ssr_pairs, probs):
                 if p > 0.5: adj[i, j] = adj[j, i] = 1
                 
         n_comp, labels = connected_components(csr_matrix(adj))
@@ -558,25 +578,37 @@ class NewHybridUpdater(StateUpdater):
         from src.pairwise_features import compute_psr_psr_features, compute_ssr_any_features
         
         costs = np.ones((len(tracks), len(meta)))
+        
+        # Collect all pairs for batch
+        psr_pairs = []
+        ssr_pairs = []
+        
         for i, t in enumerate(tracks):
             for j, m in enumerate(meta):
                 t1 = 'SSR' if t.get('mode_3a') else 'PSR'
                 t2 = 'SSR' if m.get('mode_3a') else 'PSR'
-                if t1 == 'PSR' and t2 == 'PSR':
-                    f = compute_psr_psr_features(t, m)
-                    model = self.psr_classifier
-                else:
-                    f = compute_ssr_any_features(t, m)
-                    model = self.ssr_classifier
+                dist = np.sqrt((t['x']-m['x'])**2 + (t['y']-m['y'])**2)
                 
-                if model:
-                    with torch.no_grad():
-                        # Avoid UserWarning by using np.array first
-                        feats_batch = np.array([f], dtype=np.float32)
-                        p = torch.sigmoid(model(torch.from_numpy(feats_batch).to(self.device))).item()
-                    dist = np.sqrt((t['x']-m['x'])**2 + (t['y']-m['y'])**2)
-                    if dist > 8000.0: costs[i, j] = 1.0
-                    else: costs[i, j] = 1.0 - p
+                if dist < 8000.0:
+                    if t1 == 'PSR' and t2 == 'PSR':
+                        psr_pairs.append((i, j, compute_psr_psr_features(t, m)))
+                    else:
+                        ssr_pairs.append((i, j, compute_ssr_any_features(t, m)))
+
+        # Batch inference
+        if psr_pairs and self.psr_classifier:
+            feats = torch.from_numpy(np.array([p[2] for p in psr_pairs])).float().to(self.device)
+            with torch.no_grad():
+                probs = torch.sigmoid(self.psr_classifier(feats)).cpu().numpy()
+            for (i, j, _), p in zip(psr_pairs, probs):
+                costs[i, j] = 1.0 - p
+                
+        if ssr_pairs and self.ssr_classifier:
+            feats = torch.from_numpy(np.array([p[2] for p in ssr_pairs])).float().to(self.device)
+            with torch.no_grad():
+                probs = torch.sigmoid(self.ssr_classifier(feats)).cpu().numpy()
+            for (i, j, _), p in zip(ssr_pairs, probs):
+                costs[i, j] = 1.0 - p
                     
         row, col = linear_sum_assignment(costs)
         # Match hybrid_tracker.py logic: In temporal mode, accept any match within 8km gate

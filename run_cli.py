@@ -4,6 +4,7 @@ AI Tracker CLI: Run evaluation and tracking from the command line.
 import argparse
 import sys
 import os
+import time
 from pathlib import Path
 from datetime import datetime
 import torch
@@ -17,6 +18,28 @@ from src.pipeline import Pipeline
 from src.metrics import TrackingMetrics, format_metrics
 from src.mlflow_config import init_mlflow
 from src.stream_utils import load_stream_and_truth, get_truth_at_time
+
+class Profiler:
+    def __init__(self):
+        self.stats = {}
+        self.start_times = {}
+
+    def start(self, name):
+        self.start_times[name] = time.perf_counter()
+
+    def stop(self, name):
+        if name in self.start_times:
+            dt = time.perf_counter() - self.start_times[name]
+            self.stats[name] = self.stats.get(name, 0) + dt
+
+    def summary(self):
+        print("\n⏱️  PERFORMANCE SUMMARY:")
+        print("-" * 30)
+        total = sum(self.stats.values())
+        for name, dt in sorted(self.stats.items(), key=lambda x: x[1], reverse=True):
+            pct = (dt/total)*100 if total > 0 else 0
+            print(f"{name:15}: {dt:6.2f}s ({pct:4.1f}%)")
+        print("-" * 30)
 
 def run_cli():
     parser = argparse.ArgumentParser(description="AI Tracker Command Line Interface")
@@ -96,6 +119,8 @@ def run_cli():
     pipeline = Pipeline(config)
     
     # 4. Load & Detect Format
+    profiler = Profiler()
+    profiler.start("Data Loading")
     if not os.path.exists(args.data):
         print(f"❌ Error: Data file {args.data} not found.")
         return
@@ -112,6 +137,7 @@ def run_cli():
         print("🌊 Detected STREAMING data format. Switching to windowed evaluation...")
         measurements_all, truth_trajectories, all_track_ids = load_stream_and_truth(args.data)
         measurements_all.sort(key=lambda x: x['t'])
+        profiler.stop("Data Loading")
         
         t_start = measurements_all[0]['t']
         t_end = measurements_all[-1]['t']
@@ -130,13 +156,19 @@ def run_cli():
                 meas_idx += 1
             
             # Predict
+            profiler.start("AI Pipeline")
             predicted_tracks = pipeline.process_frame(window_meas)
+            profiler.stop("AI Pipeline")
             
             # Get Truth for this window
+            profiler.start("Truth Mapping")
             gt_tracks = get_truth_at_time(truth_trajectories, current_t + window_size/2, set(all_track_ids))
+            profiler.stop("Truth Mapping")
             
             # Update metrics
+            profiler.start("Metrics Calc")
             metrics_tracker.update(predicted_tracks, gt_tracks)
+            profiler.stop("Metrics Calc")
             
             current_t += window_size
             pbar.update(1)
@@ -163,6 +195,7 @@ def run_cli():
         
     # 6. Finalize
     metrics = metrics_tracker.compute()
+    profiler.summary()
     print("\n" + "="*40)
     print("      TRACKING RESULTS (CLI)")
     print("="*40)
