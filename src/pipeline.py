@@ -158,11 +158,20 @@ class Pipeline:
                 t['state'] = 'confirmed'
                 
             # Deletion
-            if t.get('age', 0) <= max_age:
+            if t.get('age', 0) < max_age:
                 keep_tracks.append(t)
                 if t.get('state') == 'confirmed':
                     confirmed.append(t)
-                    
+        
+        # Enforce Track Cap
+        track_cap = getattr(self.config.state_updater, 'track_cap', 500)
+        if len(keep_tracks) > track_cap:
+            # Sort by hits (reliability) and keep top tracks
+            keep_tracks.sort(key=lambda x: x.get('hits', 0), reverse=True)
+            keep_tracks = keep_tracks[:track_cap]
+            # Refresh confirmed list based on capped tracks
+            confirmed = [t for t in keep_tracks if t.get('state') == 'confirmed']
+
         self.tracks = keep_tracks
         return confirmed
     

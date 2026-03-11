@@ -57,6 +57,7 @@ def run_cli():
     parser.add_argument("--threshold", type=float, default=0.35, help="Association threshold")
     parser.add_argument("--clutter-threshold", type=float, default=0.7, help="Clutter filter threshold")
     parser.add_argument("--match-threshold", type=float, default=5000.0, help="Metrics match threshold (m)")
+    parser.add_argument("--track-cap", type=int, default=500, help="Max active tracks")
     
     # Training arguments
     parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
@@ -110,8 +111,8 @@ def run_cli():
     config.state_updater.type = args.mode
     config.state_updater.gnn_model_path = args.gnn_model_path
     config.track_manager.min_hits = args.min_hits
-    config.track_manager.max_age = args.max_age
-    config.track_manager.association_threshold = args.threshold
+    config.state_updater.del_age = args.max_age
+    config.state_updater.track_cap = args.track_cap
     config.clutter_filter.threshold = args.clutter_threshold
     
     # 3. Initialize Pipeline

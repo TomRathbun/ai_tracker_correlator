@@ -90,12 +90,12 @@ def train_streaming(num_epochs=10, data_file="data/stream_radar_001.jsonl", wind
         # Management params (sharpened for streaming)
         init_thresh = 0.35
         coast_thresh = 0.15
-        suppress_thresh = 0.70
+        suppress_thresh = 0.50 # More aggressive suppression to prevent duplicates
         del_exist = 0.05
-        del_age = 10
-        track_cap = 50
+        del_age = 15 # Allow longer coasting for staggered radar scans
+        track_cap = 1000 # Increased from 50 to handle full scenes
         match_gate = 15000.0
-        miss_penalty = 5.0
+        miss_penalty = 10.0 # Heavier penalty for losing tracks
         fp_mult = 1.0
 
         while current_t < t_end:

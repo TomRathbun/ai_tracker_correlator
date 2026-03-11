@@ -33,7 +33,8 @@ class StateUpdaterConfig(BaseModel):
     coast_thresh: float = 0.12
     suppress_thresh: float = 0.75
     del_exist: float = 0.08
-    del_age: int = 8
+    del_age: int = 15
+    track_cap: int = 500
 
 
 class TrackManagerConfig(BaseModel):
