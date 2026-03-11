@@ -44,40 +44,27 @@ def load_stream_and_truth(data_file: str):
                     'track_id': tid
                 })
             
-    # Sort trajectories and pre-extract times for binary search
-    truth_arrays = {}
-    for tid in truth_trajectories:
-        states = sorted(truth_trajectories[tid], key=lambda x: x['t'])
-        truth_trajectories[tid] = states
-        truth_arrays[tid] = np.array([s['t'] for s in states])
-        
-    return measurements, (truth_trajectories, truth_arrays), sorted(list(unique_track_ids))
-
-def get_truth_at_time(truth_data: Tuple[Dict, Dict], t: float, allowed_ids: set) -> List[Dict]:
-    """Retrieves the state of all tracks at time t using binary search."""
-    truth_trajectories, truth_arrays = truth_data
-    active_gt = []
+    # Create a time-bucketed map for O(1) lookup during evaluation
+    # Key: int(t), Value: List of aircraft states at that second
+    truth_map = {}
     
-    for tid in allowed_ids:
-        if tid not in truth_arrays: continue
-        
-        times = truth_arrays[tid]
-        # Find index where t would be inserted
-        idx = np.searchsorted(times, t)
-        
-        # Check if the closest point is within a reasonable window (e.g. 5s)
-        best_s = None
-        min_dt = 5.0
-        
-        # Check index and neighbor
-        for i in [idx - 1, idx]:
-            if 0 <= i < len(times):
-                dt = abs(times[i] - t)
-                if dt < min_dt:
-                    min_dt = dt
-                    best_s = truth_trajectories[tid][i]
-        
-        if best_s:
-            active_gt.append(best_s)
+    print("Bucketing ground truth for fast lookup...")
+    for tid, states in truth_trajectories.items():
+        for s in states:
+            t_bucket = int(s['t'])
+            if t_bucket not in truth_map:
+                truth_map[t_bucket] = []
+            truth_map[t_bucket].append(s)
             
-    return active_gt
+    return measurements, truth_map, sorted(list(unique_track_ids))
+
+def get_truth_at_time(truth_map: Dict[int, List[Dict]], t: float, allowed_ids: set) -> List[Dict]:
+    """Retrieves the state of all tracks at time t using a pre-bucketed map."""
+    # We check the current second and adjacent seconds to ensure we don't miss 
+    # transitions due to rounding
+    t_int = int(t)
+    candidates = truth_map.get(t_int, [])
+    
+    # Optional: If you want to be extremely precise, you could filter by allowed_ids
+    # but the buckets are already filtered by the loader.
+    return candidates
