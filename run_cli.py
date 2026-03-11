@@ -52,8 +52,8 @@ def run_cli():
     parser.add_argument("--gnn-model-path", type=str, default="checkpoints/model_v3.pt",
                         help="Path to GNN model checkpoint")
     # Hyperparameters
-    parser.add_argument("--min-hits", type=int, default=5, help="Min hits for track confirmation")
-    parser.add_argument("--max-age", type=int, default=5, help="Max age for track coasting")
+    parser.add_argument("--min-hits", type=int, default=3, help="Min hits for track confirmation")
+    parser.add_argument("--max-age", type=int, default=10, help="Max age for track coasting")
     parser.add_argument("--threshold", type=float, default=0.35, help="Association threshold")
     parser.add_argument("--clutter-threshold", type=float, default=0.7, help="Clutter filter threshold")
     parser.add_argument("--match-threshold", type=float, default=5000.0, help="Metrics match threshold (m)")
