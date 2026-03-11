@@ -111,10 +111,21 @@ def train_streaming(num_epochs=10, data_file="data/stream_radar_001.jsonl", wind
                 pbar.set_postfix({"tracks": 0, "meas": 0})
                 continue
 
-            # 2. Build Tensors
+            # 2. Build Tensors (Map radar_id to sensor_id)
+            for m in window_meas:
+                if 'sensor_id' not in m and 'radar_id' in m:
+                    m['sensor_id'] = m['radar_id']
+            
             meas_tensor, meas_sensor_ids = frame_to_tensors({'measurements': window_meas}, device)
             num_meas = meas_tensor.shape[0]
-            pbar.set_postfix({"tracks": len(active_tracks), "meas": num_meas})
+            
+            # Update EMA for display
+            if 'avg_meas' not in locals(): 
+                avg_meas, avg_tracks = float(num_meas), float(len(active_tracks))
+            else:
+                avg_meas = 0.95 * avg_meas + 0.05 * num_meas
+                avg_tracks = 0.95 * avg_tracks + 0.05 * len(active_tracks)
+            pbar.set_postfix({"tracks": int(avg_tracks), "meas": int(avg_meas)})
             
             full_x, full_sensor_id, hidden_state, num_tracks = build_full_input(
                 active_tracks, meas_tensor, meas_sensor_ids, num_sensors=5, device=device

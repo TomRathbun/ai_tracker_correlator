@@ -56,7 +56,6 @@ class GNNUpdater(StateUpdater):
     
     def _load_model(self):
         """Load the GNN model from checkpoint, attempting multiple architectures."""
-        from src.gnn_tracker import GNNTracker
         from src.model_v3 import RecurrentGATTrackerV3
         
         try:
@@ -108,8 +107,12 @@ class GNNUpdater(StateUpdater):
         from src.model_v3 import frame_to_tensors, build_full_input
         
         # 1. Convert measurements to tensors
+        # Map radar_id to sensor_id for measurements if not already present
+        for m in measurements:
+            if 'sensor_id' not in m and 'radar_id' in m:
+                m['sensor_id'] = m['radar_id']
+                
         meas, meas_sensor_ids = frame_to_tensors({'measurements': measurements}, self.device)
-        
         num_meas = meas.shape[0]
         
         # 2. Build full input (tracks + measurements)
