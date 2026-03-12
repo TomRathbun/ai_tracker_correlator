@@ -59,7 +59,7 @@ class GNNUpdater(StateUpdater):
         from src.model_v3 import RecurrentGATTrackerV3
         
         try:
-            checkpoint = torch.load(self.config.gnn_model_path, weights_only=True, map_location=self.device)
+            checkpoint = torch.load(self.config.gnn_model_path, weights_only=False, map_location=self.device)
             # Handle different checkpoint formats
             if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
                 state_dict = checkpoint['model_state_dict']
