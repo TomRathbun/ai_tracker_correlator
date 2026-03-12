@@ -2,13 +2,13 @@
 
 ## Abstract
 
-In traditional air traffic surveillance systems, each radar sensor employs an independent physics-based tracker to process decoded Asterix messages (CAT 034, 048, or 062), followed by a separate correlator to fuse tracks and resolve duplicates. This project investigates the feasibility of replacing this multi-component setup with a single AI/ML-based tracker that natively ingests multi-sensor inputs, performs clutter rejection, data association, and state estimation, and outputs a correlated set of tracks. We propose a hybrid architecture integrating a clutter classifier, dual pairwise association classifiers (specialized for Primary Surveillance Radar (PSR) and Secondary Surveillance Radar (SSR)), graph construction, and a Graph Neural Network (GNN) for joint association and tracking. Evaluated on simulated heterogeneous data, the system achieves a Multi-Object Tracking Accuracy (MOTA) of 0.925, recall of 92.6%, precision of 99.9%, and zero ID switches—outperforming baselines like SORT (MOTA 0.07). This demonstrates high feasibility for simplifying radar fusion pipelines while maintaining robust performance. We detail the architecture, equations, and training approaches, highlighting pathways to real-world deployment.
+In traditional air traffic surveillance systems, each radar sensor employs an independent physics-based tracker to process decoded Asterix messages (CAT 034, 048, or 062), followed by a separate correlator to fuse tracks and resolve duplicates. This project investigates the feasibility of replacing this multi-component setup with a single AI/ML-based tracker that natively ingests multi-sensor inputs, performs clutter rejection, data association, and state estimation, and outputs a correlated set of tracks. We propose a hybrid architecture integrating a clutter classifier, dual pairwise association classifiers (specialized for Primary Surveillance Radar (PSR) and Secondary Surveillance Radar (SSR)), and continuous-time, asynchronous Kalman Filtering for joint association and tracking. Evaluated on simulated high-density streaming heterogeneous data with realistic scan periods, the system achieves a Multi-Object Tracking Accuracy (MOTA) of 0.82, recall of over 93%, precision of 89%, and zero ID switches—outperforming baseline windowed trackers. This demonstrates high feasibility for simplifying radar fusion pipelines while maintaining robust, real-time performance. We detail the architecture, equations, and training approaches, highlighting the mechanism for solving "temporal dragging" via exact time-step synchronization.
 
 ## Introduction
 
 Air traffic surveillance relies on multiple radar sensors to monitor airspace, with Primary Surveillance Radars (PSR) providing position and velocity via Doppler, and Secondary Surveillance Radars (SSR) offering identity codes (Mode 3A/S). Conventionally, each sensor feeds a dedicated physics-based tracker that filters clutter, initiates tracks, and updates states using methods like Kalman filtering. Outputs are then fused by a correlator to identify and merge duplicate tracks representing the same aircraft.
 
-This fragmented approach introduces complexity, latency, and maintenance overhead. Our research explores the feasibility of a unified AI/ML tracker that directly processes decoded Cartesian coordinates from multi-sensor inputs, implicitly handles clutter and association, and produces correlated tracks. Building on prior work [from our first paper], this departure incorporates specialized classifiers for heterogeneous sensors and a GNN for end-to-end fusion.
+This fragmented approach introduces complexity, latency, and maintenance overhead. Our research explores the feasibility of a unified AI/ML tracker that directly processes decoded Cartesian coordinates from multi-sensor inputs, implicitly handles clutter and association, and produces correlated tracks. Building on prior work, this departure incorporates specialized classifiers for heterogeneous sensors and asynchronous continuous-time Kalman filtering to natively process unstructured streaming data.
 
 We document the architecture (with visualization), key equations (for classifiers and GNN), and training methodology, evaluating on simulated data to assess viability.
 
@@ -24,11 +24,11 @@ ML advancements include GNNs for MOT, such as GraphTrack [4], which use attentio
 
 The proposed architecture processes multi-sensor inputs through a pipeline of AI/ML components, eliminating per-radar trackers and explicit correlators. Raw Asterix messages are decoded and transformed to Cartesian coordinates offline. The tracker then applies:
 
-1. **Clutter Filtering**: A unary MLP classifies measurements as clutter or valid.
-2. **Pairwise Association**: Dual classifiers compute similarity probabilities for PSR-PSR (kinematic-focused) and SSR-ANY (identity-focused) pairs.
-3. **Graph Construction**: Builds a graph with nodes as measurements and edges weighted by association probabilities.
-4. **GNN-Based Tracking**: A GAT + GRU model performs joint association and state updates.
-5. **Track Management**: M/N logic initiates/confirms tracks based on hits and existence logits.
+1. **Clutter Filtering**: A neural network classifier directly inspects structural features to classify measurements as clutter or valid.
+2. **Spatial Clustering**: ML Pairwise classifiers group geographically overlapping measurements from the same time frame (such as an SSR and a PSR report from the same aircraft in the same radar sweep) into single fused meta-measurements to reduce computational load.
+3. **Temporal Association**: Dual ML Pairwise classifiers compute similarity probabilities for evaluating Track-to-Measurement matches, relying on kinematic alignment for PSRs and identity alignment for SSRs. Matches are selected via Linear Sum Assignment (Hungarian Algorithm).
+4. **Asynchronous State Update**: To eliminate Temporal Dragging caused by grouping asynchronous sensor sweeps, tracks are dynamically projected exactly to the individual measurement's timestamp (`dt = meas_t - track_t`) for distance scoring. Following association, a mathematically exact continuous-time Kalman Filter update is executed on that precise time-step.
+5. **Track Management**: Robust M/N logic handles asynchronous data sparsity, initiating tracks at 3 hits and actively coasting unobserved tracks through radar blind spots for up to 20 seconds.
 
 Figure 1 visualizes the architecture:
 
@@ -41,14 +41,14 @@ Figure 1 visualizes the architecture:
                                                              |
                                                              v
     +-----------------+     +-------------------+     +----------------+
-    | Dual Pairwise   | <-- | Graph             | <-- | GNN Tracker    |
-    | Classifiers     |     | Construction      |     | (GAT + GRU)    |
+    | Exact-Time      | <-- | Temporal Assoc.   | <-- | Spatial Class- |
+    | Kalman Update   |     | (Hungarian + ML)  |     | tring (MLP)    |
     +-----------------+     +-------------------+     +----------------+
             |
             v
     +-----------------+     +-------------------+
     | Track Management| --> | Correlated Output |
-    | (M/N Initiation)|     | Tracks            |
+    | (Initiate/Coast)|     | Tracks            |
     +-----------------+     +-------------------+
 ```
 
@@ -128,7 +128,15 @@ Loss: MSE on states + BCE on existence.
 
 ## Results
 
-On simulation: MOTA 0.925, MOTP 701m, Precision 0.999, Recall 0.926, F1 0.961, ID Switches 0, FP/frame 0.0, FN/frame 1.5. Outperforms V2 Model (31.1% recall) and SORT (30.0% recall, MOTA 0.07).
+On an extremely dense, heavily maneuvered simulation comprising 5 asynchronous sweeping radars (periods 5.5s–9.0s), Poisson clutter, and 120 seconds of continuous tracking, the Hybrid pipeline achieved:
+
+- MOTA: **0.82**
+- MOTP: **805m** (~3σ radar noise)
+- Precision: **0.89**
+- Recall: **0.94**
+- ID Switches: **0**
+
+The precise sub-window Kalman alignment solved the "temporal dragging" error characteristic of naive batch windowing. By raising the initial hit requirement (`min_hits=3`) and extending the track coasting duration (`max_age=10 windows, 20s`), the system natively handles periods of sensor shadow, lifting overall Recall from 0.47 to 0.94.
 
 ## Discussion
 
