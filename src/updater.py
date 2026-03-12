@@ -97,8 +97,7 @@ class GNNUpdater(StateUpdater):
             self.model = None
             self.model_type = None
             self.psr_clf = self.ssr_clf = None
-    
-    def update(self, measurements: List[Dict], tracks: List[Dict], dt: float = 1.0) -> List[Dict]:
+    def update(self, measurements: List[Dict], tracks: List[Dict], dt: float = 1.0, frame_t: float = None) -> List[Dict]:
         """Update tracks using GNN."""
         if self.model is None or not measurements:
             return tracks
@@ -431,13 +430,14 @@ class NewHybridUpdater(StateUpdater):
         except Exception as e:
             raise RuntimeError(f"CRITICAL: NewHybridUpdater failed to load classifiers: {e}")
 
-    def update(self, measurements: List[Dict], tracks: List[Dict], dt: float = 1.0) -> List[Dict]:
+    def update(self, measurements: List[Dict], tracks: List[Dict], dt: float = 1.0, frame_t: float = None) -> List[Dict]:
         if not measurements:
             for t in tracks: t['age'] = t.get('age', 0) + 1
             return tracks
             
-        # Current frame time (from pipeline, passed as dt since last frame)
-        frame_t = measurements[-1].get('t', None)  # approximate frame end time
+        # Use exact pipeline frame time if provided, else approximate
+        if frame_t is None:
+            frame_t = measurements[-1].get('t', None)
         
         # 1. Spatial Fusion (Cluster reports within this frame)
         meta_measurements = self._spatial_cluster(measurements)
@@ -466,12 +466,17 @@ class NewHybridUpdater(StateUpdater):
                     track['kf'] = kf
                 
                 kf = track['kf']
+                
+                # Asynchronous time step: step EXACTLY to measurement time and update mathematically
+                if 't' in meta:
+                    dt_meas = meta['t'] - track.get('kf_t', meta['t'])
+                    if dt_meas > 0: kf.predict(dt=dt_meas)
+                    track['kf_t'] = meta['t']
+                
                 z = np.array([meta['x'], meta['y'], meta['z'], meta.get('vx', 0), meta.get('vy', 0), meta.get('vz', 0)])
                 kf.update(z)
                 
-                # Sync back to dict
-                track['x'], track['y'], track['z'] = kf.x[0], kf.x[1], kf.x[2]
-                track['vx'], track['vy'], track['vz'] = kf.x[3], kf.x[4], kf.x[5]
+                # We do NOT sync to dictionary yet, we do that at the end after predicting to frame_t
                 
                 # identity propagation
                 if meta.get('mode_3a'): track['mode_3a'] = meta['mode_3a']
@@ -501,30 +506,26 @@ class NewHybridUpdater(StateUpdater):
             kf.x = np.array([meta['x'], meta['y'], meta['z'], meta.get('vx', 0), meta.get('vy', 0), meta.get('vz', 0)])
             kf.P[3:6, 3:6] *= 100.0 # High velocity uncertainty
             new_track['kf'] = kf
+            new_track['kf_t'] = meta['t']
             
             updated_tracks.append(new_track)
             
+        # 5. Finalize all tracks to frame_t so output evaluation is synchronous
+        if frame_t is not None:
+            for t in updated_tracks:
+                if 'kf' in t:
+                    dt_final = frame_t - t.get('kf_t', frame_t)
+                    if dt_final > 0:
+                        t['kf'].predict(dt=dt_final)
+                    t['kf_t'] = frame_t
+                    # Sync to dictionary for evaluators
+                    t['x'], t['y'], t['z'] = t['kf'].x[0], t['kf'].x[1], t['kf'].x[2]
+                    t['vx'], t['vy'], t['vz'] = t['kf'].x[3], t['kf'].x[4], t['kf'].x[5]
+                    
         return updated_tracks
 
     def predict(self, tracks: List[Dict], dt: float = 1.0) -> List[Dict]:
-        """Predict using Kalman internal state."""
-        for track in tracks:
-            if 'kf' in track:
-                track['kf'].predict(dt=dt)
-                # Sync back to track dict
-                track['x'], track['y'], track['z'], track['vx'], track['vy'], track['vz'] = track['kf'].x[:6].flatten().tolist()
-                
-                # --- Two Point Initialization for new SSR tracks ---
-                if track.get('hits', 0) == 2 and track.get('vx', 0) == 0:
-                    # If this is the second hit and we still have 0 velocity, it might be an SSR-only track.
-                    # We can estimate velocity from the current and previous position.
-                    # Note: x/y already updated by KF.update? No, predict just happened.
-                    pass 
-            else:
-                # Fallback to simple motion if no KF yet
-                track['x'] += track.get('vx', 0) * dt
-                track['y'] += track.get('vy', 0) * dt
-                track['z'] += track.get('vz', 0) * dt
+        """Global prediction disabled. Updater handles real-time asynchronous tracking dynamically."""
         return tracks
 
     def _spatial_cluster(self, measurements: List[Dict]) -> List[Dict]:
@@ -625,13 +626,23 @@ class NewHybridUpdater(StateUpdater):
             for j, m in enumerate(meta):
                 t1 = 'SSR' if t.get('mode_3a') else 'PSR'
                 t2 = 'SSR' if m.get('mode_3a') else 'PSR'
-                dist = np.sqrt((t['x']-m['x'])**2 + (t['y']-m['y'])**2)
+                
+                # Temporarily predict track state EXACTLY to measurement time for distance check
+                tmp_t = dict(t)
+                if 't' in m:
+                    dt = m['t'] - t.get('kf_t', m['t'])
+                    if dt > 0:
+                        tmp_t['x'] += t.get('vx', 0) * dt
+                        tmp_t['y'] += t.get('vy', 0) * dt
+                        tmp_t['z'] += t.get('vz', 0) * dt
+                        
+                dist = np.sqrt((tmp_t['x']-m['x'])**2 + (tmp_t['y']-m['y'])**2)
                 
                 if dist < 8000.0:
                     if t1 == 'PSR' and t2 == 'PSR':
-                        psr_pairs.append((i, j, compute_psr_psr_features(t, m)))
+                        psr_pairs.append((i, j, compute_psr_psr_features(tmp_t, m)))
                     else:
-                        ssr_pairs.append((i, j, compute_ssr_any_features(t, m)))
+                        ssr_pairs.append((i, j, compute_ssr_any_features(tmp_t, m)))
 
         # Batch inference
         if psr_pairs and self.psr_classifier:

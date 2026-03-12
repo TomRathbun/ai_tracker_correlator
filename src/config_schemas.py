@@ -39,7 +39,10 @@ class StateUpdaterConfig(BaseModel):
 
 class TrackManagerConfig(BaseModel):
     """Configuration for track management."""
-    min_hits: int = Field(2, ge=1)
+    min_hits: int = Field(
+        default=3,
+        description="Consecutive hits required to confirm a track."
+    )
     max_age: int = Field(10, ge=1)
     association_threshold: float = Field(0.35, ge=0.0, le=1.0)
 
