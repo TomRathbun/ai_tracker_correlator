@@ -53,6 +53,10 @@ def detect_model_version(checkpoint_path: str):
         ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         keys = ckpt["model_state_dict"].keys() if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt.keys()
         
+        # Phase 2: V6 (Bipartite Cross Attention)
+        if any("cross_attn" in k for k in keys):
+            return "v6"
+            
         if "clutter_head.0.weight" in keys:
             # If specified file name has v5, or it has GAT traits, we categorize as v5
             if "v5" in str(checkpoint_path).lower():
