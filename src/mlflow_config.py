@@ -23,8 +23,8 @@ def init_mlflow():
         print(f"MLflow initialization warning: {e}")
     
     mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
-    print(f"✓ MLflow initialized: {MLFLOW_TRACKING_URI}")
-    print(f"✓ Experiment: {MLFLOW_EXPERIMENT_NAME}")
+    print(f"[OK] MLflow initialized: {MLFLOW_TRACKING_URI}")
+    print(f"[OK] Experiment: {MLFLOW_EXPERIMENT_NAME}")
 
 if __name__ == "__main__":
     init_mlflow()

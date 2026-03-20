@@ -12,8 +12,8 @@ import numpy as np
 from tqdm import tqdm
 from typing import List, Dict, Tuple
 
-from src.model_v3 import (
-    RecurrentGATTrackerV3, 
+from src.model_v5 import (
+    RecurrentGATTrackerV5, 
     build_gnn_edges, 
     build_full_input, 
     model_forward,
@@ -52,22 +52,11 @@ def train_streaming(num_epochs=10, data_file="data/stream_radar_001.jsonl", wind
     
     print(f"Training on {len(measurements)} measurements (filtered from {len(measurements_all)})")
     
-    # Load pairwise classifiers for GNN features
-    try:
-        psr_clf = PairwiseAssociationClassifier(feature_dim=get_psr_psr_dim()).to(device)
-        psr_clf.load_state_dict(torch.load('checkpoints/pairwise_psr_psr.pt', map_location=device, weights_only=True))
-        psr_clf.eval()
-        ssr_clf = PairwiseAssociationClassifier(feature_dim=get_ssr_any_dim()).to(device)
-        ssr_clf.load_state_dict(torch.load('checkpoints/pairwise_ssr_any.pt', map_location=device, weights_only=True))
-        ssr_clf.eval()
-        print("✓ Loaded pairwise classifiers")
-    except:
-        print("Warning: Classifiers not found, using distance-only edges.")
-        psr_clf = ssr_clf = None
- 
-    model = RecurrentGATTrackerV3(num_sensors=5, edge_dim=7).to(device)
+    # V5 uses fully learned inline edge embeddings in the GATv2 layers, plus early Clutter Head gating.
     
-    checkpoint_path = "checkpoints/model_v3_streaming.pt"
+    model = RecurrentGATTrackerV5(num_sensors=5, edge_dim=7).to(device)
+    
+    checkpoint_path = "checkpoints/model_v5_streaming.pt"
     if os.path.exists(checkpoint_path):
         try:
             model.load_state_dict(torch.load(checkpoint_path, map_location=device, weights_only=True))
@@ -111,11 +100,12 @@ def train_streaming(num_epochs=10, data_file="data/stream_radar_001.jsonl", wind
                 miss_penalty = cfg.get("miss_penalty", 50.0)
                 del_exist = cfg.get("del_exist", 0.40)
                 del_age = cfg.get("del_age", 2)
-                print(f"🔄 Epoch {epoch+1}: Hot-reloaded config (fp_mult={fp_mult}, lr={lr})")
+                clutter_thresh = cfg.get("clutter_thresh", 0.70)
+                print(f"🔄 Epoch {epoch+1}: Hot-reloaded config (fp_mult={fp_mult}, lr={lr}, clutter_thresh={clutter_thresh})")
         except Exception as e:
             print(f"⚠️ Config reload failed: {e}. Using previous fallback.")
             # Fallback to defaults
-            match_gate, miss_penalty, del_exist, del_age = 2000.0, 50.0, 0.40, 2
+            match_gate, miss_penalty, del_exist, del_age, clutter_thresh = 2000.0, 50.0, 0.40, 2, 0.70
 
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
@@ -171,19 +161,19 @@ def train_streaming(num_epochs=10, data_file="data/stream_radar_001.jsonl", wind
             ])
             
             # 3. Build Edges 
-            edge_index, edge_attr = build_gnn_edges(full_x, node_type, psr_clf, ssr_clf, device)
+            edge_index, edge_attr = build_gnn_edges(full_x, node_type, device)
             
             # 4. Forward Pass
-            out, new_hidden_full, alpha, existence_probs, existence_logits = model_forward(
-                model, full_x, node_type, full_sensor_id, edge_index, edge_attr, hidden_state
+            out, new_hidden_full, alpha, existence_probs, existence_logits, clutter_probs, clutter_logits, pruned_edge_index = model_forward(
+                model, full_x, node_type, full_sensor_id, edge_index, edge_attr, hidden_state, clutter_thresh
             )
             
             # 5. Manage Tracks (Loss is calculated at the end of the window; GNN refinement is 1:1)
             active_tracks = manage_tracks(
-                active_tracks, out, new_hidden_full, existence_probs, existence_logits, 
-                alpha, edge_index, num_tracks, 0 if dummy_added else num_meas, 
+                active_tracks, out, new_hidden_full, existence_probs, existence_logits, clutter_probs,
+                alpha, pruned_edge_index, num_tracks, 0 if dummy_added else num_meas, 
                 init_thresh, coast_thresh, suppress_thresh, del_exist, del_age, track_cap,
-                dt=0.0
+                dt=0.0, clutter_thresh=clutter_thresh
             )
             
             # 6. Loss Calculation
@@ -195,10 +185,10 @@ def train_streaming(num_epochs=10, data_file="data/stream_radar_001.jsonl", wind
             pred_logits = torch.stack([tr['logit'] for tr in active_tracks]) if active_tracks else torch.empty((0,), device=device)
             pred_ages = torch.tensor([tr['age'] for tr in active_tracks], device=device) if active_tracks else None
             
-            loss = compute_loss(
+            loss, clut_metrics = compute_loss(
                 pred_states, pred_logits, gt_states, len(gt_list), 
                 match_gate, miss_penalty, fp_mult, out, epoch, 0 if dummy_added else num_meas, 
-                meas_tensor, existence_logits, num_tracks,
+                meas_tensor, existence_logits, clutter_logits, num_tracks,
                 pred_ages=pred_ages, aux_init_weight=aux_init_weight
             )
             
@@ -218,7 +208,11 @@ def train_streaming(num_epochs=10, data_file="data/stream_radar_001.jsonl", wind
                         global_step = epoch * (int(t_end - t_start) // int(window_size)) + step_id
                         mlflow.log_metric("live_loss", loss.item(), step=global_step)
                         mlflow.log_metric("active_tracks", len(active_tracks), step=global_step)
+                        mlflow.log_metric("step_progress", global_step, step=global_step)
                         mlflow.log_metric("ground_truth", len(gt_list), step=global_step)
+                        # Add new clutter telemetry
+                        mlflow.log_metric("clutter_reject_rate", clut_metrics["clutter_reject_rate"], step=global_step)
+                        mlflow.log_metric("clutter_loss_val", clut_metrics["clutter_loss"], step=global_step)
                 except: pass
 
             current_t += window_size

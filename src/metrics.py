@@ -63,11 +63,16 @@ class TrackingMetrics:
             gt_states: List of dicts or [N_gt, 6] tensor
             pred_ids: Optional list of predicted track IDs
         """
-        # Convert lists to tensors if necessary
+        # Convert lists or numpy to tensors if necessary
         if isinstance(pred_states, list):
             pred_states = self._dicts_to_tensor(pred_states)
+        elif isinstance(pred_states, np.ndarray):
+            pred_states = torch.from_numpy(pred_states).float()
+            
         if isinstance(gt_states, list):
             gt_states = self._dicts_to_tensor(gt_states)
+        elif isinstance(gt_states, np.ndarray):
+            gt_states = torch.from_numpy(gt_states).float()
             
         self.num_frames += 1
         try:

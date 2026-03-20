@@ -29,3 +29,6 @@ evaluation_results/
 optimization_reports/
 *.jsonl
 *.pt
+*.json
+data/scat_raw/
+data/raw/

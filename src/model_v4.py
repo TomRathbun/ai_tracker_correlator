@@ -20,8 +20,8 @@ from src.pairwise_classifier import PairwiseAssociationClassifier
 from src.pairwise_features import compute_psr_psr_features, compute_ssr_any_features, get_psr_psr_dim, get_ssr_any_dim
 from src.metrics import TrackingMetrics   # your existing metrics
 
-class RecurrentGATTrackerV3(nn.Module):
-    """Single ML component for the entire multi-radar fusion pipeline."""
+class RecurrentGATTrackerV4(nn.Module):
+    """Single ML component for the entire multi-radar fusion pipeline, V4 with Clutter Head."""
     def __init__(self, num_sensors=5, hidden_dim=64, state_dim=6, num_heads=4, edge_dim=7):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -48,10 +48,11 @@ class RecurrentGATTrackerV3(nn.Module):
         self.decoder = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, state_dim + 2)
+            nn.Linear(hidden_dim, state_dim + 3) # +3: survival, initiation, clutter
         )
         nn.init.constant_(self.decoder[-1].bias[state_dim], 0.0)
         nn.init.constant_(self.decoder[-1].bias[state_dim + 1], -2.0)
+        nn.init.constant_(self.decoder[-1].bias[state_dim + 2], -2.0)
 
     def forward(self, x, node_type, sensor_id, edge_index, edge_attr, hidden_state=None):
         N = x.shape[0]
@@ -79,10 +80,12 @@ class RecurrentGATTrackerV3(nn.Module):
 
 
 def build_gnn_edges(full_x, node_type, psr_clf, ssr_clf, device, max_dist=60000.0, k=12):
-    """100% Vectorized Torch implementation. Zero Python loops in the hot path."""
+    """V4 Implementation (ignores frozen classifiers in favor of learned edge features)"""
+    """100% Vectorized Torch implementation. Zero Python loops in the hot path.
+    V4: Replaces frozen classifier probs with raw features for end-to-end learning."""
     pos = full_x[:, :3]
     vel = full_x[:, 3:6]
-    amp = full_x[:, 6]
+    dt_feat = full_x[:, 7]
     N = pos.shape[0]
     if N <= 1:
         return torch.empty((2, 0), dtype=torch.long, device=device), torch.empty((0, 7), device=device)
@@ -104,61 +107,15 @@ def build_gnn_edges(full_x, node_type, psr_clf, ssr_clf, device, max_dist=60000.
     # 2. Vectorized Feature Extraction for Edge Attributes
     p1, p2 = pos[row], pos[col]
     v1, v2 = vel[row], vel[col]
-    t1, t2 = node_type[row], node_type[col]
-    
-    # Calculate angular features in batch
-    def get_az_el(p):
-        x, y, z = p[:, 0], p[:, 1], p[:, 2]
-        az = torch.atan2(y, x)
-        el = torch.atan2(z, torch.sqrt(x**2 + y**2 + 1e-8))
-        return az, el
+    dt1, dt2 = dt_feat[row], dt_feat[col]
 
-    az1, el1 = get_az_el(p1)
-    az2, el2 = get_az_el(p2)
-    
-    az_diff = torch.abs(az1 - az2)
-    az_diff = torch.where(az_diff > np.pi, 2*np.pi - az_diff, az_diff)
-    el_diff = torch.abs(el1 - el2)
-
-    # 3. Batch Classifier Inference
-    probs = torch.zeros(edge_index.shape[1], device=device)
-    
-    # PSR-PSR vectorized features
-    psr_mask = (t1 == 0) & (t2 == 0)
-    if psr_mask.any() and psr_clf is not None:
-        vp1, vp2 = v1[psr_mask], v2[psr_mask]
-        v1_n = torch.norm(vp1, dim=1) + 1e-8
-        v2_n = torch.norm(vp2, dim=1) + 1e-8
-        cos_sim = torch.sum(vp1 * vp2, dim=1) / (v1_n * v2_n)
-        mag_diff = torch.abs(v1_n - v2_n) / 1000.0
-        
-        # Match psr_psr input dim (6): [dist, cos_sim, mag_diff, az_diff, el_diff, amp_diff]
-        dist_feat = torch.norm(p1[psr_mask] - p2[psr_mask], dim=1) / 100000.0
-        amp_diff = torch.abs(amp[row[psr_mask]] - amp[col[psr_mask]]) / 100.0
-        
-        psr_feats = torch.stack([
-            dist_feat, cos_sim, mag_diff, 
-            az_diff[psr_mask], el_diff[psr_mask], amp_diff
-        ], dim=1)
-        probs[psr_mask] = torch.sigmoid(psr_clf(psr_feats))
-
-    # SSR-ANY vectorized features
-    ssr_mask = ~psr_mask
-    if ssr_mask.any() and ssr_clf is not None:
-        # Match ssr_any input dim (4): [dist, az_diff, mode3a(0), modeS(0)]
-        # Since full_x currently doesn't hold IDs, we pass 0 for them.
-        dist_feat = torch.norm(p1[ssr_mask] - p2[ssr_mask], dim=1) / 100000.0
-        ssr_feats = torch.stack([
-            dist_feat, az_diff[ssr_mask], 
-            torch.zeros_like(dist_feat), torch.zeros_like(dist_feat)
-        ], dim=1)
-        probs[ssr_mask] = torch.sigmoid(ssr_clf(ssr_feats))
-
-    # 4. Final Attributes
+    # 3. Final Attributes (End-to-End Edge Embedding)
+    # The GATv2 layer will take these 7 raw features and learn the association
+    # probabilities internally via its attention mechanism.
     edge_attr = torch.cat([
         p1 - p2, 
         v1 - v2, 
-        probs.unsqueeze(1)
+        (dt1 - dt2).unsqueeze(1)
     ], dim=-1)
     
     return edge_index, edge_attr
@@ -211,13 +168,15 @@ def model_forward(model, full_x, node_type, full_sensor_id, edge_index, edge_att
     state_delta = raw_out[:, :6]
     survival_logits = raw_out[:, 6]
     init_logits = raw_out[:, 7]
+    clutter_logits = raw_out[:, 8]
     
     existence_logits = torch.where(node_type == 1, survival_logits, init_logits)
     
     updated_state = full_x[:, :6] + state_delta
     out = torch.cat([updated_state, existence_logits.unsqueeze(-1)], dim=-1)
     existence_probs = torch.sigmoid(existence_logits)
-    return out, new_hidden_full, alpha, existence_probs, existence_logits
+    clutter_probs = torch.sigmoid(clutter_logits)
+    return out, new_hidden_full, alpha, existence_probs, existence_logits, clutter_probs, clutter_logits
 
 
 def focal_bce(logits, targets, alpha=0.25, gamma=2.0, reduction='mean'):
@@ -229,23 +188,24 @@ def focal_bce(logits, targets, alpha=0.25, gamma=2.0, reduction='mean'):
     return loss
 
 
-def manage_tracks(active_tracks, out, new_hidden_full, existence_probs, existence_logits, alpha, edge_index,
-                  num_tracks, num_meas, init_thresh, coast_thresh, suppress_thresh, del_exist, del_age, track_cap, dt=0.0):
+def manage_tracks(active_tracks, out, new_hidden_full, existence_probs, existence_logits, clutter_probs, alpha, edge_index,
+                  num_tracks, num_meas, init_thresh, coast_thresh, suppress_thresh, del_exist, del_age, track_cap, dt=0.0, clutter_thresh=0.70):
     """
     Fixed: Removed automatic motion step during state update (dt=0).
     The GNN 'out' is now the refined state at the END of the window.
     The Pipeline handles the physics prediction between windows.
     """
     meas_offset = num_tracks
-    attn_suppress = torch.zeros(num_meas, dtype=torch.bool, device=out.device)
-    if num_meas > 0 and alpha is not None and alpha.numel() > 0:
+    actual_meas_nodes = out.shape[0] - num_tracks
+    attn_suppress = torch.zeros(actual_meas_nodes, dtype=torch.bool, device=out.device)
+    if actual_meas_nodes > 0 and alpha is not None and alpha.numel() > 0:
         alpha_mean = alpha.mean(dim=-1)
         src, dst = edge_index
         meas_mask = dst >= num_tracks
         if meas_mask.any():
             meas_edges = meas_mask.nonzero(as_tuple=False).squeeze(-1)
             meas_dst = dst[meas_edges] - num_tracks
-            meas_incoming = torch.zeros(num_meas, device=out.device)
+            meas_incoming = torch.zeros(actual_meas_nodes, device=out.device)
             meas_incoming.scatter_add_(0, meas_dst, alpha_mean[meas_edges])
             attn_suppress = meas_incoming > suppress_thresh
 
@@ -287,6 +247,7 @@ def manage_tracks(active_tracks, out, new_hidden_full, existence_probs, existenc
             # Use lower threshold during cold start to ensure we catch initial targets
             eff_init = init_thresh - 0.18 if cold_start else init_thresh
             if prob > eff_init:
+                if clutter_probs[idx] > clutter_thresh: continue # V4 Clutter Head Patch
                 s = out[idx, :6].detach()
                 
                 # Spatial Guard: Don't start multiple tracks for the same target in one window
@@ -330,11 +291,12 @@ def manage_tracks(active_tracks, out, new_hidden_full, existence_probs, existenc
 
 
 def compute_loss(pred_states, pred_logits, gt_states_dev, num_gt, match_gate, miss_penalty, fp_mult,
-                 out, epoch, num_meas, meas=None, existence_logits=None, num_tracks=0, 
+                 out, epoch, num_meas, meas=None, existence_logits=None, clutter_logits=None, num_tracks=0, 
                  pred_ages=None, aux_init_weight=5.0):
     """Fixed: all Hungarian matching now on CPU numpy → safe indexing."""
     device = out.device
     reg_loss = exist_matched_loss = exist_fp_loss = matched_exist_loss = torch.tensor(0.0, device=device)
+    clutter_loss = torch.tensor(0.0, device=device)
     miss_loss = torch.tensor(miss_penalty * num_gt, device=device)
 
     if pred_states.shape[0] > 0 and num_gt > 0:
@@ -384,6 +346,25 @@ def compute_loss(pred_states, pred_logits, gt_states_dev, num_gt, match_gate, mi
         vel_mag = torch.norm(meas[:, 3:6], dim=1)
         pseudo_target = torch.where((meas[:, 6] > 45.0) & (vel_mag > 80.0) & (vel_mag < 550.0), 0.92, 0.08).to(device)
         loss = loss + aux_init_weight * focal_bce(meas_logits, pseudo_target)
+
+    # Clutter Head Loss
+    if num_meas > 0 and meas is not None and clutter_logits is not None:
+        meas_pos = meas[:, :3]
+        if num_gt > 0:
+            dists = torch.cdist(meas_pos, gt_states_dev[:, :3])
+            min_dist, _ = torch.min(dists, dim=1)
+            is_true_tgt = min_dist < match_gate
+        else:
+            is_true_tgt = torch.zeros(num_meas, dtype=torch.bool, device=device)
+            
+        m_clutter_logits = clutter_logits[num_tracks : num_tracks + num_meas]
+        
+        # Target for clutter: 1.0 if NOT close to any ground truth
+        clutter_target = (~is_true_tgt).float()
+        
+        clutter_bce = focal_bce(m_clutter_logits, clutter_target)
+        clutter_loss = 2.0 * clutter_bce 
+        loss = loss + clutter_loss
 
     if existence_logits is not None:
         loss = loss + 0.001 * (existence_logits ** 2).mean()
@@ -459,13 +440,13 @@ def train_model(num_epochs=25, data_file="data/sim_hetero_001.jsonl", checkpoint
 
             edge_index, edge_attr = build_gnn_edges(full_x, node_type, psr_clf, ssr_clf, device)
 
-            out, new_hidden_full, alpha, existence_probs, existence_logits = model_forward(
+            out, new_hidden_full, alpha, existence_probs, existence_logits, clutter_probs, clutter_logits = model_forward(
                 model, full_x, node_type, full_sensor_id, edge_index, edge_attr, hidden_state)
 
             if num_tracks == 0 or frame_idx % 50 == 0:
                 print(f"Frame {frame_idx} | N={N}, tracks={num_tracks}, meas={num_meas}, exist_mean={existence_probs.mean().item():.4f}")
 
-            selected = manage_tracks(active_tracks, out, new_hidden_full, existence_probs, existence_logits,
+            selected = manage_tracks(active_tracks, out, new_hidden_full, existence_probs, existence_logits, clutter_probs,
                                      alpha, edge_index, num_tracks, num_meas, init_thresh, coast_thresh,
                                      suppress_thresh, del_exist, del_age, track_cap)
 
@@ -475,7 +456,7 @@ def train_model(num_epochs=25, data_file="data/sim_hetero_001.jsonl", checkpoint
             pred_logits = torch.stack([tr['logit'] for tr in selected]) if selected else torch.empty((0,), device=device)
 
             loss = compute_loss(pred_states, pred_logits, gt_states_dev, num_gt, match_gate, miss_penalty, fp_mult,
-                                out, epoch, num_meas, meas, existence_logits, num_tracks)
+                                out, epoch, num_meas, meas, existence_logits, clutter_logits, num_tracks)
 
             optimizer.zero_grad()
             loss.backward()

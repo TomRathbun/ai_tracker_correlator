@@ -34,7 +34,8 @@ class StateUpdaterConfig(BaseModel):
     suppress_thresh: float = 0.75
     del_exist: float = 0.05
     del_age: int = 15
-    track_cap: int = 500
+    track_cap: int = Field(500, description="Max active tracks")
+    clutter_thresh: float = Field(0.70, description="Dynamic clutter rejection probability threshold")
 
 
 class TrackManagerConfig(BaseModel):

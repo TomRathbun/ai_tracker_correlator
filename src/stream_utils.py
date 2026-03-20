@@ -41,7 +41,7 @@ def load_stream_and_truth(data_file: str):
         origin_lon = np.median(origin_lons)
         lon_scale = l_scale
         
-    print(f"📡 Calibrated Reference Origin: {origin_lat:.4f}, {origin_lon:.4f}")
+    print(f" Calibrated Reference Origin: {origin_lat:.4f}, {origin_lon:.4f}")
 
     truth_trajectories = {} 
     unique_track_ids = set()
@@ -72,7 +72,7 @@ def load_stream_and_truth(data_file: str):
                 'track_id': tid
             })
             
-    return measurements, truth_trajectories, sorted(list(unique_track_ids))
+    return measurements, truth_trajectories, sorted(list(unique_track_ids), key=lambda x: str(x))
 
 def get_truth_at_time(truth_trajectories: Dict[int, List[Dict]], t: float, allowed_ids: set = None) -> List[Dict]:
     """Retrieves the exact interpolated state of all tracks at time t."""

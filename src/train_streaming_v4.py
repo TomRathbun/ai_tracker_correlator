@@ -12,8 +12,8 @@ import numpy as np
 from tqdm import tqdm
 from typing import List, Dict, Tuple
 
-from src.model_v3 import (
-    RecurrentGATTrackerV3, 
+from src.model_v4 import (
+    RecurrentGATTrackerV4, 
     build_gnn_edges, 
     build_full_input, 
     model_forward,
@@ -52,22 +52,12 @@ def train_streaming(num_epochs=10, data_file="data/stream_radar_001.jsonl", wind
     
     print(f"Training on {len(measurements)} measurements (filtered from {len(measurements_all)})")
     
-    # Load pairwise classifiers for GNN features
-    try:
-        psr_clf = PairwiseAssociationClassifier(feature_dim=get_psr_psr_dim()).to(device)
-        psr_clf.load_state_dict(torch.load('checkpoints/pairwise_psr_psr.pt', map_location=device, weights_only=True))
-        psr_clf.eval()
-        ssr_clf = PairwiseAssociationClassifier(feature_dim=get_ssr_any_dim()).to(device)
-        ssr_clf.load_state_dict(torch.load('checkpoints/pairwise_ssr_any.pt', map_location=device, weights_only=True))
-        ssr_clf.eval()
-        print("✓ Loaded pairwise classifiers")
-    except:
-        print("Warning: Classifiers not found, using distance-only edges.")
-        psr_clf = ssr_clf = None
- 
-    model = RecurrentGATTrackerV3(num_sensors=5, edge_dim=7).to(device)
+    # Removed: Pairwise classifiers (psr_clf, ssr_clf) 
+    # V4 uses fully learned inline edge embeddings in the GATv2 layers.
     
-    checkpoint_path = "checkpoints/model_v3_streaming.pt"
+    model = RecurrentGATTrackerV4(num_sensors=5, edge_dim=7).to(device)
+    
+    checkpoint_path = "checkpoints/model_v4_streaming.pt"
     if os.path.exists(checkpoint_path):
         try:
             model.load_state_dict(torch.load(checkpoint_path, map_location=device, weights_only=True))
@@ -111,11 +101,12 @@ def train_streaming(num_epochs=10, data_file="data/stream_radar_001.jsonl", wind
                 miss_penalty = cfg.get("miss_penalty", 50.0)
                 del_exist = cfg.get("del_exist", 0.40)
                 del_age = cfg.get("del_age", 2)
-                print(f"🔄 Epoch {epoch+1}: Hot-reloaded config (fp_mult={fp_mult}, lr={lr})")
+                clutter_thresh = cfg.get("clutter_thresh", 0.70)
+                print(f"🔄 Epoch {epoch+1}: Hot-reloaded config (fp_mult={fp_mult}, lr={lr}, clutter_thresh={clutter_thresh})")
         except Exception as e:
             print(f"⚠️ Config reload failed: {e}. Using previous fallback.")
             # Fallback to defaults
-            match_gate, miss_penalty, del_exist, del_age = 2000.0, 50.0, 0.40, 2
+            match_gate, miss_penalty, del_exist, del_age, clutter_thresh = 2000.0, 50.0, 0.40, 2, 0.70
 
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
@@ -171,19 +162,19 @@ def train_streaming(num_epochs=10, data_file="data/stream_radar_001.jsonl", wind
             ])
             
             # 3. Build Edges 
-            edge_index, edge_attr = build_gnn_edges(full_x, node_type, psr_clf, ssr_clf, device)
+            edge_index, edge_attr = build_gnn_edges(full_x, node_type, device)
             
             # 4. Forward Pass
-            out, new_hidden_full, alpha, existence_probs, existence_logits = model_forward(
+            out, new_hidden_full, alpha, existence_probs, existence_logits, clutter_probs, clutter_logits = model_forward(
                 model, full_x, node_type, full_sensor_id, edge_index, edge_attr, hidden_state
             )
             
             # 5. Manage Tracks (Loss is calculated at the end of the window; GNN refinement is 1:1)
             active_tracks = manage_tracks(
-                active_tracks, out, new_hidden_full, existence_probs, existence_logits, 
+                active_tracks, out, new_hidden_full, existence_probs, existence_logits, clutter_probs,
                 alpha, edge_index, num_tracks, 0 if dummy_added else num_meas, 
                 init_thresh, coast_thresh, suppress_thresh, del_exist, del_age, track_cap,
-                dt=0.0
+                dt=0.0, clutter_thresh=clutter_thresh
             )
             
             # 6. Loss Calculation
@@ -198,7 +189,7 @@ def train_streaming(num_epochs=10, data_file="data/stream_radar_001.jsonl", wind
             loss = compute_loss(
                 pred_states, pred_logits, gt_states, len(gt_list), 
                 match_gate, miss_penalty, fp_mult, out, epoch, 0 if dummy_added else num_meas, 
-                meas_tensor, existence_logits, num_tracks,
+                meas_tensor, existence_logits, clutter_logits, num_tracks,
                 pred_ages=pred_ages, aux_init_weight=aux_init_weight
             )
             

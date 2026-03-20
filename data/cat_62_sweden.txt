@@ -1,0 +1,6 @@
+{'category': 62, 'edition': '1.18', 'track_number': 'SWE101', 'time': 1476532800.0, 'lat': 59.6, 'lon': 17.8, 'x': -6670.62, 'y': -5777.51, 'z': 9144.0, 'vx': 220, 'vy': -10, 'mode3a': '4521', 'callsign': 'SKW101'}
+{'category': 62, 'edition': '1.18', 'track_number': 'SWE101', 'time': 1476532810.0, 'lat': 59.59, 'lon': 17.81, 'x': -6108.17, 'y': -6890.71, 'z': 9296.4, 'vx': 225, 'vy': -5, 'mode3a': '4521', 'callsign': 'SKW101'}
+{'category': 62, 'edition': '1.18', 'track_number': 'SWE101', 'time': 1476532820.0, 'lat': 59.58, 'lon': 17.82, 'x': -5545.73, 'y': -8003.91, 'z': 9448.8, 'vx': 230, 'vy': 0, 'mode3a': '4521', 'callsign': 'SKW101'}
+{'category': 62, 'edition': '1.18', 'track_number': 'SWE102', 'time': 1476532805.0, 'lat': 59.8, 'lon': 18.0, 'x': 4578.32, 'y': 16486.49, 'z': 3657.6, 'vx': 150, 'vy': 150, 'mode3a': '1172', 'callsign': 'FIN44'}
+{'category': 62, 'edition': '1.18', 'track_number': 'SWE102', 'time': 1476532815.0, 'lat': 59.82, 'lon': 18.02, 'x': 5703.21, 'y': 18712.89, 'z': 3810.0, 'vx': 155, 'vy': 155, 'mode3a': '1172', 'callsign': 'FIN44'}
+{'category': 62, 'edition': '1.18', 'track_number': 'SWE102', 'time': 1476532825.0, 'lat': 59.84, 'lon': 18.04, 'x': 6828.1, 'y': 20939.29, 'z': 3962.4, 'vx': 160, 'vy': 160, 'mode3a': '1172', 'callsign': 'FIN44'}

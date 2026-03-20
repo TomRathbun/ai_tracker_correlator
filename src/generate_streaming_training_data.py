@@ -49,6 +49,7 @@ import os
 import random
 import re
 import sys
+from typing import List, Dict
 from collections import defaultdict
 from pathlib import Path
 
@@ -57,26 +58,51 @@ import numpy as np
 # ── paths ──────────────────────────────────────────────────────────────────────
 SCRIPT_DIR = Path(__file__).resolve().parent
 DATA_DIR = SCRIPT_DIR.parent / "data"
-INPUT_FILE = DATA_DIR / "cat_62_data.txt"
-OUTPUT_FILE = DATA_DIR / "stream_radar_001.jsonl"
+
+def get_args():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", type=str, default=str(DATA_DIR / "cat_62_data.txt"))
+    parser.add_argument("--output", type=str, default=str(DATA_DIR / "sim_hetero_001.jsonl"))
+    parser.add_argument("--region", type=str, default=os.environ.get("TRACKER_REGION", "uae"))
+    return parser.parse_args()
 
 # ── reproducibility ─────────────────────────────────────────────────────────
 RNG_SEED = 42
 rng = np.random.default_rng(RNG_SEED)
 random.seed(RNG_SEED)
 
-# ── radar site definitions (lon, lat approximate) ───────────────────────────
-#  5 notional radar sites placed to give overlapping coverage of UAE airspace.
-#  Positions expressed in the same Cartesian frame as the CAT-62 x/y data
-#  (metres east/north from a reference point near Abu Dhabi centre).
-RADAR_SITES = [
-    # id, x_site, y_site,  max_range_m,  psr_rate_hz, ssr_rate_hz, scan_period_s
-    {"id": 0, "x": 0.0,      "y": 0.0,      "max_range": 450_000, "scan_period": 7.0,  "psr_prob": 0.92, "ssr_prob": 0.88},
-    {"id": 1, "x": 150_000,  "y": 100_000,  "max_range": 400_000, "scan_period": 5.5,  "psr_prob": 0.90, "ssr_prob": 0.85},
-    {"id": 2, "x": -200_000, "y": 200_000,  "max_range": 420_000, "scan_period": 8.0,  "psr_prob": 0.88, "ssr_prob": 0.83},
-    {"id": 3, "x": 300_000,  "y": -50_000,  "max_range": 380_000, "scan_period": 6.5,  "psr_prob": 0.87, "ssr_prob": 0.80},
-    {"id": 4, "x": -100_000, "y": -150_000, "max_range": 410_000, "scan_period": 9.0,  "psr_prob": 0.85, "ssr_prob": 0.82},
-]
+# ── regional configurations ──────────────────────────────────────────────────
+REGIONS = {
+    "uae": {
+        "origin_lat": 24.4539,
+        "origin_lon": 54.3773,
+        "radar_sites": [
+            {"id": 0, "x": 0.0,      "y": 0.0,      "max_range": 450_000, "scan_period": 7.0,  "psr_prob": 0.92, "ssr_prob": 0.88},
+            {"id": 1, "x": 150_000,  "y": 100_000,  "max_range": 400_000, "scan_period": 5.5,  "psr_prob": 0.90, "ssr_prob": 0.85},
+            {"id": 2, "x": -200_000, "y": 200_000,  "max_range": 420_000, "scan_period": 8.0,  "psr_prob": 0.88, "ssr_prob": 0.83},
+            {"id": 3, "x": 300_000,  "y": -50_000,  "max_range": 380_000, "scan_period": 6.5,  "psr_prob": 0.87, "ssr_prob": 0.80},
+            {"id": 4, "x": -100_000, "y": -150_000, "max_range": 410_000, "scan_period": 9.0,  "psr_prob": 0.85, "ssr_prob": 0.82},
+        ]
+    },
+    "sweden": {
+        "origin_lat": 59.6519, # Arlanda
+        "origin_lon": 17.9186,
+        "radar_sites": [
+            {"id": 0, "x": 0.0,      "y": 0.0,       "max_range": 400_000, "scan_period": 7.0,  "psr_prob": 0.92, "ssr_prob": 0.88}, # Arlanda
+            {"id": 1, "x": -300_000, "y": -350_000,  "max_range": 400_000, "scan_period": 5.0,  "psr_prob": 0.90, "ssr_prob": 0.85}, # Landvetter area
+            {"id": 2, "x": 100_000,  "y": -250_000,  "max_range": 400_000, "scan_period": 8.0,  "psr_prob": 0.88, "ssr_prob": 0.83}, # Gotland area
+            {"id": 3, "x": -50_000,  "y": 250_000,   "max_range": 400_000, "scan_period": 6.0,  "psr_prob": 0.87, "ssr_prob": 0.80}, # North of Arlanda
+            {"id": 4, "x": -250_000, "y": 100_000,   "max_range": 350_000, "scan_period": 9.0,  "psr_prob": 0.85, "ssr_prob": 0.82}, # West
+        ]
+    }
+}
+
+def get_config(region_name):
+    region_name = region_name.lower()
+    if region_name not in REGIONS:
+        region_name = "uae"
+    return REGIONS[region_name], region_name
 
 # ── noise parameters ─────────────────────────────────────────────────────────
 POS_NOISE_STD_M  = 150.0   # 1-sigma position error (metres)
@@ -145,42 +171,24 @@ def load_cat62(path: Path) -> list[dict]:
     return records
 
 
-def build_track_epochs(records: list[dict]) -> dict:
-    """
-    Group records by (time, track_number) → unique aircraft epoch.
-    Returns dict[time_float] → list of track dicts for that epoch.
-    The CAT-62 feed repeats each track across multiple SAC/SIC entries;
-    we deduplicate by track_number within the same time step.
-    """
-    by_time: dict[float, dict[int, dict]] = defaultdict(dict)
+def build_track_epochs(records: List[Dict]) -> Dict[float, List[Dict]]:
+    by_time: Dict[float, Dict[str, Dict]] = defaultdict(dict)
     for rec in records:
-        t = rec["time"]
-        tn = int(rec["track_number"])
+        t = float(rec["time"])
+        tn = str(rec["track_number"])
         if tn not in by_time[t]:
             by_time[t][tn] = rec
     return {t: list(tracks.values()) for t, tracks in sorted(by_time.items())}
 
 
 # ── assign Mode-S addresses once per track_number ────────────────────────────
-_modes_map: dict[int, str] = {}
+_modes_map: Dict[str, str] = {}
 
-def get_mode_s(track_number: int) -> str:
-    if track_number not in _modes_map:
-        _modes_map[track_number] = rand_hex6()
-    return _modes_map[track_number]
-
-
-# ── phase offsets so each radar starts its scan at a different angle ──────────
-RADAR_PHASE_OFFSETS = {r["id"]: rng.uniform(0, r["scan_period"]) for r in RADAR_SITES}
-
-
-def next_scan_time(radar: dict, current_wall_t: float) -> float:
-    """Return the wall-clock time of the next scan for this radar."""
-    period = radar["scan_period"]
-    phase  = RADAR_PHASE_OFFSETS[radar["id"]]
-    # How many full periods since zero?
-    elapsed = current_wall_t + phase
-    return current_wall_t + (period - (elapsed % period))
+def get_mode_s(track_number) -> str:
+    tn_str = str(track_number)
+    if tn_str not in _modes_map:
+        _modes_map[tn_str] = rand_hex6()
+    return _modes_map[tn_str]
 
 
 # ── generate false-alarm cluster per scan ────────────────────────────────────
@@ -232,7 +240,10 @@ def gen_false_alarms(radar: dict, scan_wall_t: float, coverage_bbox: dict) -> li
 
 # ── main generation loop ──────────────────────────────────────────────────────
 
-def generate(input_path: Path, output_path: Path) -> None:
+def generate(input_path: Path, output_path: Path, radar_sites: List[Dict]) -> None:
+    # ── phase offsets so each radar starts its scan at a different angle ──────────
+    radar_phase_offsets = {r["id"]: rng.uniform(0, r["scan_period"]) for r in radar_sites}
+    
     print(f"Loading CAT-62 data from {input_path} …")
     records = load_cat62(input_path)
     print(f"  {len(records):,} category-62 records loaded.")
@@ -264,7 +275,7 @@ def generate(input_path: Path, output_path: Path) -> None:
     alt_cache: dict[tuple, float] = {}
 
     def get_alt(track_rec: dict) -> float:
-        key = (track_rec["time"], int(track_rec["track_number"]))
+        key = (track_rec["time"], str(track_rec["track_number"]))
         if key not in alt_cache:
             speed = math.hypot(track_rec["vx"], track_rec["vy"])
             base  = estimate_altitude_m(speed)
@@ -273,8 +284,8 @@ def generate(input_path: Path, output_path: Path) -> None:
 
     # Build scan schedule for each radar (next_scan_time indexed by radar_id)
     next_scan: dict[int, float] = {}
-    for r in RADAR_SITES:
-        next_scan[r["id"]] = RADAR_PHASE_OFFSETS[r["id"]]  # first scan
+    for r in radar_sites:
+        next_scan[r["id"]] = radar_phase_offsets[r["id"]]  # first scan
 
     # We'll collect all measurements and sort by t at the end
     all_measurements: list[dict] = []
@@ -286,7 +297,7 @@ def generate(input_path: Path, output_path: Path) -> None:
         wall_t = cat62_t - t0_cat62   # seconds from recording start
         track_list = epochs[cat62_t]
 
-        for radar in RADAR_SITES:
+        for radar in radar_sites:
             rid = radar["id"]
 
             # Advance scan schedule past the current wall_t
@@ -340,7 +351,7 @@ def generate(input_path: Path, output_path: Path) -> None:
                         "gt_x":       round(tx, 2), # Ground Truth
                         "gt_y":       round(ty, 2), # Ground Truth
                         "amplitude":  round(amp, 2),
-                        "track_id":   int(trk["track_number"]),
+                        "track_id":   trk["track_number"],
                         "source_lat": trk["lat"],
                         "source_lon": trk["lon"],
                     }
@@ -365,8 +376,8 @@ def generate(input_path: Path, output_path: Path) -> None:
                         "gt_x":       round(tx, 2),
                         "gt_y":       round(ty, 2),
                         "mode3a":     trk["mode3a"],
-                        "mode_s":     get_mode_s(int(trk["track_number"])),
-                        "track_id":   int(trk["track_number"]),
+                        "mode_s":     get_mode_s(trk["track_number"]),
+                        "track_id":   trk["track_number"],
                         "source_lat": trk["lat"],
                         "source_lon": trk["lon"],
                     }
@@ -420,4 +431,10 @@ def generate(input_path: Path, output_path: Path) -> None:
 
 
 if __name__ == "__main__":
-    generate(INPUT_FILE, OUTPUT_FILE)
+    args = get_args()
+    
+    CONFIG, ACTIVE_REGION = get_config(args.region)
+    RADAR_SITES = CONFIG["radar_sites"]
+    print(f"🌍 Simulation Region: {ACTIVE_REGION.upper()} (Origin: {CONFIG['origin_lat']}, {CONFIG['origin_lon']})")
+    
+    generate(Path(args.input), Path(args.output), RADAR_SITES)

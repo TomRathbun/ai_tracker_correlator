@@ -10,8 +10,7 @@ import numpy as np
 import torch
 
 from src.config_schemas import PipelineConfig
-from src.model_v3 import RecurrentGATTrackerV3, build_gnn_edges
-from scipy.sparse import csr_matrix
+from src.factory import detect_model_version, get_model_suite
 from scipy.sparse.csgraph import connected_components
 from scipy.optimize import linear_sum_assignment
 
@@ -53,27 +52,19 @@ class GNNUpdater(StateUpdater):
         
         if self.config.gnn_model_path:
             self._load_model()
-    
     def _load_model(self):
-        """Load the GNN model from checkpoint, attempting multiple architectures."""
-        from src.model_v3 import RecurrentGATTrackerV3
-        
+        """Load the GNN model from checkpoint, automatically resolving version."""
         try:
-            checkpoint = torch.load(self.config.gnn_model_path, weights_only=False, map_location=self.device)
-            # Handle different checkpoint formats
-            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-                state_dict = checkpoint['model_state_dict']
-            else:
-                state_dict = checkpoint
+            self.model_type = detect_model_version(self.config.gnn_model_path)
+            self.suite = get_model_suite(self.model_type)
             
-            # Identify architecture by keys
-            if "gat1.att" not in str(state_dict.keys()) and "gat1.lin_l.weight" not in str(state_dict.keys()):
-                raise RuntimeError("Only RecurrentGATTrackerV3 supported. Legacy path removed.")
-            self.model = RecurrentGATTrackerV3(num_sensors=5)
-            self.model_type = "v3"
-                
+            # Load state dict
+            checkpoint = torch.load(self.config.gnn_model_path, weights_only=False, map_location=self.device)
+            state_dict = checkpoint['model_state_dict'] if (isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint) else checkpoint
+            
+            # Instantiate model via suite
+            self.model = self.suite["model_class"](num_sensors=5).to(self.device)
             self.model.load_state_dict(state_dict)
-            self.model.to(self.device)
             self.model.eval()
             
             # Load classifiers for GNN edge features (RecurrentGATTrackerV3 uses them)
@@ -99,7 +90,7 @@ class GNNUpdater(StateUpdater):
             self.psr_clf = self.ssr_clf = None
     def update(self, measurements: List[Dict], tracks: List[Dict], dt: float = 1.0, frame_t: float = None) -> List[Dict]:
         """Update tracks using GNN."""
-        if self.model is None or not measurements:
+        if self.model is None or (not measurements and not tracks):
             return tracks
         
         # This implementation uses model_v3 logic
@@ -112,7 +103,7 @@ class GNNUpdater(StateUpdater):
                 m['sensor_id'] = m['radar_id']
                 
         meas, meas_sensor_ids = frame_to_tensors({'measurements': measurements}, self.device)
-        num_meas = meas.shape[0]
+        num_meas = meas.shape[0] if (meas is not None and len(meas.shape) > 0) else 0
         
         # 2. Build full input (tracks + measurements)
         # Note: RecurrentGATTrackerV3 expects hidden state in track dicts
@@ -120,33 +111,73 @@ class GNNUpdater(StateUpdater):
             tracks, meas, meas_sensor_ids, num_sensors=5, device=self.device
         )
         
+        N = full_x.shape[0] if full_x is not None else 0
+        if N == 0:
+            return tracks
+            
+        # Add dummy measurement if we only have tracks to ensure GNN structure works
+        dummy_added = False
+        if num_meas == 0 and num_tracks > 0:
+            dim = 8 if getattr(self, "model_type", "v3") in ["v4", "v5"] else 7
+            dummy_meas = torch.zeros(1, dim, device=self.device)
+            dummy_id = torch.tensor([5], dtype=torch.long, device=self.device)
+            full_x = torch.cat([full_x, dummy_meas], dim=0)
+            sensor_ids = torch.cat([sensor_ids, dummy_id], dim=0)
+            num_meas = 1
+            dummy_added = True
+            
         # 3. Create graph
         # 3. Create graph nodes (Tracks + Measurements)
         # Type: 1.0 for established tracks and SSR measurements, 0.0 for PSR measurements
         track_types = torch.ones(num_tracks, dtype=torch.long, device=self.device)
-        meas_types = torch.tensor([
-            1 if m.get('type') != 'PSR' else 0 
-            for m in measurements
-        ], dtype=torch.long, device=self.device)
+        
+        if dummy_added:
+            meas_types = torch.zeros(1, dtype=torch.long, device=self.device)
+        else:
+            meas_types = torch.tensor([
+                1 if m.get('type') != 'PSR' else 0 
+                for m in measurements
+            ], dtype=torch.long, device=self.device)
         
         node_type = torch.cat([track_types, meas_types])
         
         # Build GNN edges with association features
-        edge_index, edge_attr = build_gnn_edges(
-            full_x, node_type, self.psr_clf, self.ssr_clf, self.device
+        if getattr(self, "model_type", "v3") == "v5":
+            from src.model_v5 import build_gnn_edges as build_gnn_edges_v5
+            edge_index, edge_attr = build_gnn_edges_v5(
+                full_x, node_type, self.device
+            )
+        elif getattr(self, "model_type", "v3") == "v4":
+            from src.model_v4 import build_gnn_edges as build_gnn_edges_v4
+            edge_index, edge_attr = build_gnn_edges_v4(
+                full_x, node_type, self.device
+            )
+        # 3. Build Graph Edges via suite
+        edge_index, edge_attr = self.suite["build_edges"](
+            full_x, node_type, getattr(self, 'psr_clf', None), getattr(self, 'ssr_clf', None), self.device
         )
         
-        # 4. Forward pass
+        # 4. Forward pass via suite
         try:
             with torch.no_grad():
-                if self.model_type == "v3":
-                    # Modern architecture
-                    out, new_hidden_full, alpha = self.model(
-                        full_x, node_type, sensor_ids, edge_index, edge_attr, hidden_state
+                # Note: model_forward signatures vary slightly by version (v5 adds clutter_thresh/pruned_edges)
+                if self.model_type == "v5":
+                    out, new_hidden_full, alpha, existence_probs, existence_logits, clutter_probs, clutter_logits, pruned_edge_index = self.suite["model_forward"](
+                        self.model, full_x, node_type, sensor_ids, edge_index, edge_attr, hidden_state,
+                        getattr(self.config, 'clutter_thresh', 0.70)
                     )
-                    existence_logits = out[:, 6]
-                    existence_probs = torch.sigmoid(existence_logits)
-                else:
+                elif self.model_type in ["v3", "v4"]:
+                    res = self.suite["model_forward"](
+                        self.model, full_x, node_type, sensor_ids, edge_index, edge_attr, hidden_state
+                    )
+                    # Handle V4/V3 result unpacking
+                    if self.model_type == "v4":
+                        out, new_hidden_full, alpha, existence_probs, existence_logits, clutter_probs, clutter_logits = res
+                    else: # V3
+                        out, new_hidden_full, alpha, existence_probs, existence_logits = res
+                        clutter_probs = torch.zeros_like(existence_probs)
+                        clutter_logits = torch.zeros_like(existence_logits)
+                elif self.model_type == "legacy":
                     # Legacy GNNTracker architecture
                     # Mapping features: [x,y,z,vx,vy,vz,amp,type,m3a,ms]
                     # Note: Legacy GNN expects km-scaled inputs for numerical stability
@@ -214,20 +245,6 @@ class GNNUpdater(StateUpdater):
             return tracks
             
         # 5. Extract updated states and manage tracks
-        # For simplicity, we use matching logic or direct update
-        # In this consolidated version, we return the processed tracks
-        from src.model_v3 import manage_tracks
-        
-        # existence_probs/logits for management
-        existence_logits = out[:, 6]
-        existence_probs = torch.sigmoid(existence_logits)
-        
-        self.frame_count += 1
-        if self.frame_count % 10 == 0 and num_tracks < len(existence_probs):
-            meas_probs = existence_probs[num_tracks:]
-            print(f"GNN Frame {self.frame_count} | meas probs: mean={meas_probs.mean():.3f} max={meas_probs.max():.3f} "
-                  f"initiated={sum((meas_probs > getattr(self.config, 'init_thresh', 0.30))).item()}")
-
         # Use config values from state_updater (self.config IS state_updater)
         init_thresh = self.config.init_thresh
         coast_thresh = self.config.coast_thresh
@@ -236,24 +253,35 @@ class GNNUpdater(StateUpdater):
         del_age = self.config.del_age
         track_cap = self.config.track_cap
         
-        updated_tracks = manage_tracks(
-            active_tracks=tracks,
-            out=out,
-            new_hidden_full=new_hidden_full,
-            existence_probs=existence_probs,
-            existence_logits=existence_logits,
-            alpha=alpha,
-            edge_index=edge_index,
-            num_tracks=num_tracks,
-            num_meas=num_meas,
-            init_thresh=init_thresh,
-            coast_thresh=coast_thresh,
-            suppress_thresh=suppress_thresh,
-            del_exist=del_exist,
-            del_age=del_age,
-            track_cap=track_cap,
-            dt=dt
-        )
+        if self.model_type == "v5":
+            from src.model_v5 import manage_tracks
+            updated_tracks = manage_tracks(
+                active_tracks=tracks, out=out, new_hidden_full=new_hidden_full, 
+                existence_probs=existence_probs, existence_logits=existence_logits, clutter_probs=clutter_probs,
+                alpha=alpha, edge_index=pruned_edge_index if 'pruned_edge_index' in locals() else edge_index, num_tracks=num_tracks, num_meas=0 if dummy_added else num_meas,
+                init_thresh=init_thresh, coast_thresh=coast_thresh, suppress_thresh=suppress_thresh,
+                del_exist=del_exist, del_age=del_age, track_cap=track_cap, dt=dt, 
+                clutter_thresh=getattr(self.config, 'clutter_thresh', 0.70)
+            )
+        elif self.model_type == "v4":
+            from src.model_v4 import manage_tracks
+            updated_tracks = manage_tracks(
+                active_tracks=tracks, out=out, new_hidden_full=new_hidden_full, 
+                existence_probs=existence_probs, existence_logits=existence_logits, clutter_probs=clutter_probs,
+                alpha=alpha, edge_index=edge_index, num_tracks=num_tracks, num_meas=0 if dummy_added else num_meas,
+                init_thresh=init_thresh, coast_thresh=coast_thresh, suppress_thresh=suppress_thresh,
+                del_exist=del_exist, del_age=del_age, track_cap=track_cap, dt=dt,
+                clutter_thresh=getattr(self.config, 'clutter_thresh', 0.70)
+            )
+        else:
+            from src.model_v3 import manage_tracks
+            updated_tracks = manage_tracks(
+                active_tracks=tracks, out=out, new_hidden_full=new_hidden_full, 
+                existence_probs=existence_probs, existence_logits=existence_logits, 
+                alpha=alpha, edge_index=edge_index, num_tracks=num_tracks, num_meas=0 if dummy_added else num_meas,
+                init_thresh=init_thresh, coast_thresh=coast_thresh, suppress_thresh=suppress_thresh,
+                del_exist=del_exist, del_age=del_age, track_cap=track_cap, dt=dt
+            )
         
         return updated_tracks
     
