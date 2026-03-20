@@ -191,7 +191,7 @@ def build_full_input(active_tracks, meas, meas_sensor_ids, num_sensors, device):
 
 
 def model_forward(model, full_x, node_type, full_sensor_id, edge_index, edge_attr, hidden_state, clutter_thresh=0.70):
-    raw_out, new_hidden_full, alpha, clutter_logits, pruned_edge_index = model(full_x, node_type, full_sensor_id, edge_index, edge_attr, hidden_state, clutter_thresh)
+    raw_out, new_hidden_full, alpha, clutter_logits, active_edge_index = model(full_x, node_type, full_sensor_id, edge_index, edge_attr, hidden_state, clutter_thresh)
     state_delta = raw_out[:, :6]
     survival_logits = raw_out[:, 6]
     init_logits = raw_out[:, 7]
@@ -202,7 +202,7 @@ def model_forward(model, full_x, node_type, full_sensor_id, edge_index, edge_att
     out = torch.cat([updated_state, existence_logits.unsqueeze(-1)], dim=-1)
     existence_probs = torch.sigmoid(existence_logits)
     clutter_probs = torch.sigmoid(clutter_logits)
-    return out, new_hidden_full, alpha, existence_probs, existence_logits, clutter_probs, clutter_logits, pruned_edge_index
+    return out, new_hidden_full, alpha, existence_probs, existence_logits, clutter_probs, clutter_logits, active_edge_index
 
 
 def focal_bce(logits, targets, alpha=0.25, gamma=2.0, reduction='mean'):
@@ -221,11 +221,16 @@ def manage_tracks(active_tracks, out, new_hidden_full, existence_probs, existenc
     The GNN 'out' is now the refined state at the END of the window.
     The Pipeline handles the physics prediction between windows.
     """
+    # 1. Attention Suppression (Gating)
     meas_offset = num_tracks
     actual_meas_nodes = out.shape[0] - num_tracks
     attn_suppress = torch.zeros(actual_meas_nodes, dtype=torch.bool, device=out.device)
-    if actual_meas_nodes > 0 and alpha is not None and alpha.numel() > 0:
-        alpha_mean = alpha.mean(dim=-1)
+    
+    # Correctly handle GAT attention tuple (edge_index, weights)
+    attn_weights = alpha[1] if isinstance(alpha, tuple) else alpha
+    
+    if actual_meas_nodes > 0 and attn_weights is not None and attn_weights.numel() > 0:
+        alpha_mean = attn_weights.mean(dim=-1)
         src, dst = edge_index
         meas_mask = dst >= num_tracks
         if meas_mask.any():

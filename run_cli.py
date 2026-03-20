@@ -124,7 +124,7 @@ def run_cli():
             from mlflow.tracking import MlflowClient
             client = MlflowClient()
             
-            print(f"\n SCANNING ACTIVE AI TRACKER FLEET:")
+            logging.info(f"\n SCANNING ACTIVE AI TRACKER FLEET:")
             print("="*110)
             print(f"{'PID':<8} | {'MODE':<10} | {'UPTIME':<12} | {'PROGRESS':<12} | {'LIVE LOSS':<10} | {'COMMAND LINE'}")
             print("-" * 110)

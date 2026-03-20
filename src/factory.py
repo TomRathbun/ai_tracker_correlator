@@ -30,6 +30,7 @@ def get_model_suite(version: str):
         "build_edges": getattr(model_module, "build_gnn_edges", None),
         "model_forward": getattr(model_module, "model_forward", None),
         "manage_tracks": getattr(model_module, "manage_tracks", None),
+        "build_input": getattr(model_module, "build_full_input", None),
         "train_streaming": train_fn
     }
     
@@ -48,13 +49,19 @@ def detect_model_version(checkpoint_path: str):
         return "v4" # Default fallback
         
     try:
-        state_dict = torch.load(checkpoint_path, map_state_dict="cpu", weights_only=True)
-        if "clutter_head.0.weight" in state_dict:
-            return "v5"
-        # Logic for future versions
-        if "cross_attn" in str(state_dict.keys()):
+        # map_location, not map_state_dict
+        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        keys = ckpt["model_state_dict"].keys() if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt.keys()
+        
+        if "clutter_head.0.weight" in keys:
+            # If specified file name has v5, or it has GAT traits, we categorize as v5
+            if "v5" in str(checkpoint_path).lower():
+                return "v5"
+            return "v4"
+        if any("cross_attn" in k for k in keys):
             return "v6"
-    except:
+    except Exception as e:
+        print(f"Version detection failed: {e}")
         pass
         
-    return "v4" # Default
+    return "v4" # Default fallback

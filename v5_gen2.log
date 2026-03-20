@@ -1,0 +1,101 @@
+2026-03-20 15:59:17,201 [INFO] PROCESS START: PID=27296, Model=v5, Mode=gnn
+C:\Users\USER\ai_tracker_correlator\.venv\Lib\site-packages\mlflow\tracking\_tracking_service\utils.py:178: FutureWarning: The filesystem tracking backend (e.g., './mlruns') will be deprecated in February 2026. Consider transitioning to a database backend (e.g., 'sqlite:///mlflow.db') to take advantage of the latest MLflow features. See https://github.com/mlflow/mlflow/issues/18534 for more details and migration guidance. For migrating existing data, https://github.com/mlflow/mlflow-export-import can be used.
+  return FileStore(store_uri, store_uri)
+[OK] MLflow initialized: ./mlruns
+[OK] Experiment: ai_tracker_fusion
+
+ Initializing AI Tracker (GNN mode)...
+Warning: Could not load clutter filter: 'charmap' codec can't encode character '\u2713' in position 0: character maps to <undefined>
+Warning: GNNUpdater could not load classifiers, edges will lack ML features.
+Warning: Could not load GNN model from checkpoints/model_v5_streaming.pt: 'charmap' codec can't encode character '\u2713' in position 0: character maps to <undefined>
+ Loaded 300 frames. Starting tracking...
+
+Processing:   0%|          | 0/300 [00:00<?, ?it/s]
+                                                   
+
+Processing:   0%|          | 0/300 [00:00<?, ?it/s]
+Processing:  12%|#1        | 35/300 [00:00<00:00, 346.06it/s]
+                                                             
+
+Processing:  12%|#1        | 35/300 [00:00<00:00, 346.06it/s]
+                                                             
+
+Processing:  12%|#1        | 35/300 [00:00<00:00, 346.06it/s]
+Processing:  23%|##3       | 70/300 [00:00<00:00, 332.36it/s]
+                                                             
+
+Processing:  23%|##3       | 70/300 [00:00<00:00, 332.36it/s]
+                                                             
+
+Processing:  23%|##3       | 70/300 [00:00<00:00, 332.36it/s]
+Processing:  37%|###6      | 110/300 [00:00<00:00, 359.21it/s]
+                                                              
+
+Processing:  37%|###6      | 110/300 [00:00<00:00, 359.21it/s]
+                                                              
+
+Processing:  37%|###6      | 110/300 [00:00<00:00, 359.21it/s]
+Processing:  50%|####9     | 149/300 [00:00<00:00, 366.73it/s]
+                                                              
+
+Processing:  50%|####9     | 149/300 [00:00<00:00, 366.73it/s]
+                                                              
+
+Processing:  50%|####9     | 149/300 [00:00<00:00, 366.73it/s]
+Processing:  62%|######2   | 186/300 [00:00<00:00, 365.17it/s]
+                                                              
+
+Processing:  62%|######2   | 186/300 [00:00<00:00, 365.17it/s]
+                                                              
+
+Processing:  62%|######2   | 186/300 [00:00<00:00, 365.17it/s]
+Processing:  74%|#######4  | 223/300 [00:00<00:00, 352.88it/s]
+                                                              
+
+Processing:  74%|#######4  | 223/300 [00:00<00:00, 352.88it/s]
+Processing:  86%|########6 | 259/300 [00:00<00:00, 341.42it/s]
+                                                              
+
+Processing:  86%|########6 | 259/300 [00:00<00:00, 341.42it/s]
+                                                              
+
+Processing:  86%|########6 | 259/300 [00:00<00:00, 341.42it/s]
+Processing:  98%|#########8| 294/300 [00:00<00:00, 316.99it/s]
+                                                              
+
+Processing:  98%|#########8| 294/300 [00:00<00:00, 316.99it/s]
+Processing: 100%|##########| 300/300 [00:00<00:00, 336.83it/s]
+Frame 20: 48 meas -> 0 confirmed tracks
+Frame 40: 42 meas -> 0 confirmed tracks
+Frame 60: 49 meas -> 0 confirmed tracks
+Frame 80: 42 meas -> 0 confirmed tracks
+Frame 100: 41 meas -> 0 confirmed tracks
+Frame 120: 41 meas -> 0 confirmed tracks
+Frame 140: 47 meas -> 0 confirmed tracks
+Frame 160: 42 meas -> 0 confirmed tracks
+Frame 180: 44 meas -> 0 confirmed tracks
+Frame 200: 45 meas -> 0 confirmed tracks
+Frame 220: 47 meas -> 0 confirmed tracks
+Frame 240: 55 meas -> 0 confirmed tracks
+Frame 260: 54 meas -> 0 confirmed tracks
+Frame 280: 53 meas -> 0 confirmed tracks
+Frame 300: 56 meas -> 0 confirmed tracks
+
+  PERFORMANCE SUMMARY:
+------------------------------
+AI Pipeline    :   0.74s (92.5%)
+Data Loading   :   0.05s ( 6.2%)
+Metrics Calc   :   0.01s ( 1.2%)
+------------------------------
+
+========================================
+      TRACKING RESULTS (CLI)
+========================================
+MOTA:      0.0000
+MOTP:      15000.0m
+Precision: 0.0000
+Recall:    0.0000
+F1:        0.0000
+ID Switch: 0
+========================================
+Results logged to MLflow (Run ID: 3d7d2d4974dd42c1b2f2e36d59a8651b)

@@ -1,1 +1,14 @@
-'charmap' codec can't encode character '\U0001f4e1' in position 0: character maps to <undefined>
+name 'os' is not defined
+Traceback (most recent call last):
+  File "C:\Users\USER\ai_tracker_correlator\run_cli.py", line 381, in <module>
+    run_cli()
+  File "C:\Users\USER\ai_tracker_correlator\run_cli.py", line 336, in run_cli
+    predicted_tracks = pipeline.process_frame(measurements, t=frame_t)
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\USER\ai_tracker_correlator\src\pipeline.py", line 140, in process_frame
+    self.tracks = self.state_updater.update(filtered_measurements, self.tracks, dt=dt, frame_t=self.last_t)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\USER\ai_tracker_correlator\src\updater.py", line 213, in update
+    logging.info(f"Frame {self.frame_count} | PID={os.getpid()} | Tracks={len(updated_tracks)} | Max P={max_p:.3f}")
+                                                   ^^
+NameError: name 'os' is not defined. Did you forget to import 'os'

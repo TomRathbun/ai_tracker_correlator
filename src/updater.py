@@ -5,10 +5,11 @@ Provides abstract base and concrete implementations for state estimation,
 including GNN and Kalman filter variants.
 """
 from abc import ABC, abstractmethod
-from typing import List, Dict, Optional, Tuple
+import os
+import logging
 import numpy as np
 import torch
-
+from typing import List, Dict, Optional, Tuple
 from src.config_schemas import PipelineConfig
 from src.factory import detect_model_version, get_model_suite
 from scipy.sparse.csgraph import connected_components
@@ -141,147 +142,76 @@ class GNNUpdater(StateUpdater):
         
         node_type = torch.cat([track_types, meas_types])
         
-        # Build GNN edges with association features
-        if getattr(self, "model_type", "v3") == "v5":
-            from src.model_v5 import build_gnn_edges as build_gnn_edges_v5
-            edge_index, edge_attr = build_gnn_edges_v5(
-                full_x, node_type, self.device
-            )
-        elif getattr(self, "model_type", "v3") == "v4":
-            from src.model_v4 import build_gnn_edges as build_gnn_edges_v4
-            edge_index, edge_attr = build_gnn_edges_v4(
-                full_x, node_type, self.device
-            )
-        # 3. Build Graph Edges via suite
+        # 3. Build Graph Edges via standardized suite
         edge_index, edge_attr = self.suite["build_edges"](
             full_x, node_type, getattr(self, 'psr_clf', None), getattr(self, 'ssr_clf', None), self.device
         )
         
         # 4. Forward pass via suite
         try:
-            with torch.no_grad():
-                # Note: model_forward signatures vary slightly by version (v5 adds clutter_thresh/pruned_edges)
-                if self.model_type == "v5":
-                    out, new_hidden_full, alpha, existence_probs, existence_logits, clutter_probs, clutter_logits, pruned_edge_index = self.suite["model_forward"](
-                        self.model, full_x, node_type, sensor_ids, edge_index, edge_attr, hidden_state,
-                        getattr(self.config, 'clutter_thresh', 0.70)
-                    )
-                elif self.model_type in ["v3", "v4"]:
+            if self.model_type == "legacy":
+                # Legacy GNN remains isolated due to km-scaling
+                N = full_x.shape[0]
+                m3a = torch.zeros(N, 1, device=self.device)
+                node_type_feat = node_type.float().unsqueeze(1)
+                sensor_id_feat = sensor_ids.float().unsqueeze(1)
+                x_scale = full_x.clone()
+                x_scale[:, 0:3] *= 1e-4; x_scale[:, 3:6] *= 1e-2
+                row, col = edge_index
+                dist = torch.norm(full_x[row, :3] - full_x[col, :3], dim=1)
+                edge_attr_legacy = torch.zeros(edge_index.shape[1], 8, device=self.device)
+                edge_attr_legacy[:, 0] = 0.5; edge_attr_legacy[:, 1] = dist / 1000.0
+                node_feats = torch.cat([x_scale, node_type_feat, m3a, sensor_id_feat], dim=1)
+                
+                hidden_state = torch.zeros(N, self.model.gru.hidden_size, device=self.device) if hidden_state is None else hidden_state
+                if hidden_state.shape[0] < N:
+                    hidden_state = torch.cat([hidden_state, torch.zeros(N - hidden_state.shape[0], self.model.gru.hidden_size, device=self.device)], dim=0)
+                
+                state_deltas, existence_logits, new_hidden_full = self.model(node_feats, edge_index, edge_attr_legacy, hidden_state)
+                existence_logits = existence_logits.squeeze(-1)
+                unscaled_deltas = state_deltas.clone(); unscaled_deltas[:, 0:3] /= 1e-4; unscaled_deltas[:, 3:6] /= 1e-2
+                absolute_state = full_x[:, :6] + unscaled_deltas
+                out = torch.cat([absolute_state, existence_logits.unsqueeze(-1)], dim=1)
+                existence_probs = torch.sigmoid(existence_logits)
+                clutter_probs = torch.zeros_like(existence_probs)
+                clutter_logits = torch.zeros_like(existence_logits)
+                alpha = None
+            else:
+                # Standard Modern GNN Path (V3, V4, V5, V6)
+                with torch.no_grad():
                     res = self.suite["model_forward"](
                         self.model, full_x, node_type, sensor_ids, edge_index, edge_attr, hidden_state
                     )
-                    # Handle V4/V3 result unpacking
-                    if self.model_type == "v4":
-                        out, new_hidden_full, alpha, existence_probs, existence_logits, clutter_probs, clutter_logits = res
-                    else: # V3
-                        out, new_hidden_full, alpha, existence_probs, existence_logits = res
-                        clutter_probs = torch.zeros_like(existence_probs)
-                        clutter_logits = torch.zeros_like(existence_logits)
-                elif self.model_type == "legacy":
-                    # Legacy GNNTracker architecture
-                    # Mapping features: [x,y,z,vx,vy,vz,amp,type,m3a,ms]
-                    # Note: Legacy GNN expects km-scaled inputs for numerical stability
-                    N = full_x.shape[0]
-                    m3a = torch.zeros(N, 1, device=self.device)
-                    node_type_feat = node_type.float().unsqueeze(1)
-                    sensor_id_feat = sensor_ids.float().unsqueeze(1)
-                    
-                    # Local scaling for model forward
-                    x_scale = full_x.clone()
-                    x_scale[:, 0:3] *= 1e-4 # 100km -> 10.0
-                    x_scale[:, 3:6] *= 1e-2 # 500m/s -> 5.0
-                    
-                    # Reconstruct edge features specifically for legacy architecture
-                    # Legacy expects [prob, dist/1000.0, 0, 0, 0, 0, 0, 0]
-                    row, col = edge_index
-                    dist = torch.norm(full_x[row, :3] - full_x[col, :3], dim=1)
-                    edge_attr_legacy = torch.zeros(edge_index.shape[1], 8, device=self.device)
-                    edge_attr_legacy[:, 0] = 0.5 # Neutral association probability
-                    edge_attr_legacy[:, 1] = dist / 1000.0 # Meters to km
-                    
-                    node_feats = torch.cat([x_scale, node_type_feat, m3a, sensor_id_feat], dim=1)
-                    edge_attr_padded = edge_attr_legacy
-                    
-                    # Hidden state handling
-                    if hidden_state is None:
-                        hidden_state = torch.zeros(N, self.model.gru.hidden_size, device=self.device)
+                    # Unified 8-value signature (includes active/pruned edge index)
+                    if len(res) == 8:
+                        out, new_hidden_full, alpha, existence_probs, existence_logits, clutter_probs, clutter_logits, active_edge_index = res
                     else:
-                        # Pad hidden state for new measurements
-                        # Legacy GNN requires a hidden state for all N nodes (tracks + measurements)
-                        num_h = hidden_state.shape[0]
-                        if num_h < N:
-                            pad = torch.zeros(N - num_h, self.model.gru.hidden_size, device=self.device)
-                            hidden_state = torch.cat([hidden_state, pad], dim=0)
-                    
-                    # Forward pass
-                    state_deltas, existence_logits, new_hidden_full = self.model(
-                        node_feats, edge_index, edge_attr_padded, hidden_state
-                    )
-                    
-                    # existence_logits shape is (N, 1), we need (N,)
-                    existence_logits = existence_logits.squeeze(-1)
-                    
-                    # Apply deltas to RAW meters. 
-                    # If model was trained on scaled space, state_deltas are scaled.
-                    # Unscale them: delta_meters = delta_scaled / scale_factor
-                    unscaled_deltas = state_deltas.clone()
-                    unscaled_deltas[:, 0:3] /= 1e-4
-                    unscaled_deltas[:, 3:6] /= 1e-2
-                    
-                    absolute_state = full_x[:, :6] + unscaled_deltas
-                    
-                    # Reconstruct 'out' for management: [x,y,z,vx,vy,vz,exists]
-                    out = torch.cat([absolute_state, existence_logits.unsqueeze(-1)], dim=1)
-                    existence_probs = torch.sigmoid(existence_logits)
-                    
-                    # Instrumentation
-                    self.frame_count += 1
-                    if self.frame_count % 20 == 0:
-                        print(f"DEBUG [GNN Legacy]: Max Exist Prob = {existence_probs.max().item():.4f}, Mean = {existence_probs.mean().item():.4f}")
-                    
-                    alpha = None # Alpha not returned by legacy forward
+                        out, new_hidden_full, alpha, existence_probs, existence_logits, clutter_probs, clutter_logits = res
+                        active_edge_index = edge_index
         except Exception as e:
-            print(f"Error during GNN forward pass: {e}")
+            import logging
+            logging.error(f"Error during GNN forward pass: {e}")
+            import traceback; logging.error(traceback.format_exc())
             return tracks
             
-        # 5. Extract updated states and manage tracks
-        # Use config values from state_updater (self.config IS state_updater)
-        init_thresh = self.config.init_thresh
-        coast_thresh = self.config.coast_thresh
-        suppress_thresh = self.config.suppress_thresh
-        del_exist = self.config.del_exist
-        del_age = self.config.del_age
-        track_cap = self.config.track_cap
+        # 5. Manage Tracks via Suite Dispatch
+        # self.config is state_updater section of PipelineConfig
+        updated_tracks = self.suite["manage_tracks"](
+            active_tracks=tracks, out=out, new_hidden_full=new_hidden_full, 
+            existence_probs=existence_probs, existence_logits=existence_logits, 
+            clutter_probs=clutter_probs, alpha=alpha, edge_index=active_edge_index, 
+            num_tracks=num_tracks, num_meas=0 if dummy_added else num_meas,
+            init_thresh=self.config.init_thresh, coast_thresh=self.config.coast_thresh,
+            suppress_thresh=self.config.suppress_thresh, del_exist=self.config.del_exist, 
+            del_age=self.config.del_age, track_cap=self.config.track_cap,
+            dt=dt, clutter_thresh=getattr(self.config, 'clutter_threshold', 0.70)
+        )
         
-        if self.model_type == "v5":
-            from src.model_v5 import manage_tracks
-            updated_tracks = manage_tracks(
-                active_tracks=tracks, out=out, new_hidden_full=new_hidden_full, 
-                existence_probs=existence_probs, existence_logits=existence_logits, clutter_probs=clutter_probs,
-                alpha=alpha, edge_index=pruned_edge_index if 'pruned_edge_index' in locals() else edge_index, num_tracks=num_tracks, num_meas=0 if dummy_added else num_meas,
-                init_thresh=init_thresh, coast_thresh=coast_thresh, suppress_thresh=suppress_thresh,
-                del_exist=del_exist, del_age=del_age, track_cap=track_cap, dt=dt, 
-                clutter_thresh=getattr(self.config, 'clutter_thresh', 0.70)
-            )
-        elif self.model_type == "v4":
-            from src.model_v4 import manage_tracks
-            updated_tracks = manage_tracks(
-                active_tracks=tracks, out=out, new_hidden_full=new_hidden_full, 
-                existence_probs=existence_probs, existence_logits=existence_logits, clutter_probs=clutter_probs,
-                alpha=alpha, edge_index=edge_index, num_tracks=num_tracks, num_meas=0 if dummy_added else num_meas,
-                init_thresh=init_thresh, coast_thresh=coast_thresh, suppress_thresh=suppress_thresh,
-                del_exist=del_exist, del_age=del_age, track_cap=track_cap, dt=dt,
-                clutter_thresh=getattr(self.config, 'clutter_thresh', 0.70)
-            )
-        else:
-            from src.model_v3 import manage_tracks
-            updated_tracks = manage_tracks(
-                active_tracks=tracks, out=out, new_hidden_full=new_hidden_full, 
-                existence_probs=existence_probs, existence_logits=existence_logits, 
-                alpha=alpha, edge_index=edge_index, num_tracks=num_tracks, num_meas=0 if dummy_added else num_meas,
-                init_thresh=init_thresh, coast_thresh=coast_thresh, suppress_thresh=suppress_thresh,
-                del_exist=del_exist, del_age=del_age, track_cap=track_cap, dt=dt
-            )
+        # Unified Telemetry (Log EVERY frame to bypass buffer-delay)
+        self.frame_count += 1
+        import logging
+        max_p = existence_probs.max().item() if existence_probs.numel() > 0 else 0
+        logging.info(f"Frame {self.frame_count} | PID={os.getpid()} | Tracks={len(updated_tracks)} | Max P={max_p:.3f}")
         
         return updated_tracks
     
