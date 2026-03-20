@@ -1,0 +1,12 @@
+2026-03-20 16:18:42,597 [INFO] PROCESS START: PID=40096, Model=v6, Mode=train
+2026-03-20 16:18:43,936 [INFO] DEBUG: Data Types - Meas: <class 'list'>, Truth: <class 'dict'>, IDs: <class 'list'>
+2026-03-20 16:19:01,549 [INFO] Epoch 1 Complete. Avg Loss: 13025.7680
+2026-03-20 16:19:28,206 [INFO] Epoch 2 Complete. Avg Loss: 13384.9538
+2026-03-20 16:19:54,952 [INFO] Epoch 3 Complete. Avg Loss: 13264.4417
+2026-03-20 16:20:21,189 [INFO] Epoch 4 Complete. Avg Loss: 13250.5195
+2026-03-20 16:20:48,757 [INFO] Epoch 5 Complete. Avg Loss: 13204.0175
+2026-03-20 16:21:15,933 [INFO] Epoch 6 Complete. Avg Loss: 13252.4955
+2026-03-20 16:21:42,631 [INFO] Epoch 7 Complete. Avg Loss: 13334.0691
+2026-03-20 16:22:09,571 [INFO] Epoch 8 Complete. Avg Loss: 13200.6788
+2026-03-20 16:22:37,244 [INFO] Epoch 9 Complete. Avg Loss: 13304.4192
+2026-03-20 16:23:04,915 [INFO] Epoch 10 Complete. Avg Loss: 13351.9702

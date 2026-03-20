@@ -1,0 +1,14 @@
+2026-03-20 16:16:11,453 [INFO] PROCESS START: PID=20972, Model=v6, Mode=train
+2026-03-20 16:16:12,888 [INFO] DEBUG: Data Types - Meas: <class 'list'>, Truth: <class 'dict'>, IDs: <class 'list'>
+2026-03-20 16:16:13,002 [ERROR] Error initializing training for v6: 'list' object has no attribute 'get'
+2026-03-20 16:16:13,002 [ERROR] Traceback (most recent call last):
+  File "C:\Users\USER\ai_tracker_correlator\run_cli.py", line 231, in run_cli
+    train_streaming(
+  File "C:\Users\USER\ai_tracker_correlator\src\train_streaming_v6.py", line 107, in train_streaming
+    meas_node_t, sensor_ids = frame_to_tensors(window_meas_list, device, window_t=next_t)
+                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\USER\ai_tracker_correlator\src\model_v6.py", line 116, in frame_to_tensors
+    measurements = frame_data.get('measurements', [])
+                   ^^^^^^^^^^^^^^
+AttributeError: 'list' object has no attribute 'get'
+

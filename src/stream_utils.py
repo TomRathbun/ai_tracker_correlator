@@ -13,7 +13,9 @@ def load_stream_and_truth(data_file: str):
     print(f"Loading stream data from {data_file}...")
     with open(data_file, 'r') as f:
         for line in f:
-            measurements.append(json.loads(line))
+            obj = json.loads(line)
+            if isinstance(obj, dict):
+                measurements.append(obj)
             
     # CRITICAL: Ensure stream is strictly sorted for windowing logic
     measurements.sort(key=lambda x: x['t'])
@@ -46,6 +48,7 @@ def load_stream_and_truth(data_file: str):
     truth_trajectories = {} 
     unique_track_ids = set()
     for m in measurements:
+        if not isinstance(m, dict): continue
         tid = m.get('track_id', -1)
         if tid != -1:
             unique_track_ids.add(tid)

@@ -1,183 +1,197 @@
+"""
+Phase 2: V6 Bipartite Training Pipeline.
+Optimized for Learned Gating and Decisive Matchmaking.
+"""
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader
-from tqdm import tqdm
-import numpy as np
 import json
 import os
-import time
-from pathlib import Path
-from datetime import datetime
+import logging
+import numpy as np
+from tqdm import tqdm
+from typing import List, Dict, Tuple
 
-from src.model_v6 import RecurrentGATTrackerV6, model_forward, manage_tracks, build_gnn_edges
+from src.model_v6 import (
+    RecurrentGATTrackerV6, 
+    build_gnn_edges, 
+    build_full_input, 
+    model_forward,
+    manage_tracks,
+    compute_loss,
+    frame_to_tensors
+)
 from src.stream_utils import load_stream_and_truth, get_truth_at_time
-from src.metrics import TrackingMetrics
 
-def compute_v6_loss(pred_states, pred_logits, gt_states, num_gt, match_gate, miss_penalty, fp_mult, out, epoch, num_meas, meas, existence_logits, clutter_logits, num_tracks, pred_ages=None, aux_init_weight=0.1):
-    # Reuse V5's compute_loss logic but ensure it's compatible with V6 returns
-    from src.model_v5 import compute_loss
-    return compute_loss(pred_states, pred_logits, gt_states, num_gt, match_gate, miss_penalty, fp_mult, out, epoch, num_meas, meas, existence_logits, clutter_logits, num_tracks, pred_ages, aux_init_weight)
-
-def train_streaming(num_epochs=15, data_file="data/sweden_radar_subset.jsonl", window_size=2.0, split_ratio=0.8, start_epoch=0):
+def train_streaming(num_epochs=10, data_file="data/stream_radar_001.jsonl", window_size=2.0, split_ratio=0.8, start_epoch=0):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    num_sensors = 5
-    hidden_dim = 64
     
-    # 1. Load Data
-    print(f"Loading Streaming Data: {data_file}")
-    stream_data_list, ground_truth, _ = load_stream_and_truth(data_file)
+    # Load stream and truth
+    measurements_all, truth_trajectories, all_track_ids = load_stream_and_truth(data_file)
+    logging.info(f"DEBUG: Data Types - Meas: {type(measurements_all)}, Truth: {type(truth_trajectories)}, IDs: {type(all_track_ids)}")
     
-    # Group measurements by time for windowing
-    stream_data = {}
-    for m in stream_data_list:
-        t_key = round(float(m['t']), 1)
-        if t_key not in stream_data: stream_data[t_key] = []
-        stream_data[t_key].append(m)
+    # Perform Track ID split
+    np.random.seed(42)
+    np.random.shuffle(all_track_ids)
+    num_train = int(len(all_track_ids) * split_ratio)
+    train_ids = set(all_track_ids[:num_train])
+    test_ids = set(all_track_ids[num_train:])
+    
+    print(f"Phase 2 Split: {len(train_ids)} Training Tracks, {len(test_ids)} Testing Tracks")
+    
+    # Filter training measurements
+    # Type-safety guard: ensure row is a dict to avoid 'list' object errors
+    measurements = [
+        m for m in measurements_all 
+        if isinstance(m, dict) and (m.get('track_id', -1) in train_ids or m.get('track_id', -1) == -1)
+    ]
+    measurements.sort(key=lambda x: x['t'])
+    
+    # Initialize V6 Bipartite Model
+    model = RecurrentGATTrackerV6(num_heads=4).to(device)
+    checkpoint_path = "checkpoints/model_v6_streaming.pt"
+    
+    # Resume if exists
+    if os.path.exists(checkpoint_path):
+        try:
+            model.load_state_dict(torch.load(checkpoint_path, map_location=device, weights_only=True))
+            print(f"🔄 Resumed V6 (Bipartite) from {checkpoint_path}")
+        except Exception as e:
+            print(f"Warning: Could not load V6 checkpoint: {e}")
 
-    t_start = float(min(stream_data.keys()))
-    t_end = float(max(stream_data.keys()))
-    t_split = t_start + (t_end - t_start) * split_ratio
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
     
-    print(f"Time Range: {t_start} -> {t_end} (Split at {t_split})")
-    print(f"Total Unique Time Keys: {len(stream_data.keys())}")
-    print(f"Sample Measurement Count (First key): {len(stream_data[t_start])}")
-    
-    # 2. Initialize V6 Model
-    model = RecurrentGATTrackerV6(num_sensors=num_sensors, hidden_dim=hidden_dim).to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    
-    checkpoint_path = f"checkpoints/model_v6_latest.pt"
-    if start_epoch > 0 and os.path.exists(checkpoint_path):
-        print(f"Resuming from {checkpoint_path}")
-        model.load_state_dict(torch.load(checkpoint_path)['model_state_dict'])
-
-    # 3. Hyperparams
-    match_gate = 100.0 # Meters
-    miss_penalty = 5.0
-    del_exist = 0.05
-    del_age = 10
-    track_cap = 50
-    aux_init_weight = 0.5
-
-    for epoch in range(start_epoch, num_epochs):
+    for epoch_idx in range(num_epochs):
+        epoch = start_epoch + epoch_idx
+        active_tracks = []
         epoch_losses = []
-        active_tracks = [] # List of track dicts
+
+        t_start = measurements[0]['t']
+        t_end = measurements[-1]['t']
+        pbar = tqdm(total=int(t_end - t_start), desc=f"Epoch {epoch+1} (V6)")
         
-        # Training Split Loop
         current_t = t_start
-        pbar = tqdm(total=int(t_split - t_start), desc=f"V6 Epoch {epoch+1}")
-        step_id = 0
+        meas_idx = 0
         
-        # Dynamic curriculum
-        fp_mult = 0.2 if epoch < 3 else (0.6 if epoch < 7 else 1.0)
-        init_thresh, coast_thresh, suppress_thresh = 0.35, 0.15, 0.75
+        # Load Training Config
+        config_path = "src/training_config.json"
+        try:
+            with open(config_path, "r") as f:
+                cfg = json.load(f)
+                init_thresh = cfg.get("init_thresh", 0.45)
+                coast_thresh = cfg.get("coast_thresh", 0.20)
+                suppress_thresh = cfg.get("suppress_thresh", 0.15)
+                fp_mult = cfg.get("fp_mult", 10.0) # More aggressive in V6
+                match_gate = cfg.get("match_gate", 5000.0)
+                lr = cfg.get("lr", 1e-4)
+        except:
+            init_thresh, coast_thresh, suppress_thresh = 0.45, 0.20, 0.15
+            fp_mult, match_gate, lr = 10.0, 5000.0, 1e-4
 
-        while current_t < t_split:
-            step_id += 1
-            if step_id % 500 == 0:
-                l_avg = np.mean(epoch_losses[-10:]) if epoch_losses else 0
-                print(f" > V6 Step {step_id}: Time={current_t:.1f} | Tracks={len(active_tracks)} | Loss={l_avg:.2f}")
+        for g in optimizer.param_groups: g['lr'] = lr
 
-            # 1. Predict (Constant Velocity)
-            for tr in active_tracks:
-                tr['state_tensor'][0:3] += tr['state_tensor'][3:6] * window_size
-                tr['age'] += 1
-            
-            # 2. Fetch Measurements & GT with Epsilon Safety
-            meas_hits = []
-            for t in np.arange(current_t, current_t + window_size, 0.1):
-                t_key = round(float(t), 1)
-                meas_hits.extend(stream_data.get(t_key, []))
-            
-            # Map radar_id to sensor_id if missing
-            for m in meas_hits:
-                if 'sensor_id' not in m and 'radar_id' in m:
-                    m['sensor_id'] = m['radar_id']
-            
-            gt_list = get_truth_at_time(ground_truth, current_t + window_size)
-            num_gt = len(gt_list)
-            
-            # 3. Tensorize
-            meas_list = [[m.get(k, 0.0) for k in ('x','y','z','vx','vy','vz','amplitude', 't')] for m in meas_hits]
-            for m in meas_list: m[7] = (current_t + window_size) - m[7] # dt relative to window end
-            
-            meas_tensor = torch.tensor(meas_list, dtype=torch.float32, device=device)
-            meas_sids = torch.tensor([m['sensor_id'] for m in meas_hits], dtype=torch.long, device=device)
-            num_meas = meas_tensor.shape[0]
+        while current_t < t_end:
+            # 1. Prediction (Physics Step)
+            # In V6, hidden states are predicted to window end inside the pipeline loop
+            dt = window_size
+            next_t = current_t + dt
 
-            # 4. Prepare GNN Input
-            dummy_added = False
-            if num_meas == 0:
-                if not active_tracks:
-                    current_t += window_size
-                    pbar.update(int(window_size))
-                    continue
-                # Add dummy measurement to maintain graph flow
-                meas_tensor = torch.zeros((1, 8), device=device)
-                meas_sids = torch.full((1,), num_sensors, dtype=torch.long, device=device)
-                num_meas = 1
-                dummy_added = True
-
-            # Concatenate Tracks + Measurements
-            track_states = torch.stack([tr['state_tensor'] for tr in active_tracks]) if active_tracks else torch.empty((0, 6), device=device)
-            track_features = torch.cat([track_states, torch.zeros((len(active_tracks), 2), device=device)], dim=1) if active_tracks else torch.empty((0, 8), device=device)
+            # 2. Window Measurement Collection
+            window_meas_list = []
+            while meas_idx < len(measurements) and measurements[meas_idx]['t'] < next_t:
+                window_meas_list.append(measurements[meas_idx])
+                meas_idx += 1
             
-            full_x = torch.cat([track_features, meas_tensor], dim=0)
-            node_type = torch.cat([torch.ones(len(active_tracks), dtype=torch.long, device=device), torch.zeros(num_meas, dtype=torch.long, device=device)])
-            sensor_ids = torch.cat([torch.full((len(active_tracks),), num_sensors, dtype=torch.long, device=device), meas_sids])
-            hidden_state = torch.stack([tr['hidden'] for tr in active_tracks]) if active_tracks else None
-            num_tracks = len(active_tracks)
-
-            # 5. Model Pass
-            edge_index, edge_attr = build_gnn_edges(full_x, node_type, None, None, device)
-            out, new_hidden_full, alpha, exist_probs, exist_logits, clut_probs, clut_logits = model_forward(
-                model, full_x, node_type, sensor_ids, edge_index, edge_attr, hidden_state
+            # Prepare Tensors
+            meas_node_t, sensor_ids = frame_to_tensors(window_meas_list, device, window_t=next_t)
+            full_x, full_sensor_id, track_hiddens, num_tracks = build_full_input(
+                active_tracks, meas_node_t, sensor_ids, num_sensors=5, device=device
             )
-
-            # 6. Loss & Manage Tracks
-            gt_states = torch.tensor([[gt[k] for k in ('x','y','z','vx','vy','vz')] for gt in gt_list], dtype=torch.float32, device=device)
-            pred_states = out[:, :6]
-            pred_logits = existence_logits = out[:, 6]
-            pred_ages = torch.tensor([tr['age'] for tr in active_tracks], device=device) if active_tracks else None
-
-            loss, clut_metrics = compute_v6_loss(
-                pred_states, pred_logits, gt_states, num_gt, match_gate, miss_penalty, fp_mult, out, epoch, 
-                0 if dummy_added else num_meas, meas_tensor, existence_logits, clut_logits, num_tracks, 
-                pred_ages=pred_ages, aux_init_weight=aux_init_weight
-            )
-
+            
+            # Build Node Types (0: Meas, 1: Track)
+            node_type = torch.zeros(full_x.shape[0], dtype=torch.long, device=device)
+            node_type[:num_tracks] = 1
+            
+            # Graph Edges
+            edge_index, edge_attr = build_gnn_edges(full_x, node_type, device)
+            
+            # 3. Model Forward (Bipartite Pass)
             optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            res = model_forward(model, full_x, node_type, full_sensor_id, edge_index, edge_attr, track_hiddens)
+            out, new_hidden_full, attn_weights, existence_probs, existence_logits, clutter_probs, clutter_logits, _ = res
             
-            epoch_losses.append(loss.item())
-
-            # 7. Update Track State Dictionary
-            active_tracks = manage_tracks(
-                active_tracks, out, new_hidden_full, exist_probs, exist_logits, clut_probs, alpha, edge_index, 
-                num_tracks, num_meas, init_thresh, coast_thresh, suppress_thresh, del_exist, del_age, track_cap
+            # 4. Ground Truth Matching
+            gt_states = get_truth_at_time(truth_trajectories, next_t, allowed_ids=train_ids)
+            if gt_states:
+                # Ensure each gt item is a dict to avoid 'list' object errors
+                gt_tensor = torch.tensor([
+                    [g.get('x',0), g.get('y',0), g.get('z',0), g.get('vx',0), g.get('vy',0), g.get('vz',0)] 
+                    for g in gt_states if isinstance(g, dict)
+                ], device=device)
+            else:
+                gt_tensor = torch.empty((0, 6), device=device)
+            
+            # 5. Loss Calculation (Including Attention Sparsity)
+            # Type-sanity guard for active_tracks
+            safe_tracks = []
+            for tr in active_tracks:
+                if isinstance(tr, dict):
+                    safe_tracks.append(tr)
+                else:
+                    logging.warning(f"ZOMBIE TRACK DETECTED: {type(tr)} - Discarding.")
+            active_tracks = safe_tracks
+            
+            ages = torch.tensor([tr.get('age', 0) for tr in active_tracks], device=device) if active_tracks else None
+            
+            loss, metrics = compute_loss(
+                pred_states=out[:, :6], 
+                pred_logits=existence_logits, 
+                gt_states_dev=gt_tensor, 
+                num_gt=len(gt_states), 
+                match_gate=match_gate, 
+                miss_penalty=100.0, 
+                fp_mult=fp_mult, 
+                out=out, epoch=epoch, 
+                num_meas=len(window_meas_list), 
+                meas=meas_node_t, 
+                existence_logits=existence_logits, 
+                clutter_logits=clutter_logits, 
+                num_tracks=num_tracks, 
+                pred_ages=ages, 
+                attn_weights=attn_weights
             )
-
-            # Telemetry
-            if step_id % 200 == 0:
-                try:
-                    import mlflow
-                    if mlflow.active_run():
-                        global_step = epoch * (int(t_split - t_start) // int(window_size)) + step_id
-                        mlflow.log_metric("live_loss", loss.item(), step=global_step)
-                        mlflow.log_metric("clutter_reject_rate", clut_metrics["clutter_reject_rate"], step=global_step)
-                        mlflow.log_metric("active_tracks", len(active_tracks), step=global_step)
-                        mlflow.log_metric("step_progress", global_step, step=global_step)
-                except: pass
-
-            current_t += window_size
-            pbar.update(int(window_size))
-            pbar.set_postfix({"loss": f"{loss.item():.1f}", "tr": len(active_tracks)})
-
+            
+            if loss.requires_grad:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                epoch_losses.append(loss.item())
+            
+            # 6. Track Management (Bipartite Matching)
+            active_tracks = manage_tracks(
+                active_tracks=active_tracks, out=out, new_hidden_full=new_hidden_full,
+                existence_probs=existence_probs, existence_logits=existence_logits,
+                clutter_probs=clutter_probs, alpha=attn_weights, edge_index=edge_index,
+                num_tracks=num_tracks, num_meas=len(window_meas_list),
+                init_thresh=init_thresh, coast_thresh=coast_thresh,
+                suppress_thresh=suppress_thresh, del_exist=0.1, del_age=3, track_cap=100,
+                dt=dt
+            )
+            
+            current_t = next_t
+            pbar.update(int(dt))
+            
         pbar.close()
-        torch.save({'epoch': epoch, 'model_state_dict': model.state_dict(), 'loss': np.mean(epoch_losses)}, checkpoint_path)
+        avg_loss = np.mean(epoch_losses) if epoch_losses else 0
+        logging.info(f"Epoch {epoch+1} Complete. Avg Loss: {avg_loss:.4f}")
+        
+        # Save Phase 2 Checkpoint
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'epoch': epoch,
+            'optimizer_state_dict': optimizer.state_dict(),
+        }, checkpoint_path)
+        print(f"✓ V6 Checkpoint Saved: {checkpoint_path}")
 
-if __name__ == "__main__":
-    train_streaming(num_epochs=5)
+    return model

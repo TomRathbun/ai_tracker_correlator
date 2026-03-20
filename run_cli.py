@@ -39,12 +39,12 @@ class Profiler:
 
     def summary(self):
         print("\n  PERFORMANCE SUMMARY:")
-        print("-" * 30)
+        print("-" * 50)
         total = sum(self.stats.values())
         for name, dt in sorted(self.stats.items(), key=lambda x: x[1], reverse=True):
             pct = (dt/total)*100 if total > 0 else 0
             print(f"{name:15}: {dt:6.2f}s ({pct:4.1f}%)")
-        print("-" * 30)
+        print("-" * 50)
 
 def run_cli():
     parser = argparse.ArgumentParser(description="AI Tracker Command Line Interface")
@@ -125,9 +125,9 @@ def run_cli():
             client = MlflowClient()
             
             logging.info(f"\n SCANNING ACTIVE AI TRACKER FLEET:")
-            print("="*110)
+            print("="*130)
             print(f"{'PID':<8} | {'MODE':<10} | {'UPTIME':<12} | {'PROGRESS':<12} | {'LIVE LOSS':<10} | {'COMMAND LINE'}")
-            print("-" * 110)
+            print("-" * 130)
             
             # Fetch active MLflow runs for progress peeking
             try:
@@ -175,7 +175,7 @@ def run_cli():
                         
                         # Cleanup command line
                         display_cmd = " ".join([c for c in cmdline if "python" not in c.lower() and c != "run_cli.py" and len(c) < 50])
-                        if len(display_cmd) > 40: display_cmd = display_cmd[:37] + "..."
+                        if len(display_cmd) > 80: display_cmd = display_cmd[:77] + "..."
                         
                         print(f"{pid:<8} | {mode:<10} | {uptime:<12} | {progress_str:<12} | {loss_str:<10} | {display_cmd}")
                         count += 1
@@ -184,7 +184,7 @@ def run_cli():
             
             if count == 0:
                 print("No active AI Tracker processes found.")
-            print("="*110)
+            print("="*130)
             return # Exit after listing
         except ImportError:
             print("Error: 'psutil' or 'mlflow' library not found.")
@@ -240,9 +240,8 @@ def run_cli():
                 mlflow.end_run()
             return
         except Exception as e:
-            print(f"Error initializing training for {args.model}: {e}")
-            import traceback
-            traceback.print_exc()
+            logging.error(f"Error initializing training for {args.model}: {e}")
+            logging.error(traceback.format_exc())
             return
 
     # 2. Build Config
@@ -352,16 +351,16 @@ def run_cli():
     # 6. Finalize
     metrics = metrics_tracker.compute()
     profiler.summary()
-    print("\n" + "="*40)
+    print("\n" + "="*60)
     print("      TRACKING RESULTS (CLI)")
-    print("="*40)
+    print("="*60)
     print(f"MOTA:      {metrics['mota']:.4f}")
     print(f"MOTP:      {metrics['motp']:.1f}m")
     print(f"Precision: {metrics['precision']:.4f}")
     print(f"Recall:    {metrics['recall']:.4f}")
     print(f"F1:        {metrics['f1']:.4f}")
     print(f"ID Switch: {metrics['id_switches']}")
-    print("="*40)
+    print("="*60)
 
     if use_mlflow:
         # Log final metrics

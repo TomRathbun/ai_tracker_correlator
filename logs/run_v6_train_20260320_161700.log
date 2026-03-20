@@ -1,0 +1,14 @@
+2026-03-20 16:17:00,677 [INFO] PROCESS START: PID=44084, Model=v6, Mode=train
+2026-03-20 16:17:02,061 [INFO] DEBUG: Data Types - Meas: <class 'list'>, Truth: <class 'dict'>, IDs: <class 'list'>
+2026-03-20 16:17:02,400 [ERROR] Error initializing training for v6: name 'linear_sum_assignment' is not defined
+2026-03-20 16:17:02,403 [ERROR] Traceback (most recent call last):
+  File "C:\Users\USER\ai_tracker_correlator\run_cli.py", line 231, in run_cli
+    train_streaming(
+  File "C:\Users\USER\ai_tracker_correlator\src\train_streaming_v6.py", line 147, in train_streaming
+    loss, metrics = compute_loss(
+                    ^^^^^^^^^^^^^
+  File "C:\Users\USER\ai_tracker_correlator\src\model_v6.py", line 306, in compute_loss
+    row_ind, col_ind = linear_sum_assignment(cost_np)
+                       ^^^^^^^^^^^^^^^^^^^^^
+NameError: name 'linear_sum_assignment' is not defined
+

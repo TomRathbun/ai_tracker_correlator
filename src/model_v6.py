@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import List, Dict, Tuple, Union
+from scipy.optimize import linear_sum_assignment
 from torch_geometric.nn import GATv2Conv
 from .cross_attention import BipartiteCrossAttention
 
@@ -109,11 +111,27 @@ class RecurrentGATTrackerV6(nn.Module):
 # --- Infrastructure Boilerplate (V6 Specialized) ---
 
 import json
-from .stream_utils import frame_to_tensors as common_f2t
 
-def frame_to_tensors(frame_data, device, window_t=None):
-    """V6 uses 8-feature header (x, y, z, vx, vy, vz, snr, dt)."""
-    return common_f2t(frame_data, device, window_t)
+def frame_to_tensors(frame_data: Union[Dict, List], device, window_t=None):
+    """V6 uses 8-feature header (x, y, z, vx, vy, vz, amplitude, dt_offset)."""
+    if isinstance(frame_data, dict):
+        measurements = frame_data.get('measurements', [])
+    else:
+        measurements = frame_data # It's already the list of measurement dicts
+        
+    meas_list, sid_list = [], []
+    for m in measurements:
+        if not isinstance(m, dict): continue
+        # Calculate t_offset: how many seconds BEFORE the window end did this hit occur?
+        t_offset = (window_t - m['t']) if window_t is not None else 0.0
+        # Headers: [x, y, z, vx, vy, vz, amplitude, t_offset]
+        row = [float(m.get(k, 0.0)) for k in ('x','y','z','vx','vy','vz','amplitude')]
+        row.append(float(t_offset))
+        meas_list.append(row)
+        sid_list.append(int(m.get('sensor_id', 0)))
+    if not meas_list:
+        return torch.empty((0,8), device=device), torch.empty((0,), dtype=torch.long, device=device)
+    return torch.tensor(meas_list, dtype=torch.float32, device=device), torch.tensor(sid_list, dtype=torch.long, device=device)
 
 def build_full_input(active_tracks, meas, meas_sensor_ids, num_sensors, device):
     """V6 input builder: correctly aligns tracks and measurements into a homogenous node tensor."""
@@ -259,3 +277,100 @@ def manage_tracks(active_tracks, out, new_hidden_full, existence_probs, existenc
         selected = selected[:track_cap]
         
     return selected
+
+
+def focal_bce(logits, targets, alpha=0.25, gamma=2.0, reduction='mean'):
+    """Focal Loss to handle extreme class imbalance (tracks vs clutter)."""
+    probs = torch.sigmoid(logits)
+    bce = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+    p_t = probs * targets + (1 - probs) * (1 - targets)
+    loss = alpha * (1 - p_t) ** gamma * bce
+    if reduction == 'mean': return loss.mean()
+    elif reduction == 'sum': return loss.sum()
+    return loss
+
+def compute_loss(pred_states, pred_logits, gt_states_dev, num_gt, match_gate, miss_penalty, fp_mult,
+                 out, epoch, num_meas, meas=None, existence_logits=None, clutter_logits=None, num_tracks=0, 
+                 pred_ages=None, aux_init_weight=5.0, attn_weights=None):
+    """
+    V6 Hybrid Loss: Regression + Existence + Attention Entropy Regularization.
+    Guides MHCA heads toward decisive one-to-one matchmaking.
+    """
+    device = out.device
+    reg_loss = exist_matched_loss = exist_fp_loss = matched_exist_loss = torch.tensor(0.0, device=device)
+    clutter_loss = torch.tensor(0.0, device=device)
+    miss_loss = torch.tensor(miss_penalty * num_gt, device=device)
+
+    if pred_states.shape[0] > 0 and num_gt > 0:
+        cost_matrix = torch.cdist(pred_states[:, :3], gt_states_dev[:, :3])
+        cost_np = cost_matrix.detach().cpu().numpy()
+        row_ind, col_ind = linear_sum_assignment(cost_np)
+
+        valid = cost_np[row_ind, col_ind] < match_gate
+        row_ind = row_ind[valid]
+        col_ind = col_ind[valid]
+        row_ind_torch = torch.from_numpy(row_ind).to(device)
+
+        if len(row_ind) > 0:
+            reg_loss = F.smooth_l1_loss(pred_states[row_ind_torch], gt_states_dev[col_ind])
+            exist_matched_loss = 2.0 * focal_bce(pred_logits[row_ind_torch], torch.ones_like(pred_logits[row_ind_torch]))
+            target_logits = torch.full_like(pred_logits[row_ind_torch], 4.0)
+            matched_exist_loss = F.mse_loss(pred_logits[row_ind_torch], target_logits)
+
+        matched_mask = torch.zeros(len(pred_logits), dtype=torch.bool, device=device)
+        if len(row_ind) > 0:
+            matched_mask[row_ind_torch] = True
+        fp_mask = ~matched_mask
+        if fp_mask.any():
+            fp_logits = pred_logits[fp_mask]
+            exist_fp_loss = fp_mult * focal_bce(fp_logits, torch.zeros_like(fp_logits))
+
+        miss_loss = torch.tensor(miss_penalty * (num_gt - len(row_ind)), device=device)
+
+    # 1. Total Core Loss
+    loss = reg_loss + exist_matched_loss + exist_fp_loss + miss_loss + 2.0 * matched_exist_loss
+
+    # 2. Attention Regularization (Decisive Matching)
+    # Penalize diffuse/high-entropy attention to force decisive associations
+    attn_reg = torch.tensor(0.0, device=device)
+    if attn_weights is not None:
+        if isinstance(attn_weights, tuple): attn_weights = attn_weights[1]
+        
+        # Squeeze batch if present
+        if len(attn_weights.shape) == 3: 
+            a_flat = attn_weights.squeeze(0) # (num_tracks, num_meas)
+            
+            # Entropy penalty: We want p to be 0 or 1
+            # penalty = sum(p * (1-p)) -> maximized at 0.5
+            attn_reg = (a_flat * (1.0 - a_flat)).mean()
+            loss = loss + 2.0 * attn_reg
+
+    # 3. Cardinality Penalty (Soft constraint)
+    num_pred = (torch.sigmoid(pred_logits) > 0.4).sum()
+    card_loss = 0.5 * (num_pred - num_gt).float() ** 2
+    loss = loss + 0.1 * card_loss
+
+    # 4. Clutter Head Loss (Early Focal Head)
+    if num_meas > 0 and meas is not None and clutter_logits is not None:
+        meas_pos = meas[:, :3]
+        if num_gt > 0:
+            dists = torch.cdist(meas_pos, gt_states_dev[:, :3])
+            min_dist, _ = torch.min(dists, dim=1)
+            is_true_tgt = min_dist < match_gate
+        else:
+            is_true_tgt = torch.zeros(num_meas, dtype=torch.bool, device=device)
+            
+        m_clutter_logits = clutter_logits[num_tracks : num_tracks + num_meas]
+        clutter_target = (~is_true_tgt).float()
+        clutter_loss = 10.0 * focal_bce(m_clutter_logits, clutter_target, alpha=0.35, gamma=2.5)
+        loss = loss + clutter_loss
+
+    # Telemetry
+    metrics_dict = {
+        "reg_loss": reg_loss.item(),
+        "exist_fp_loss": exist_fp_loss.item(),
+        "attn_reg": attn_reg.item(),
+        "clutter_loss": clutter_loss.item()
+    }
+
+    return loss, metrics_dict
