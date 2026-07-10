@@ -4,12 +4,15 @@ Pairwise feature extraction for heterogeneous measurement association (PSR/SSR).
 import numpy as np
 from typing import Dict, List, Tuple
 
+from src.data_schema import get_meas_type, get_mode_3a, normalize_measurement_dict
+
+
 def compute_psr_psr_features(m1: Dict, m2: Dict) -> np.ndarray:
     """Features for two PSR measurements (both have velocity)"""
     p1 = np.array([m1['x'], m1['y'], m1['z']])
     p2 = np.array([m2['x'], m2['y'], m2['z']])
-    v1 = np.array([m1.get('vx', 0.0), m1.get('vy', 0.0), m1.get('vz', 0.0)])
-    v2 = np.array([m2.get('vx', 0.0), m2.get('vy', 0.0), m2.get('vz', 0.0)])
+    v1 = np.array([m1.get('vx', 0.0) or 0.0, m1.get('vy', 0.0) or 0.0, m1.get('vz', 0.0) or 0.0])
+    v2 = np.array([m2.get('vx', 0.0) or 0.0, m2.get('vy', 0.0) or 0.0, m2.get('vz', 0.0) or 0.0])
     
     features = []
     
@@ -59,23 +62,23 @@ def compute_ssr_any_features(m1: Dict, m2: Dict) -> np.ndarray:
     if az_diff > np.pi: az_diff = 2*np.pi - az_diff
     features.append(az_diff)
     
-    # Mode 3A (Squawk) match
+    # Mode 3A (Squawk) match — accept mode_3a or mode3a via adapter helpers
     # 1.0 = match, -1.0 = mismatch, 0.0 = N/A (one side missing)
-    m3a_1 = m1.get('mode_3a')
-    m3a_2 = m2.get('mode_3a')
+    m3a_1 = get_mode_3a(m1)
+    m3a_2 = get_mode_3a(m2)
     if m3a_1 is not None and m3a_2 is not None:
         features.append(1.0 if m3a_1 == m3a_2 else -1.0)
     else:
         features.append(0.0)
-        
+
     # Mode S ICAO match
     ms_1 = m1.get('mode_s')
     ms_2 = m2.get('mode_s')
     if ms_1 is not None and ms_2 is not None:
-        features.append(1.0 if ms_1 == ms_2 else -1.0)
+        features.append(1.0 if str(ms_1) == str(ms_2) else -1.0)
     else:
         features.append(0.0)
-        
+
     return np.array(features, dtype=np.float32)
 
 def get_psr_psr_dim(): return 6
@@ -85,45 +88,51 @@ def extract_specialized_pairs(measurements: List[Dict], classifier_type: str) ->
     """
     Extract pairs specialized for a specific classifier type.
     classifier_type: 'PSR-PSR' or 'SSR-ANY'
+    Accepts raw or normalized measurements (batch or stream field names).
     """
     all_features = []
     all_labels = []
-    n = len(measurements)
-    
+    # Normalize once so type/mode fields are consistent
+    norm = [normalize_measurement_dict(m) if isinstance(m, dict) else m for m in measurements]
+    n = len(norm)
+
     for i in range(n):
-        for j in range(i+1, n):
-            m1, m2 = measurements[i], measurements[j]
-            t1, t2 = m1.get('type', 'PSR'), m2.get('type', 'PSR')
-            
-            # Determine if this pair belongs to this classifier
+        for j in range(i + 1, n):
+            m1, m2 = norm[i], norm[j]
+            if not isinstance(m1, dict) or not isinstance(m2, dict):
+                continue
+            t1, t2 = get_meas_type(m1), get_meas_type(m2)
+
             if classifier_type == 'PSR-PSR':
                 if t1 == 'PSR' and t2 == 'PSR':
                     feats = compute_psr_psr_features(m1, m2)
                 else:
                     continue
-            else: # SSR-ANY
+            else:  # SSR-ANY
                 if t1 == 'SSR' or t2 == 'SSR':
                     feats = compute_ssr_any_features(m1, m2)
                 else:
                     continue
-            
+
             all_features.append(feats)
-            tid1 = m1.get('track_id', -1)
-            tid2 = m2.get('track_id', -1)
+            tid1 = int(m1.get('track_id', -1))
+            tid2 = int(m2.get('track_id', -1))
             label = 1.0 if (tid1 == tid2 and tid1 != -1) else 0.0
             all_labels.append(label)
-            
+
     if not all_features:
         return np.zeros((0, get_psr_psr_dim() if classifier_type == 'PSR-PSR' else get_ssr_any_dim())), np.zeros(0)
-        
+
     return np.array(all_features), np.array(all_labels)
 
 # Maintain backward compatibility for now if needed, but discouraged
 def compute_pairwise_features(m1: Dict, m2: Dict) -> np.ndarray:
-    t1, t2 = m1.get('type', 'PSR'), m2.get('type', 'PSR')
+    m1n = normalize_measurement_dict(m1)
+    m2n = normalize_measurement_dict(m2)
+    t1, t2 = get_meas_type(m1n), get_meas_type(m2n)
     if t1 == 'PSR' and t2 == 'PSR':
-        return compute_psr_psr_features(m1, m2)
-    return compute_ssr_any_features(m1, m2)
+        return compute_psr_psr_features(m1n, m2n)
+    return compute_ssr_any_features(m1n, m2n)
 
 def get_feature_dim():
     # This is ambiguous now, should use specialized functions

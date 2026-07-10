@@ -7,6 +7,7 @@ import os
 import time
 import logging
 import signal
+import traceback
 import psutil
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -65,16 +66,20 @@ def run_cli():
     parser.add_argument("--min-hits", type=int, default=3, help="Min hits for track confirmation")
     parser.add_argument("--max-age", type=int, default=2, help="Max age for track coasting")
     parser.add_argument("--del-exist", type=float, default=0.40, help="Existence threshold for deletion")
-    parser.add_argument("--threshold", type=float, default=0.35, help="Association threshold")
-    parser.add_argument("--clutter-threshold", type=float, default=0.7, help="Clutter filter threshold")
-    parser.add_argument("--match-threshold", type=float, default=5000.0, help="Metrics match threshold (m)")
+    parser.add_argument("--init-thresh", type=float, default=0.25, help="GNN initiation threshold")
+    parser.add_argument("--coast-thresh", type=float, default=0.15, help="GNN coasting threshold")
+    parser.add_argument("--suppress-thresh", type=float, default=0.75, help="GNN suppression threshold")
+    parser.add_argument("--clutter-threshold", type=float, default=0.70, help="Clutter prob threshold (P > T is rejected)")
+    parser.add_argument("--no-clutter-filter", action="store_true", help="Disable Phase 0 Pre-trained Clutter Filter (Native V6 mode)")
+    parser.add_argument("--match-threshold", type=float, default=7000.0, help="Metrics match threshold (m)")
     parser.add_argument("--track-cap", type=int, default=500, help="Max active tracks")
     
     # Training arguments
     parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
     parser.add_argument("--start-epoch", type=int, default=0, help="Starting epoch for curriculum")
-    parser.add_argument("--window-size", type=float, default=2.0, help="Streaming window size (seconds)")
+    parser.add_argument("--window-size", type=float, default=3.0, help="Streaming window size (seconds)")
     parser.add_argument("--split-ratio", type=float, default=0.8, help="Train/test track ID split ratio")
+    parser.add_argument("--phases", type=str, default="1,2,3,4", help="Phases to train (e.g., '1,2')")
     
     # MLflow
     parser.add_argument("--no-mlflow", action="store_true", help="Disable MLflow logging")
@@ -91,13 +96,19 @@ def run_cli():
             p = psutil.Process(args.kill)
             print(f"!!! KILLING PROCESS {args.kill} ({p.name()}) !!!")
             p.terminate()
-            print("✓ Terminated.")
+            print("[OK] Terminated.")
             return
         except Exception as e:
-            print(f"X Failed to kill {args.kill}: {e}")
+            print(f"[X] Failed to kill {args.kill}: {e}")
             return
 
-    # 2. Logger Setup
+    # 2. Logic: Default Checkpoint Selection by Version if not provided
+    if args.gnn_model_path == "checkpoints/model_v4_streaming.pt" and args.model != "v4":
+        v_tag = args.model.lower()
+        args.gnn_model_path = f"checkpoints/model_{v_tag}_streaming.pt"
+        print(f"[OK] Auto-selected checkpoint for {v_tag.upper()}: {args.gnn_model_path}")
+        
+    # 3. Logger Setup
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -119,17 +130,18 @@ def run_cli():
 
     if args.list:
         try:
-            import psutil
             import mlflow
             from mlflow.tracking import MlflowClient
+            logging.getLogger("mlflow").setLevel(logging.ERROR) # Suppress deprecation noise
             client = MlflowClient()
             
-            logging.info(f"\n SCANNING ACTIVE AI TRACKER FLEET:")
-            print("="*130)
-            print(f"{'PID':<8} | {'MODE':<10} | {'UPTIME':<12} | {'PROGRESS':<12} | {'LIVE LOSS':<10} | {'COMMAND LINE'}")
-            print("-" * 130)
+            print(f"\n| SCANNING ACTIVE AI TRACKER FLEET ({datetime.now().strftime('%H:%M:%S')}) |")
+            header = f"{'PID':<7} | {'NAME':<20} | {'MODEL':<8} | {'EPOCH':<8} | {'PROGRESS':<10} | {'LOSS':<8} | {'UPTIME':<10}"
+            print("=" * len(header))
+            print(header)
+            print("-" * len(header))
             
-            # Fetch active MLflow runs for progress peeking
+            # Fetch active MLflow runs
             try:
                 exp = client.get_experiment_by_name("ai_tracker_fusion")
                 active_runs = client.search_runs(
@@ -143,64 +155,57 @@ def run_cli():
                 try:
                     cmdline = proc.info.get('cmdline', [])
                     cmd_str = " ".join(cmdline) if cmdline else ""
-                    if cmdline and "run_cli.py" in cmd_str and "python" in str(cmdline[0]).lower():
-                        if os.getpid() == proc.info['pid'] or os.getppid() == proc.info['pid']: continue
+                    if cmdline and "run_cli.py" in cmd_str:
+                        if os.getpid() == proc.info['pid']: continue
                         if "--list" in cmd_str: continue 
                         
                         pid = proc.info['pid']
                         uptime_sec = time.time() - proc.info['create_time']
-                        uptime = f"{int(uptime_sec // 3600)}h {int((uptime_sec % 3600) // 60)}m {int(uptime_sec % 60)}s"
+                        uptime = f"{int(uptime_sec // 60)}m {int(uptime_sec % 60)}s"
+                        if uptime_sec > 3600: uptime = f"{int(uptime_sec // 3600)}h {uptime}"
                         
-                        # Identify Mode
-                        mode = "UNKNOWN"
-                        if "--mode train" in cmd_str: mode = "TRAIN"
-                        elif "--mode gnn" in cmd_str: mode = "EVAL"
+                        # Parse Metadata from CMD
+                        name = "N/A"
+                        model = "v4"
+                        for i, chunk in enumerate(cmdline):
+                            if chunk == "--run-name" and i+1 < len(cmdline): name = cmdline[i+1]
+                            if chunk == "--model" and i+1 < len(cmdline): model = cmdline[i+1]
                         
-                        # Try to correlate with MLflow Run for Progress
-                        progress_str = "N/A"
-                        loss_str = "N/A"
+                        if name == "N/A": # Fallback to Mode/Dataset
+                            mode = "TRAIN" if "--mode train" in cmd_str else "EVAL"
+                            ds = "data"
+                            for i, chunk in enumerate(cmdline):
+                                if chunk == "--data" and i+1 < len(cmdline): ds = Path(cmdline[i+1]).stem
+                            name = f"{mode}_{ds}"
+
+                        # Progress Peeking
+                        progress_str = "---"
+                        epoch_str = "---"
+                        loss_str = "---"
                         
                         for run in active_runs:
-                            # Heuristic: Run name contains mode or was started around same time
-                            if mode.lower() in run.info.run_name.lower():
-                                metrics = run.data.metrics
-                                if 'step_progress' in metrics:
-                                    progress_str = f"Step {int(metrics['step_progress'])}"
-                                elif 'frame_progress' in metrics:
-                                    progress_str = f"Frame {int(metrics['frame_progress'])}"
-                                elif 'step' in metrics:
-                                    progress_str = f"Step {int(metrics['step'])}"
-                                elif 'live_loss' in metrics: # Fallback if only loss is present
-                                    loss_str = f"{metrics['live_loss']:.2f}"
+                            # Match by name or inferred context
+                            if name.lower() in run.info.run_name.lower():
+                                m = run.data.metrics
+                                if 'epoch' in m: epoch_str = f"{int(m['epoch'])}"
+                                if 'step_progress' in m: progress_str = f"{m['step_progress']:.1%}"
+                                elif 'progress' in m: progress_str = f"{m['progress']:.1%}"
+                                if 'loss' in m: loss_str = f"{m['loss']:.2f}"
                         
-                        # Cleanup command line
-                        display_cmd = " ".join([c for c in cmdline if "python" not in c.lower() and c != "run_cli.py" and len(c) < 50])
-                        if len(display_cmd) > 80: display_cmd = display_cmd[:77] + "..."
-                        
-                        print(f"{pid:<8} | {mode:<10} | {uptime:<12} | {progress_str:<12} | {loss_str:<10} | {display_cmd}")
+                        print(f"{pid:<7} | {name[:20]:<20} | {model:<8} | {epoch_str:<8} | {progress_str:<10} | {loss_str:<8} | {uptime:<10}")
                         count += 1
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     continue
             
             if count == 0:
                 print("No active AI Tracker processes found.")
-            print("="*130)
-            return # Exit after listing
-        except ImportError:
-            print("Error: 'psutil' or 'mlflow' library not found.")
+            print("=" * len(header))
+            return 
+        except Exception as e:
+            print(f"Error listing processes: {e}")
             return
 
-    # 2. Build Config
-    config = PipelineConfig()
-    config.state_updater.type = args.mode
-    config.state_updater.gnn_model_path = args.gnn_model_path
-    config.track_manager.min_hits = args.min_hits
-    config.state_updater.del_age = args.max_age
-    config.state_updater.del_exist = args.del_exist
-    config.state_updater.track_cap = args.track_cap
-    config.clutter_filter.threshold = args.clutter_threshold
-    
-    # 1. Initialize MLflow
+    # Initialize MLflow (used by both train and eval paths)
     use_mlflow = not args.no_mlflow
     if use_mlflow:
         import mlflow
@@ -228,12 +233,14 @@ def run_cli():
             print(f"\n Starting Streaming Training ({args.model.upper()})...")
             print(f"Epochs: {args.epochs} | Window: {args.window_size}s | Split: {args.split_ratio}")
             
+            phases_list = [int(p) for p in args.phases.split(",")]
             train_streaming(
                 num_epochs=args.epochs,
                 data_file=args.data,
                 window_size=args.window_size,
                 split_ratio=args.split_ratio,
-                start_epoch=args.start_epoch
+                start_epoch=args.start_epoch,
+                phases=phases_list
             )
             
             if use_mlflow:
@@ -244,17 +251,28 @@ def run_cli():
             logging.error(traceback.format_exc())
             return
 
-    # 2. Build Config
+    # Single source of truth for runtime config: start from Pydantic defaults (centralized in schemas),
+    # then override from CLI args. This removes duplicate "Build Config" blocks and parallel default logic.
     config = PipelineConfig()
     config.state_updater.type = args.mode
     config.state_updater.gnn_model_path = args.gnn_model_path
     config.track_manager.min_hits = args.min_hits
+    config.track_manager.max_age = args.max_age
     config.state_updater.del_age = args.max_age
+    config.state_updater.del_exist = args.del_exist
     config.state_updater.track_cap = args.track_cap
+    config.state_updater.init_thresh = args.init_thresh
+    config.state_updater.coast_thresh = args.coast_thresh
+    config.state_updater.suppress_thresh = args.suppress_thresh
     config.state_updater.clutter_thresh = args.clutter_threshold
+    
+    # Handle Native V6 Mode (No Phase 0 Filter)
+    if args.no_clutter_filter:
+        config.clutter_filter.enabled = False
+        print("[OK] Native Mode: Phase 0 Clutter Filter Disabled.")
     config.clutter_filter.threshold = args.clutter_threshold
     
-    # 3. Initialize Pipeline
+    # Initialize Pipeline (all modes except train now use the single config object)
     print(f"\n Initializing AI Tracker ({args.mode.upper()} mode)...")
     pipeline = Pipeline(config)
     
@@ -262,7 +280,7 @@ def run_cli():
     profiler = Profiler()
     profiler.start("Data Loading")
     if not os.path.exists(args.data):
-        print(f" Error: Data file {args.data} not found.")
+        print(f" [Error] Data file {args.data} not found.")
         return
 
     import json

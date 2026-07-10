@@ -15,8 +15,8 @@ def test_metrics_types():
     print("Testing with list of dicts...")
     metrics.update(pred_list, gt_list)
     results = metrics.compute()
-    print(f"MOTA: {results['MOTA']}")
-    assert results['MOTA'] == 1.0
+    print(f"MOTA: {results.get('mota', results.get('MOTA'))}")
+    assert results.get('mota', results.get('MOTA')) == 1.0
     
     # Test case 2: Tensors
     pred_tensor = torch.tensor([[10.0, 20.0, 0.0, 1.0, 1.0, 0.0]])
@@ -26,8 +26,8 @@ def test_metrics_types():
     print("\nTesting with tensors...")
     metrics.update(pred_tensor, gt_tensor)
     results = metrics.compute()
-    print(f"MOTA: {results['MOTA']}")
-    assert results['MOTA'] == 1.0
+    print(f"MOTA: {results.get('mota', results.get('MOTA'))}")
+    assert results.get('mota', results.get('MOTA')) == 1.0
     
     # Test case 3: Empty lists
     print("\nTesting with empty lists...")

@@ -113,25 +113,44 @@ class RecurrentGATTrackerV6(nn.Module):
 import json
 
 def frame_to_tensors(frame_data: Union[Dict, List], device, window_t=None):
-    """V6 uses 8-feature header (x, y, z, vx, vy, vz, amplitude, dt_offset)."""
+    """V6 uses 8-feature header (x, y, z, vx, vy, vz, amplitude, dt_offset).
+
+    Accepts stream (`radar_id`, `t`) and batch (`sensor_id`, `timestamp`) fields.
+    """
+    from src.data_schema import get_sensor_id, get_time, normalize_measurement_dict
+
     if isinstance(frame_data, dict):
         measurements = frame_data.get('measurements', [])
     else:
-        measurements = frame_data # It's already the list of measurement dicts
-        
+        measurements = frame_data  # list of measurement dicts
+
     meas_list, sid_list = [], []
     for m in measurements:
-        if not isinstance(m, dict): continue
-        # Calculate t_offset: how many seconds BEFORE the window end did this hit occur?
-        t_offset = (window_t - m['t']) if window_t is not None else 0.0
+        if not isinstance(m, dict):
+            continue
+        mn = normalize_measurement_dict(m)
+        mt = get_time(mn, 0.0)
+        t_offset = (window_t - mt) if window_t is not None else 0.0
         # Headers: [x, y, z, vx, vy, vz, amplitude, t_offset]
-        row = [float(m.get(k, 0.0)) for k in ('x','y','z','vx','vy','vz','amplitude')]
-        row.append(float(t_offset))
+        # Missing optional fields → 0.0 for tensor math (not for GT)
+        row = [
+            float(mn.get('x', 0.0) or 0.0),
+            float(mn.get('y', 0.0) or 0.0),
+            float(mn.get('z', 0.0) or 0.0),
+            float(mn['vx']) if mn.get('vx') is not None else 0.0,
+            float(mn['vy']) if mn.get('vy') is not None else 0.0,
+            float(mn['vz']) if mn.get('vz') is not None else 0.0,
+            float(mn['amplitude']) if mn.get('amplitude') is not None else 0.0,
+            float(t_offset),
+        ]
         meas_list.append(row)
-        sid_list.append(int(m.get('sensor_id', 0)))
+        sid_list.append(get_sensor_id(mn, 0))
     if not meas_list:
-        return torch.empty((0,8), device=device), torch.empty((0,), dtype=torch.long, device=device)
-    return torch.tensor(meas_list, dtype=torch.float32, device=device), torch.tensor(sid_list, dtype=torch.long, device=device)
+        return torch.empty((0, 8), device=device), torch.empty((0,), dtype=torch.long, device=device)
+    return (
+        torch.tensor(meas_list, dtype=torch.float32, device=device),
+        torch.tensor(sid_list, dtype=torch.long, device=device),
+    )
 
 def build_full_input(active_tracks, meas, meas_sensor_ids, num_sensors, device):
     """V6 input builder: correctly aligns tracks and measurements into a homogenous node tensor."""

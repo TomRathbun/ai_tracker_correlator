@@ -24,16 +24,19 @@ def extract_clutter_features(m: Dict) -> torch.Tensor:
     """
     Extract unitary features for clutter classification.
     Features: [amp, vx, vy, vz, x_norm, y_norm, z_norm, type_binary]
+    Accepts batch (`type`) or stream (`meas_type`) field names.
     """
+    from src.data_schema import get_meas_type, normalize_measurement_dict
+    mn = normalize_measurement_dict(m) if isinstance(m, dict) else m
     feats = [
-        m.get('amplitude', 50.0) / 100.0,
-        m.get('vx', 0.0) / 100.0,
-        m.get('vy', 0.0) / 100.0,
-        m.get('vz', 0.0) / 50.0,
-        m['x'] / 100000.0,
-        m['y'] / 100000.0,
-        m['z'] / 20000.0,
-        1.0 if m.get('type') == 'SSR' else 0.0
+        (mn.get('amplitude') if mn.get('amplitude') is not None else 50.0) / 100.0,
+        (mn.get('vx') if mn.get('vx') is not None else 0.0) / 100.0,
+        (mn.get('vy') if mn.get('vy') is not None else 0.0) / 100.0,
+        (mn.get('vz') if mn.get('vz') is not None else 0.0) / 50.0,
+        mn['x'] / 100000.0,
+        mn['y'] / 100000.0,
+        mn['z'] / 20000.0,
+        1.0 if get_meas_type(mn) == 'SSR' else 0.0,
     ]
     import numpy as np
     return torch.from_numpy(np.array(feats, dtype=np.float32))

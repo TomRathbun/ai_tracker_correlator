@@ -1,8 +1,12 @@
 [project]
 name = "ai-tracker-correlator"
 version = "0.1.0"
-description = "Add your description here"
+description = "Deep learning multi-target tracker using Graph Attention Networks (GATv2) + recurrent memory for radar sensor fusion and correlation."
 readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Tom Rathbun"}
+]
 requires-python = ">=3.12"
 dependencies = [
     "matplotlib>=3.10.0",

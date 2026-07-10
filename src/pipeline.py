@@ -7,6 +7,8 @@ support for branching logic (PSR vs SSR) and fallback mechanisms.
 
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any
+import logging
+import numpy as np
 import torch
 from src.config_schemas import PipelineConfig
 from src.updater import GNNUpdater, FallbackUpdater, NewHybridUpdater
@@ -38,9 +40,9 @@ class ClutterFilterModule(PipelineModule):
                 else:
                     self.model.load_state_dict(checkpoint)
                 self.model.eval()
-                print(f"✓ Loaded clutter classifier from {self.config.model_path}")
+                logging.info(f"Loaded clutter classifier from {self.config.model_path}")
             except Exception as e:
-                print(f"Warning: Could not load clutter filter: {e}")
+                logging.warning(f"Could not load clutter filter: {e}")
     
     def process(self, measurements: List[Dict]) -> List[Dict]:
         """Filter out clutter measurements."""
@@ -121,7 +123,9 @@ class Pipeline:
         Process a single frame of measurements.
         """
         if t is None and measurements:
-            t = np.mean([m['t'] for m in measurements])
+            # Robust extraction: some data formats may lack 't' on every measurement
+            ts = [m.get('t') for m in measurements if isinstance(m.get('t'), (int, float))]
+            t = float(np.mean(ts)) if ts else None
             
         dt = 1.0 # Default fallback
         if self.last_t is not None and t is not None:
@@ -176,5 +180,7 @@ class Pipeline:
         return confirmed
     
     def reset(self):
-        """Reset pipeline state."""
+        """Reset pipeline state (tracks, timing, and id counter)."""
         self.tracks = []
+        self.last_t = None
+        self.next_id = 0

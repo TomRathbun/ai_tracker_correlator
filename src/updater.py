@@ -13,6 +13,7 @@ from typing import List, Dict, Optional, Tuple
 from src.config_schemas import PipelineConfig
 from src.factory import detect_model_version, get_model_suite
 from scipy.sparse.csgraph import connected_components
+from scipy.sparse import csr_matrix
 from scipy.optimize import linear_sum_assignment
 
 
@@ -49,7 +50,6 @@ class GNNUpdater(StateUpdater):
         self.config = config.state_updater
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = None
-        self.frame_count = 0
         
         if self.config.gnn_model_path:
             self._load_model()
@@ -59,194 +59,217 @@ class GNNUpdater(StateUpdater):
             self.model_type = detect_model_version(self.config.gnn_model_path)
             self.suite = get_model_suite(self.model_type)
             
+            # Cache the version-specific callables once (hot path in update() was re-dispatching via importlib every frame)
+            self._frame_to_tensors = self.suite["frame_to_tensors"]
+            self._build_full_input = self.suite["build_full_input"]
+            self._build_gnn_edges = self.suite["build_gnn_edges"]
+            self._model_forward = self.suite["model_forward"]
+            self._manage_tracks = self.suite["manage_tracks"]
+            
             # Load state dict
             checkpoint = torch.load(self.config.gnn_model_path, weights_only=False, map_location=self.device)
             state_dict = checkpoint['model_state_dict'] if (isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint) else checkpoint
             
-            # Instantiate model via suite
-            self.model = self.suite["model_class"](num_sensors=5).to(self.device)
-            self.model.load_state_dict(state_dict)
+            # Instantiate model via suite (V6 uses 6 sensors: 0-5 radars + dummy)
+            num_sensors = 6 if self.model_type.lower() == "v6" else 5
+            self.model = self.suite["model_class"](num_sensors=num_sensors).to(self.device)
+            # Use strict=False to allow adding the 'Dustbin token' even when loading old checkpoints
+            self.model.load_state_dict(state_dict, strict=False)
             self.model.eval()
             
             # Load classifiers for GNN edge features (RecurrentGATTrackerV3 uses them)
-            from src.pairwise_features import get_psr_psr_dim, get_ssr_any_dim
-            from src.pairwise_classifier import PairwiseAssociationClassifier
-            try:
-                self.psr_clf = PairwiseAssociationClassifier(feature_dim=get_psr_psr_dim()).to(self.device)
-                self.psr_clf.load_state_dict(torch.load('checkpoints/pairwise_psr_psr.pt', map_location=self.device, weights_only=True))
-                self.psr_clf.eval()
-                self.ssr_clf = PairwiseAssociationClassifier(feature_dim=get_ssr_any_dim()).to(self.device)
-                self.ssr_clf.load_state_dict(torch.load('checkpoints/pairwise_ssr_any.pt', map_location=self.device, weights_only=True))
-                self.ssr_clf.eval()
-                print("✓ GNNUpdater: Loaded pairwise classifiers for edge features")
-            except:
-                print("Warning: GNNUpdater could not load classifiers, edges will lack ML features.")
+            # Skip redundant pairwise classifiers if using V6 Bipartite Architecture
+            if self.model_type.lower() != "v6":
+                from src.pairwise_features import get_psr_psr_dim, get_ssr_any_dim
+                from src.pairwise_classifier import PairwiseAssociationClassifier
+                pw = getattr(self.full_config, 'pairwise', None)
+                psr_path = str(getattr(pw, 'psr_model_path', 'checkpoints/pairwise_psr_psr.pt')) if pw else 'checkpoints/pairwise_psr_psr.pt'
+                ssr_path = str(getattr(pw, 'ssr_model_path', 'checkpoints/pairwise_ssr_any.pt')) if pw else 'checkpoints/pairwise_ssr_any.pt'
+                try:
+                    self.psr_clf = PairwiseAssociationClassifier(feature_dim=get_psr_psr_dim()).to(self.device)
+                    self.psr_clf.load_state_dict(torch.load(psr_path, map_location=self.device, weights_only=True))
+                    self.psr_clf.eval()
+                    self.ssr_clf = PairwiseAssociationClassifier(feature_dim=get_ssr_any_dim()).to(self.device)
+                    self.ssr_clf.load_state_dict(torch.load(ssr_path, map_location=self.device, weights_only=True))
+                    self.ssr_clf.eval()
+                    logging.info("GNNUpdater: Loaded pairwise classifiers for edge features")
+                except:
+                    logging.warning("GNNUpdater could not load classifiers, edges will lack ML features.")
+                    self.psr_clf = self.ssr_clf = None
+            else:
                 self.psr_clf = self.ssr_clf = None
                 
-            print(f"✓ Successfully loaded {self.model_type} GNN model from {self.config.gnn_model_path}")
+            logging.info(f"Successfully loaded {self.model_type} GNN model from {self.config.gnn_model_path}")
         except Exception as e:
-            print(f"Warning: Could not load GNN model from {self.config.gnn_model_path}: {e}")
+            logging.warning(f"Could not load GNN model from {self.config.gnn_model_path}: {e}")
             self.model = None
             self.model_type = None
             self.psr_clf = self.ssr_clf = None
     def update(self, measurements: List[Dict], tracks: List[Dict], dt: float = 1.0, frame_t: float = None) -> List[Dict]:
-        """Update tracks using GNN."""
+        """Update tracks using GNN with Version Dispatching."""
         if self.model is None or (not measurements and not tracks):
+            # Age existing tracks so they coast/delete per normal rules even if GNN unavailable
+            for t in tracks:
+                t['age'] = t.get('age', 0) + 1
             return tracks
+            
+        model_ver = getattr(self, "model_type", "v3").lower()
         
-        # This implementation uses model_v3 logic
-        from src.model_v3 import frame_to_tensors, build_full_input
+        # 1. Use cached dispatch (populated in _load_model). Fallback to on-demand only if missing (defensive).
+        module_frame_to_tensors = getattr(self, "_frame_to_tensors", None)
+        module_build_full_input = getattr(self, "_build_full_input", None)
+        module_build_gnn_edges = getattr(self, "_build_gnn_edges", None)
+        module_model_forward = getattr(self, "_model_forward", None)
+        module_manage_tracks = getattr(self, "_manage_tracks", None)
+        if any(x is None for x in (module_frame_to_tensors, module_build_full_input, module_build_gnn_edges, module_model_forward, module_manage_tracks)):
+            from src.factory import get_model_suite
+            suite = get_model_suite(model_ver)
+            module_frame_to_tensors = suite["frame_to_tensors"]
+            module_build_full_input = suite["build_full_input"]
+            module_build_gnn_edges = suite["build_gnn_edges"]
+            module_model_forward = suite["model_forward"]
+            module_manage_tracks = suite["manage_tracks"]
         
-        # 1. Convert measurements to tensors
-        # Map radar_id to sensor_id for measurements if not already present
+        # 2. Measurement Tensors
+        num_sensors_val = 6 if model_ver == "v6" else 5
+        
         for m in measurements:
             if 'sensor_id' not in m and 'radar_id' in m:
                 m['sensor_id'] = m['radar_id']
+            # Safely cast string IDs (like "SU_27") to integer for the Embedding lookup
+            if isinstance(m.get('sensor_id'), str):
+                s_id = m['sensor_id']
+                try:
+                    # Extract numbers if present (e.g. SU_27 -> 27)
+                    num = int(''.join(filter(str.isdigit, s_id)))
+                    m['sensor_id'] = num % num_sensors_val
+                except ValueError:
+                    # Fallback hash
+                    m['sensor_id'] = hash(s_id) % num_sensors_val
                 
-        meas, meas_sensor_ids = frame_to_tensors({'measurements': measurements}, self.device)
+        meas, meas_sensor_ids = module_frame_to_tensors({'measurements': measurements}, self.device, window_t=frame_t)
         num_meas = meas.shape[0] if (meas is not None and len(meas.shape) > 0) else 0
         
-        # 2. Build full input (tracks + measurements)
-        # Note: RecurrentGATTrackerV3 expects hidden state in track dicts
-        full_x, sensor_ids, hidden_state, num_tracks = build_full_input(
-            tracks, meas, meas_sensor_ids, num_sensors=5, device=self.device
+        # 3. Build Full Node Tensor
+        num_sensors_val = 6 if model_ver == "v6" else 5
+        full_x, sensor_ids, hidden_state, num_tracks = module_build_full_input(
+            tracks, meas, meas_sensor_ids, num_sensors=num_sensors_val, device=self.device
         )
         
         N = full_x.shape[0] if full_x is not None else 0
         if N == 0:
             return tracks
             
-        # Add dummy measurement if we only have tracks to ensure GNN structure works
+        # Dummy measurement handling if only tracks exist
         dummy_added = False
         if num_meas == 0 and num_tracks > 0:
-            dim = 8 if getattr(self, "model_type", "v3") in ["v4", "v5"] else 7
-            dummy_meas = torch.zeros(1, dim, device=self.device)
-            dummy_id = torch.tensor([5], dtype=torch.long, device=self.device)
+            feat_dim = full_x.shape[1]
+            dummy_meas = torch.zeros(1, feat_dim, device=self.device)
             full_x = torch.cat([full_x, dummy_meas], dim=0)
-            sensor_ids = torch.cat([sensor_ids, dummy_id], dim=0)
+            
+            # Update sensor IDs to include the dummy sensor (index 5)
+            dummy_sid = torch.tensor([5], device=self.device)
+            sensor_ids = torch.cat([sensor_ids, dummy_sid])
             num_meas = 1
             dummy_added = True
             
-        # 3. Create graph
-        # 3. Create graph nodes (Tracks + Measurements)
-        # Type: 1.0 for established tracks and SSR measurements, 0.0 for PSR measurements
-        track_types = torch.ones(num_tracks, dtype=torch.long, device=self.device)
+        # 4. Graph Construction
+        node_type = torch.cat([
+            torch.ones(num_tracks, dtype=torch.long, device=self.device),
+            torch.zeros(num_meas, dtype=torch.long, device=self.device)
+        ])
         
-        if dummy_added:
-            meas_types = torch.zeros(1, dtype=torch.long, device=self.device)
-        else:
-            meas_types = torch.tensor([
-                1 if m.get('type') != 'PSR' else 0 
-                for m in measurements
-            ], dtype=torch.long, device=self.device)
-        
-        node_type = torch.cat([track_types, meas_types])
-        
-        # 3. Build Graph Edges via standardized suite
-        edge_index, edge_attr = self.suite["build_edges"](
-            full_x, node_type, getattr(self, 'psr_clf', None), getattr(self, 'ssr_clf', None), self.device
-        )
-        
-        # 4. Forward pass via suite
         try:
-            if self.model_type == "legacy":
-                # Legacy GNN remains isolated due to km-scaling
-                N = full_x.shape[0]
-                m3a = torch.zeros(N, 1, device=self.device)
-                node_type_feat = node_type.float().unsqueeze(1)
-                sensor_id_feat = sensor_ids.float().unsqueeze(1)
-                x_scale = full_x.clone()
-                x_scale[:, 0:3] *= 1e-4; x_scale[:, 3:6] *= 1e-2
-                row, col = edge_index
-                dist = torch.norm(full_x[row, :3] - full_x[col, :3], dim=1)
-                edge_attr_legacy = torch.zeros(edge_index.shape[1], 8, device=self.device)
-                edge_attr_legacy[:, 0] = 0.5; edge_attr_legacy[:, 1] = dist / 1000.0
-                node_feats = torch.cat([x_scale, node_type_feat, m3a, sensor_id_feat], dim=1)
-                
-                hidden_state = torch.zeros(N, self.model.gru.hidden_size, device=self.device) if hidden_state is None else hidden_state
-                if hidden_state.shape[0] < N:
-                    hidden_state = torch.cat([hidden_state, torch.zeros(N - hidden_state.shape[0], self.model.gru.hidden_size, device=self.device)], dim=0)
-                
-                state_deltas, existence_logits, new_hidden_full = self.model(node_feats, edge_index, edge_attr_legacy, hidden_state)
-                existence_logits = existence_logits.squeeze(-1)
-                unscaled_deltas = state_deltas.clone(); unscaled_deltas[:, 0:3] /= 1e-4; unscaled_deltas[:, 3:6] /= 1e-2
-                absolute_state = full_x[:, :6] + unscaled_deltas
-                out = torch.cat([absolute_state, existence_logits.unsqueeze(-1)], dim=1)
-                existence_probs = torch.sigmoid(existence_logits)
-                clutter_probs = torch.zeros_like(existence_probs)
-                clutter_logits = torch.zeros_like(existence_logits)
-                alpha = None
+            # Dispatch build_edges (skips classifiers for V6)
+            if model_ver == "v6":
+                edge_index, edge_attr = module_build_gnn_edges(full_x, node_type, self.device)
             else:
-                # Standard Modern GNN Path (V3, V4, V5, V6)
-                with torch.no_grad():
-                    res = self.suite["model_forward"](
-                        self.model, full_x, node_type, sensor_ids, edge_index, edge_attr, hidden_state
-                    )
-                    # Unified 8-value signature (includes active/pruned edge index)
-                    if len(res) == 8:
-                        out, new_hidden_full, alpha, existence_probs, existence_logits, clutter_probs, clutter_logits, active_edge_index = res
-                    else:
-                        out, new_hidden_full, alpha, existence_probs, existence_logits, clutter_probs, clutter_logits = res
-                        active_edge_index = edge_index
-        except Exception as e:
-            import logging
-            logging.error(f"Error during GNN forward pass: {e}")
-            import traceback; logging.error(traceback.format_exc())
-            return tracks
+                edge_index, edge_attr = module_build_gnn_edges(full_x, node_type, self.psr_clf, self.ssr_clf, self.device)
+                
+            # 5. Forward Pass
+            res = module_model_forward(
+                self.model, full_x, node_type, sensor_ids, edge_index, edge_attr, hidden_state
+            )
             
-        # 5. Manage Tracks via Suite Dispatch
-        # self.config is state_updater section of PipelineConfig
-        updated_tracks = self.suite["manage_tracks"](
-            active_tracks=tracks, out=out, new_hidden_full=new_hidden_full, 
-            existence_probs=existence_probs, existence_logits=existence_logits, 
-            clutter_probs=clutter_probs, alpha=alpha, edge_index=active_edge_index, 
-            num_tracks=num_tracks, num_meas=0 if dummy_added else num_meas,
-            init_thresh=self.config.init_thresh, coast_thresh=self.config.coast_thresh,
-            suppress_thresh=self.config.suppress_thresh, del_exist=self.config.del_exist, 
-            del_age=self.config.del_age, track_cap=self.config.track_cap,
-            dt=dt, clutter_thresh=getattr(self.config, 'clutter_threshold', 0.70)
-        )
-        
-        # Unified Telemetry (Log EVERY frame to bypass buffer-delay)
-        self.frame_count += 1
-        import logging
-        max_p = existence_probs.max().item() if existence_probs.numel() > 0 else 0
-        logging.info(f"Frame {self.frame_count} | PID={os.getpid()} | Tracks={len(updated_tracks)} | Max P={max_p:.3f}")
-        
-        return updated_tracks
+            # Universal Result Unpacker (Supports V3/4/5/6)
+            if len(res) == 9:
+                out, new_hidden_full, alpha, existence_probs, existence_logits, clutter_probs, clutter_logits, active_edge_index, _ = res
+            elif len(res) == 8:
+                out, new_hidden_full, alpha, existence_probs, existence_logits, clutter_probs, clutter_logits, active_edge_index = res
+            elif len(res) == 7:
+                out, new_hidden_full, alpha, existence_probs, existence_logits, clutter_probs, clutter_logits = res
+                active_edge_index = edge_index
+            else:
+                out, new_hidden_full, alpha, existence_probs, existence_logits = res[:5]
+                clutter_probs = clutter_logits = None
+                active_edge_index = edge_index
+            
+            # V3 Hybrid Lockdown: Prevent Velocity Runaway
+            # Force refined velocity = predicted velocity for stable kinematics
+            if model_ver == "v3":
+                out[:, 3:6] = full_x[:, 3:6]
+                
+            # 6. Track Management with Generic Dispatch
+            # V3 does not support clutter_probs/thresh, so we filter them out
+            manage_kwargs = {
+                "active_tracks": tracks, 
+                "out": out, 
+                "new_hidden_full": new_hidden_full, 
+                "existence_probs": existence_probs, 
+                "existence_logits": existence_logits, 
+                "alpha": alpha, 
+                "edge_index": active_edge_index, 
+                "num_tracks": num_tracks, 
+                "num_meas": 0 if dummy_added else num_meas,
+                "init_thresh": self.config.init_thresh, 
+                "coast_thresh": self.config.coast_thresh,
+                "suppress_thresh": self.config.suppress_thresh, 
+                "del_exist": self.config.del_exist, 
+                "del_age": self.config.del_age, 
+                "track_cap": self.config.track_cap,
+                "dt": 0.0
+            }
+            
+            # Add version-specific features (Clutter Head)
+            if model_ver != "v3":
+                manage_kwargs["clutter_probs"] = clutter_probs
+                manage_kwargs["clutter_thresh"] = getattr(self.config, 'clutter_thresh', 0.70)
+                
+            updated_tracks = module_manage_tracks(**manage_kwargs)
+            
+            return updated_tracks
+            
+        except Exception as e:
+            logging.exception(f"GNNUpdater failed on version {model_ver}: {e}")
+            # Age tracks on failure so coasting / max-age deletion logic in the pipeline still applies
+            for t in tracks:
+                t['age'] = t.get('age', 0) + 1
+            return tracks
     
     def predict(self, tracks: List[Dict], dt: float = 1.0) -> List[Dict]:
-        """Predict next state for tracks, using GRU to evolve hidden state."""
+        """
+        Predict next state for tracks.
+        For V6, the GNN is trained as a 'Residual Corrector'. It expects tracks to already
+        be moved by the motion model (x + v*dt) before the GNN performs association refinement.
+        """
         predicted = []
         for track in tracks:
             pred = track.copy()
-            if 'state_tensor' in track and 'hidden' in track and self.model is not None:
-                # Evolve GRU hidden states
-                with torch.no_grad():
-                    dummy_x = track['state_tensor']
-                    # Project dummy_x back to hidden_dim if necessary, or just GRU step with zeros
-                    # The full forward usually expects encoder input.
-                    # We can use the gru cell directly with the encoded embedding or just pad:
-                    # For simplicity, we can do a dummy forward of the GRU cell with a zero tensor 
-                    # as 'input' to let the hidden state decay/evolve, or just with a projection of state
-                    # Here we just feed zero input of size hidden_dim.
-                    dummy_input = torch.zeros(1, self.model.hidden_dim, device=self.device)
-                    new_hidden = self.model.gru(dummy_input, track['hidden'].unsqueeze(0))
-                    pred['hidden'] = new_hidden.squeeze(0)
-
-            # If state is a tensor, update it
-            if isinstance(pred.get('state_tensor', pred.get('state')), torch.Tensor):
-                state_key = 'state_tensor' if 'state_tensor' in pred else 'state'
-                state = pred[state_key].clone()
+            
+            # If state is a tensor, update it (V4-V6 primary path)
+            if isinstance(pred.get('state_tensor'), torch.Tensor):
+                state = pred['state_tensor'].clone()
                 state[0:3] += state[3:6] * dt
-                pred[state_key] = state
-                pred['x'] = state[0].item()
-                pred['y'] = state[1].item()
-                pred['z'] = state[2].item()
+                pred['state_tensor'] = state
+                pred['x'], pred['y'], pred['z'] = state[0].item(), state[1].item(), state[2].item()
             else:
-                pred['x'] += track.get('vx', 0)
-                pred['y'] += track.get('vy', 0)
-                pred['z'] += track.get('vz', 0)
+                # Fallback for dict-based tracks
+                pred['x'] += track.get('vx', 0.0) * dt
+                pred['y'] += track.get('vy', 0.0) * dt
+                pred['z'] += track.get('vz', 0.0) * dt
+            
+            # Increment age for missing prediction pass (if applicable)
+            pred['age'] = track.get('age', 0) + 1
             predicted.append(pred)
         return predicted
 
@@ -266,8 +289,9 @@ class FallbackUpdater(StateUpdater):
         self.config = config.state_updater
         # We'll create filters on demand per track or use a simplified one
     
-    def update(self, measurements: List[Dict], tracks: List[Dict], dt: float = 1.0) -> List[Dict]:
+    def update(self, measurements: List[Dict], tracks: List[Dict], dt: float = 1.0, frame_t: float = None) -> List[Dict]:
         """Update tracks using simplified Kalman logic with initiation."""
+        # frame_t accepted for signature compatibility with the unified Pipeline (ignored for this simple updater)
         updated_tracks = []
         matched_meas_indices = set()
         
@@ -310,14 +334,14 @@ class FallbackUpdater(StateUpdater):
                 
         return updated_tracks
     
-    def predict(self, tracks: List[Dict]) -> List[Dict]:
+    def predict(self, tracks: List[Dict], dt: float = 1.0) -> List[Dict]:
         """Predict next state using constant velocity model."""
         predicted = []
         for track in tracks:
             pred = track.copy()
-            pred['x'] += track.get('vx', 0)
-            pred['y'] += track.get('vy', 0)
-            pred['z'] += track.get('vz', 0)
+            pred['x'] += track.get('vx', 0) * dt
+            pred['y'] += track.get('vy', 0) * dt
+            pred['z'] += track.get('vz', 0) * dt
             predicted.append(pred)
         return predicted
     
@@ -370,21 +394,25 @@ class NewHybridUpdater(StateUpdater):
         
         self.thr = getattr(config.track_manager, 'association_threshold', 0.35)
         
+        pw = getattr(config, 'pairwise', None)
+        psr_path = str(getattr(pw, 'psr_model_path', 'checkpoints/pairwise_psr_psr.pt')) if pw else 'checkpoints/pairwise_psr_psr.pt'
+        ssr_path = str(getattr(pw, 'ssr_model_path', 'checkpoints/pairwise_ssr_any.pt')) if pw else 'checkpoints/pairwise_ssr_any.pt'
+        
         try:
             # PSR-PSR
             self.psr_classifier = PairwiseAssociationClassifier(
                 feature_dim=get_psr_psr_dim(), hidden_dims=[64, 32]
             ).to(self.device)
-            self.psr_classifier.load_state_dict(torch.load('checkpoints/pairwise_psr_psr.pt', map_location=self.device, weights_only=False))
+            self.psr_classifier.load_state_dict(torch.load(psr_path, map_location=self.device, weights_only=False))
             self.psr_classifier.eval()
 
             # SSR-ANY
             self.ssr_classifier = PairwiseAssociationClassifier(
                 feature_dim=get_ssr_any_dim(), hidden_dims=[64, 32]
             ).to(self.device)
-            self.ssr_classifier.load_state_dict(torch.load('checkpoints/pairwise_ssr_any.pt', map_location=self.device, weights_only=False))
+            self.ssr_classifier.load_state_dict(torch.load(ssr_path, map_location=self.device, weights_only=False))
             self.ssr_classifier.eval()
-            print("✓ NewHybridUpdater: Loaded dual association classifiers")
+            logging.info("NewHybridUpdater: Loaded dual association classifiers")
         except Exception as e:
             raise RuntimeError(f"CRITICAL: NewHybridUpdater failed to load classifiers: {e}")
 
@@ -420,7 +448,12 @@ class NewHybridUpdater(StateUpdater):
                 if 'kf' not in track:
                     from src.kalman_filter import SimpleKalmanFilter
                     kf = SimpleKalmanFilter()
-                    kf.x = np.array([track['x'], track['y'], track['z'], track.get('vx', 0), track.get('vy', 0), track.get('vz', 0)])
+                    kf.x = np.array([
+                        float(track['x']), float(track['y']), float(track['z']),
+                        float(track['vx']) if track.get('vx') is not None else 0.0,
+                        float(track['vy']) if track.get('vy') is not None else 0.0,
+                        float(track['vz']) if track.get('vz') is not None else 0.0,
+                    ], dtype=float)
                     track['kf'] = kf
                 
                 kf = track['kf']
@@ -431,8 +464,19 @@ class NewHybridUpdater(StateUpdater):
                     if dt_meas > 0: kf.predict(dt=dt_meas)
                     track['kf_t'] = meta['t']
                 
-                z = np.array([meta['x'], meta['y'], meta['z'], meta.get('vx', 0), meta.get('vy', 0), meta.get('vz', 0)])
-                kf.update(z)
+                # Measurement: position always; horizontal velocity if both present (PSR).
+                # Avoid length-5 vs H(6) crash — KF accepts 3, 5, or 6.
+                z_comps = [float(meta['x']), float(meta['y']), float(meta['z'])]
+                has_vx = meta.get('vx') is not None
+                has_vy = meta.get('vy') is not None
+                has_vz = meta.get('vz') is not None
+                if has_vx and has_vy:
+                    z_comps.append(float(meta['vx']))
+                    z_comps.append(float(meta['vy']))
+                    if has_vz:
+                        z_comps.append(float(meta['vz']))
+                
+                kf.update(np.array(z_comps, dtype=float))
                 
                 # We do NOT sync to dictionary yet, we do that at the end after predicting to frame_t
                 
@@ -461,8 +505,13 @@ class NewHybridUpdater(StateUpdater):
             # However, new_track is just being born. Let's look at nearby dead tracks? No.
             # Best is to initialize with measurement velocity if PSR, else 0.
             # BUT: We give it a high velocity covariance so it learns fast.
-            kf.x = np.array([meta['x'], meta['y'], meta['z'], meta.get('vx', 0), meta.get('vy', 0), meta.get('vz', 0)])
-            kf.P[3:6, 3:6] *= 100.0 # High velocity uncertainty
+            kf.x = np.array([
+                float(meta['x']), float(meta['y']), float(meta['z']),
+                float(meta['vx']) if meta.get('vx') is not None else 0.0,
+                float(meta['vy']) if meta.get('vy') is not None else 0.0,
+                float(meta['vz']) if meta.get('vz') is not None else 0.0,
+            ], dtype=float)
+            kf.P[3:6, 3:6] *= 100.0  # High velocity uncertainty
             new_track['kf'] = kf
             new_track['kf_t'] = meta['t']
             
@@ -516,11 +565,13 @@ class NewHybridUpdater(StateUpdater):
             dist_sq = (m1['x'] - m2['x'])**2 + (m1['y'] - m2['y'])**2
             if dist_sq > 2000.0**2: continue
             
-            t1, t2 = m1.get('meas_type', 'PSR'), m2.get('meas_type', 'PSR')
+            from src.data_schema import get_meas_type, normalize_measurement_dict
+            m1n, m2n = normalize_measurement_dict(m1), normalize_measurement_dict(m2)
+            t1, t2 = get_meas_type(m1n), get_meas_type(m2n)
             if t1 == 'PSR' and t2 == 'PSR':
-                psr_pairs.append((i, j, compute_psr_psr_features(m1, m2)))
+                psr_pairs.append((i, j, compute_psr_psr_features(m1n, m2n)))
             else:
-                ssr_pairs.append((i, j, compute_ssr_any_features(m1, m2)))
+                ssr_pairs.append((i, j, compute_ssr_any_features(m1n, m2n)))
 
         # Batch PSR-PSR
         if psr_pairs and self.psr_classifier:
@@ -554,8 +605,10 @@ class NewHybridUpdater(StateUpdater):
             # Vectorize velocity fusion: only average available velocities
             vels_x = [m['vx'] for m in cluster if 'vx' in m and m['vx'] != 0]
             vels_y = [m['vy'] for m in cluster if 'vy' in m and m['vy'] != 0]
+            vels_z = [m['vz'] for m in cluster if 'vz' in m and m['vz'] != 0]
             if vels_x: fused['vx'] = np.mean(vels_x)
             if vels_y: fused['vy'] = np.mean(vels_y)
+            if vels_z: fused['vz'] = np.mean(vels_z)
             
             # Propagate identity fields
             if any(m.get('mode_3a') or m.get('mode3a') for m in cluster):

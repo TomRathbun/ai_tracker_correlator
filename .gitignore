@@ -30,5 +30,39 @@ optimization_reports/
 *.jsonl
 *.pt
 *.json
+# Canonical training datasets are intentionally versioned
+!data/canonical/
+!data/canonical/**
 data/scat_raw/
 data/raw/
+data/scat_downloads/
+data/scat_sample/
+data/convert_cat048_geo.py   # one-off data script, not core
+
+# Node / Office temp
+node_modules/
+~$*
+*.pptx.tmp
+
+# Research byproducts, logs, debug/eval outputs (do not commit these)
+logs/
+*.log
+*eval*.txt
+v*_*.txt
+v*_*.log
+train_debug*.log
+anomaly*.txt
+debug*.log
+debug_nan.log
+nan_trace.txt
+sweden_eval.png
+tmp_*.py
+
+# Large binary/visual artifacts from runs (keep small committed ones in artifacts/ if truly needed)
+*.gif
+*.mp4
+*.mov
+
+# Temporary / one-off
+*.tmp
+*~
