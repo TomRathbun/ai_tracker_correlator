@@ -66,3 +66,7 @@ tmp_*.py
 # Temporary / one-off
 *.tmp
 *~
+
+# Oversized raw sources (GitHub 100MB limit) — keep local only
+data/cat_62_sweden_full_week1.txt
+data/scat_downloads/
