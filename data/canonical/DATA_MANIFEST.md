@@ -73,3 +73,18 @@ See companion `DATA_INVENTORY.json` next to this file.
 | data/canonical/episodes/sweden_10min/ | sweden | 90s episodes + manifest |
 
 See also schema.md and rtifacts/data_qa_report.md.
+
+## Dense 30/60 min package (2026-07)
+
+| Path | Role | Notes |
+|------|------|-------|
+| `stream_sweden_30min_train.jsonl` | Train stream | 3× tiled mini; ~162 tracks; medium difficulty |
+| `stream_sweden_30min_holdout.jsonl` | **Primary holdout** | 2nd half of 6-tile pack; no track_id overlap with train |
+| `stream_sweden_60min_test.jsonl` | Full hour | 6 tiles; long-run eval |
+| `cat62_sweden_dense_*min.txt` | Intermediate | Packed CAT-62 for regeneration |
+| `episodes/sweden_30min_train/` | Episodes | 90 s clips |
+| `episodes/sweden_30min_holdout/` | Episodes | Holdout clips |
+
+**Do not use** naïve first-30/60-min cuts of `cat_62_sweden_subset.txt` (1–2 concurrent tracks only).
+
+See `artifacts/TRAINING_DATA_CHAPTER.md` and `artifacts/data_difficulty_report.md`.
