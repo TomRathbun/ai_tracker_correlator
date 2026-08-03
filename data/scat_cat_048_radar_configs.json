@@ -1,0 +1,104 @@
+{
+    "radars": [
+        {
+            "name": "SU_27",
+            "sac": 233,
+            "sic": 1,
+            "rotation_rate": 5.0,
+            "latitude": 56.0,
+            "longitude": 13.8,
+            "altitude_feet": 150.0,
+            "max_range_nm": 246.0,
+            "beam_width_deg": 6.0
+        },
+        {
+            "name": "SU_28",
+            "sac": 233,
+            "sic": 2,
+            "rotation_rate": 5.0,
+            "latitude": 56.0,
+            "longitude": 20.6333,
+            "altitude_feet": 180.0,
+            "max_range_nm": 246.0,
+            "beam_width_deg": 6.0
+        },
+        {
+            "name": "SU_29",
+            "sac": 233,
+            "sic": 3,
+            "rotation_rate": 5.0,
+            "latitude": 59.7833,
+            "longitude": 13.8,
+            "altitude_feet": 120.0,
+            "max_range_nm": 246.0,
+            "beam_width_deg": 6.0
+        },
+        {
+            "name": "SU_30",
+            "sac": 233,
+            "sic": 4,
+            "rotation_rate": 5.0,
+            "latitude": 59.9333,
+            "longitude": 20.6333,
+            "altitude_feet": 150.0,
+            "max_range_nm": 246.0,
+            "beam_width_deg": 6.0
+        },
+        {
+            "name": "SU_31",
+            "sac": 233,
+            "sic": 5,
+            "rotation_rate": 5.0,
+            "latitude": 63.6,
+            "longitude": 13.8,
+            "altitude_feet": 180.0,
+            "max_range_nm": 246.0,
+            "beam_width_deg": 6.0
+        },
+        {
+            "name": "SU_32",
+            "sac": 233,
+            "sic": 6,
+            "rotation_rate": 5.0,
+            "latitude": 63.8833,
+            "longitude": 20.6333,
+            "altitude_feet": 120.0,
+            "max_range_nm": 246.0,
+            "beam_width_deg": 6.0
+        },
+        {
+            "name": "SU_33",
+            "sac": 233,
+            "sic": 7,
+            "rotation_rate": 5.0,
+            "latitude": 67.2,
+            "longitude": 13.8,
+            "altitude_feet": 150.0,
+            "max_range_nm": 246.0,
+            "beam_width_deg": 6.0
+        },
+        {
+            "name": "SU_34",
+            "sac": 233,
+            "sic": 8,
+            "rotation_rate": 5.0,
+            "latitude": 67.65,
+            "longitude": 20.6333,
+            "altitude_feet": 180.0,
+            "max_range_nm": 246.0,
+            "beam_width_deg": 6.0
+        }
+    ],
+    "metadata": {
+        "description": "Radar configuration for ASTERIX CAT-048 simulation and AI tracker training",
+        "sac_common": 233,
+        "rotation_rate_default": 5.0,
+        "units": {
+            "latitude_longitude": "decimal degrees",
+            "altitude": "feet",
+            "max_range": "nautical miles",
+            "rotation_rate": "seconds per revolution",
+            "beam_width": "degrees"
+        }
+    }
+}

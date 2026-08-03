@@ -33,6 +33,25 @@ optimization_reports/
 # Canonical training datasets are intentionally versioned
 !data/canonical/
 !data/canonical/**
+# Mid-size training/eval datasets under GitHub 100MB hard limit
+# (large UAE/misnamed streams >100MB stay ignored — see bottom)
+!data/sim_001.jsonl
+!data/sim_clean_001.jsonl
+!data/sim_hetero_001.jsonl
+!data/sim_realistic_001.jsonl
+!data/sim_realistic_003.jsonl
+!data/sim_sweden_full.jsonl
+!data/sim_sweden_test.jsonl
+!data/stream_radar_001.jsonl
+!data/stream_radar_uniform.jsonl
+!data/sweden_radar_mini.jsonl
+!data/sweden_radar_subset.jsonl
+!data/sweden_radar_v2_full.jsonl
+!data/sweden_v2_15m_linear.jsonl
+!data/sweden_v2_60m_linear.jsonl
+!data/sweden_v2_clean_mini.jsonl
+!data/scat_cat_048_radar_configs.json
+!data/test_track_ids.json
 data/scat_raw/
 data/raw/
 data/scat_downloads/
