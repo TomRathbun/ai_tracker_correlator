@@ -1,0 +1,31 @@
+{
+  "model": "checkpoints/model_v7_transformer.pt",
+  "data": "data/stream_radar_001.jsonl",
+  "device": "cuda",
+  "windows": 63,
+  "peak_tracks": 150,
+  "final_tracks": 150,
+  "eval_ids": 50,
+  "config": {
+    "init_thresh": 0.55,
+    "coast_thresh": 0.25,
+    "suppress_thresh": 0.25,
+    "del_exist": 0.2,
+    "track_cap": 150,
+    "window_size": 2.0,
+    "holdout": true
+  },
+  "metrics": {
+    "mota": -3.025433526011561,
+    "motp": 3260.57080078125,
+    "precision": 0.10500702930680221,
+    "recall": 0.3741811175337187,
+    "f1": 0.16399256882283397,
+    "id_switches": 546.0,
+    "fp_rate": 131.36507936507937,
+    "fn_rate": 25.77777777777778,
+    "total_matches": 971.0,
+    "fp": 8276.0,
+    "fn": 1624.0
+  }
+}
