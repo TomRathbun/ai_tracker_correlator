@@ -82,6 +82,8 @@ def main():
     p.add_argument("--v8-model", default="checkpoints/model_v8_assoc.pt")
     p.add_argument("--dustbin", action="store_true")
     p.add_argument("--window", type=float, default=1.0)
+    p.add_argument("--max-age", type=int, default=2)
+    p.add_argument("--min-hits", type=int, default=3)
     args = p.parse_args()
     if args.assoc != "mlp" and not os.path.exists(args.v8_model):
         print(f"Warning: {args.v8_model} missing — Hybrid will fall back to MLP.")
@@ -91,6 +93,8 @@ def main():
         v8_path=args.v8_model,
         use_dustbin=args.dustbin,
         window_size=args.window,
+        max_age=args.max_age,
+        min_hits=args.min_hits,
     )
 
 

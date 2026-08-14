@@ -34,7 +34,11 @@ class ClutterFilterModule(PipelineModule):
             try:
                 # Use the imported ClutterClassifier
                 self.model = ClutterClassifier()
-                checkpoint = torch.load(self.config.model_path, weights_only=True)
+                checkpoint = torch.load(
+                    self.config.model_path,
+                    map_location=torch.device("cpu"),
+                    weights_only=True,
+                )
                 if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
                     self.model.load_state_dict(checkpoint['model_state_dict'])
                 else:
@@ -43,6 +47,7 @@ class ClutterFilterModule(PipelineModule):
                 logging.info(f"Loaded clutter classifier from {self.config.model_path}")
             except Exception as e:
                 logging.warning(f"Could not load clutter filter: {e}")
+                self.model = None
     
     def process(self, measurements: List[Dict]) -> List[Dict]:
         """Filter out clutter measurements."""
