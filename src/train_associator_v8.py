@@ -149,7 +149,7 @@ def train_associator(
         except Exception as exc:
             print(f"Could not load checkpoint ({exc}); training from scratch")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     history = []
     best_loss = float("inf")
 
@@ -167,7 +167,7 @@ def train_associator(
             n_terms = 0
 
             if pair_idx.numel() > 0:
-                logits = model.score_pairs(window, pair_idx.to(device))
+                logits = model.score_pairs(window, window, pair_idx.to(device))
                 y = pair_y.to(device)
                 loss = loss + focal_bce(logits, y)
                 n_terms += 1
@@ -247,7 +247,7 @@ def main():
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--window", type=float, default=2.0)
     p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--checkpoint", default="checkpoints/model_v8_assoc.pt")
+    p.add_argument("--checkpoint", "--out", dest="checkpoint", default="checkpoints/model_v8_assoc.pt")
     p.add_argument("--max-windows", type=int, default=None)
     p.add_argument("--no-self-attn", action="store_true")
     args = p.parse_args()

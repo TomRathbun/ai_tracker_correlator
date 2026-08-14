@@ -20,7 +20,7 @@ import torch.nn.functional as F
 
 from src.data_schema import get_meas_type, get_mode_3a, get_sensor_id, get_time, normalize_measurement_dict
 
-NUMERIC_DIM = 14
+NUMERIC_DIM = 15
 REL_DIM = 12
 CLUSTER_GATE_M = 2000.0
 ASSOC_GATE_M = 8000.0
@@ -109,9 +109,12 @@ def relative_feature_vec(a: Dict, b: Dict) -> np.ndarray:
     )
     delta = p1 - p2
     dist = float(np.linalg.norm(delta))
+    v1_ok = a.get("vx") is not None or a.get("vy") is not None
+    v2_ok = b.get("vx") is not None or b.get("vy") is not None
     n1 = float(np.linalg.norm(v1)) + 1e-8
     n2 = float(np.linalg.norm(v2)) + 1e-8
-    cos_vel = float(np.dot(v1, v2) / (n1 * n2))
+    cos_vel = float(np.dot(v1, v2) / (n1 * n2)) if (v1_ok and v2_ok) else 0.0
+    dv_mag = abs(n1 - n2) / 1e3 if (v1_ok and v2_ok) else 0.0
     az1, az2 = math.atan2(p1[1], p1[0]), math.atan2(p2[1], p2[0])
     az_diff = abs(az1 - az2)
     if az_diff > math.pi:
@@ -140,7 +143,7 @@ def relative_feature_vec(a: Dict, b: Dict) -> np.ndarray:
             delta[1] / 1e5,
             delta[2] / 1e5,
             dist / 1e5,
-            abs(n1 - n2) / 1e3,
+            dv_mag,
             cos_vel,
             az_diff,
             abs(el1 - el2),
@@ -172,6 +175,7 @@ def _numeric_row(item: Dict, role_is_track: bool) -> np.ndarray:
             min(_as_float(item.get("age"), 0.0), 20.0) / 20.0 if role_is_track else 0.0,
             min(_as_float(item.get("hits"), 0.0), 20.0) / 20.0 if role_is_track else 0.0,
             _as_float(item.get("_dt"), 0.0),
+            1.0 if get_mode_3a(item) is not None else 0.0,
         ],
         dtype=np.float32,
     )
@@ -234,15 +238,21 @@ class AssociationTransformerV8(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
-    def _featurize(self, items: Sequence[Dict], role: int, device: torch.device):
+    def _role_id(self, role) -> int:
+        if isinstance(role, str):
+            return 1 if role.lower() in ("track", "tracks") else 0
+        return 1 if int(role) == 1 else 0
+
+    def _featurize(self, items: Sequence[Dict], role, device: torch.device):
         n = len(items)
         numeric = np.zeros((n, NUMERIC_DIM), dtype=np.float32)
-        roles = np.full((n,), role, dtype=np.int64)
+        role_id = self._role_id(role)
+        roles = np.full((n,), role_id, dtype=np.int64)
         types = np.zeros((n,), dtype=np.int64)
         sensors = np.zeros((n,), dtype=np.int64)
         m3a = np.zeros((n,), dtype=np.int64)
         ms = np.zeros((n,), dtype=np.int64)
-        role_is_track = role == 1
+        role_is_track = role_id == 1
         for i, raw in enumerate(items):
             if not isinstance(raw, dict):
                 raw = {}
@@ -270,7 +280,8 @@ class AssociationTransformerV8(nn.Module):
             torch.from_numpy(ms).to(device),
         )
 
-    def encode(self, items: Sequence[Dict], role: int) -> torch.Tensor:
+    def encode(self, items: Sequence[Dict], role: str | int = "meas") -> torch.Tensor:
+        """(N, d_model) contextualized tokens. role in {track, meas}."""
         if not items:
             device = next(self.parameters()).device
             return torch.zeros((0, self.hidden_dim), device=device)
@@ -291,16 +302,34 @@ class AssociationTransformerV8(nn.Module):
     def _pair_logits(self, h_left: torch.Tensor, h_right: torch.Tensor, rel: torch.Tensor) -> torch.Tensor:
         return self.score_head(torch.cat([h_left, h_right, rel], dim=-1)).squeeze(-1)
 
-    def score_pairs(self, items: Sequence[Dict], pair_index: torch.Tensor) -> torch.Tensor:
-        """Return (P,) logits for pairs among a single set (clustering)."""
-        if pair_index.numel() == 0:
+    def score_pairs(
+        self,
+        left: Sequence[Dict],
+        right: Optional[Sequence[Dict]] = None,
+        pair_index: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """(P,) logits for gated pairs. Used by _spatial_cluster.
+
+        Accepts the design signature ``score_pairs(left, right, pair_index)``
+        and the clustering shorthand ``score_pairs(items, pair_index)``.
+        """
+        if pair_index is None and torch.is_tensor(right):
+            pair_index = right
+            right = left
+        if right is None:
+            right = left
+        if pair_index is None or pair_index.numel() == 0:
             return torch.zeros(0, device=next(self.parameters()).device)
-        h = self.encode(items, role=0)
+        same = left is right
+        h_l = self.encode(left, role="meas")
+        h_r = h_l if same else self.encode(right, role="meas")
         ii = pair_index[:, 0].long()
         jj = pair_index[:, 1].long()
-        rel_np = np.stack([relative_feature_vec(items[int(i)], items[int(j)]) for i, j in zip(ii.tolist(), jj.tolist())])
-        rel = torch.from_numpy(rel_np).to(h.device)
-        return self._pair_logits(h[ii], h[jj], rel)
+        rel_np = np.stack(
+            [relative_feature_vec(left[int(i)], right[int(j)]) for i, j in zip(ii.tolist(), jj.tolist())]
+        )
+        rel = torch.from_numpy(rel_np).to(h_l.device)
+        return self._pair_logits(h_l[ii], h_r[jj], rel)
 
     def score_assignment(
         self,
@@ -315,11 +344,11 @@ class AssociationTransformerV8(nn.Module):
         t_n, m_n = len(tracks), len(metas)
         if t_n == 0:
             return torch.zeros((0, m_n), device=device), torch.zeros((0,), device=device)
-        h_t = self.encode(tracks, role=1)
+        h_t = self.encode(tracks, role="track")
         dust = self.dustbin_head(h_t).squeeze(-1)
         if m_n == 0:
             return torch.zeros((t_n, 0), device=device), dust
-        h_m = self.encode(metas, role=0)
+        h_m = self.encode(metas, role="meas")
         rel_np = np.zeros((t_n, m_n, REL_DIM), dtype=np.float32)
         for i, tr in enumerate(tracks):
             for j, meta in enumerate(metas):
@@ -339,8 +368,12 @@ def load_v8(path: str | Path, device: Optional[torch.device] = None, **kwargs) -
     cfg = {}
     state = ckpt
     if isinstance(ckpt, dict):
-        cfg = ckpt.get("config") or {}
+        cfg = dict(ckpt.get("config") or {})
         state = ckpt.get("model_state_dict", ckpt)
+    if "d_model" in cfg and "hidden_dim" not in cfg:
+        cfg["hidden_dim"] = cfg.pop("d_model")
+    if "nhead" in cfg and "num_heads" not in cfg:
+        cfg["num_heads"] = cfg.pop("nhead")
     cfg = {k: v for k, v in cfg.items() if k in {"hidden_dim", "num_heads", "num_layers", "dropout", "use_self_attn"}}
     cfg.update(kwargs)
     model = AssociationTransformerV8(**cfg).to(device)

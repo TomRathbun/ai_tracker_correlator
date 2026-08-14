@@ -49,6 +49,15 @@ def test_relative_identity_flags():
     c = _meas(100, 0, tid=2, mode_3a="2200")
     rel2 = relative_feature_vec(a, c)
     assert rel2[9] == -1.0
+    stream = {"x": 0.0, "y": 0.0, "z": 0.0, "mode3a": "1200"}
+    rel_alias = relative_feature_vec(a, stream)
+    assert rel_alias[9] == 1.0
+    # missing vel must not produce a fake cosine match
+    d = {"x": 0.0, "y": 0.0, "z": 0.0}
+    e = {"x": 10.0, "y": 0.0, "z": 0.0}
+    rel_miss = relative_feature_vec(d, e)
+    assert rel_miss[5] == 0.0
+    print("test_relative_identity_flags PASSED")
 
 
 def test_forward_score_pairs_and_assignment():
@@ -57,8 +66,12 @@ def test_forward_score_pairs_and_assignment():
     items = [_meas(0, 0, tid=1), _meas(150, 20, tid=1), _meas(8000, 0, tid=2)]
     idx = torch.tensor([[0, 1], [0, 2]], dtype=torch.long)
     with torch.no_grad():
-        logits = model.score_pairs(items, idx)
+        logits = model.score_pairs(items, items, idx)
     assert logits.shape == (2,)
+    # clustering shorthand still accepted
+    with torch.no_grad():
+        logits2 = model.score_pairs(items, idx)
+    assert logits2.shape == (2,)
     assert torch.isfinite(logits).all()
 
     tracks = [{"x": 0.0, "y": 0.0, "z": 1000.0, "vx": 80.0, "vy": 0.0, "vz": 0.0, "kf_t": 9.0, "age": 0, "hits": 3, "mode_3a": "1200"}]
@@ -79,9 +92,12 @@ def test_empty_sets():
     with torch.no_grad():
         empty_pairs = model.score_pairs([_meas(0, 0)], torch.zeros((0, 2), dtype=torch.long))
         S, dust = model.score_assignment([], [_meas(0, 0)])
+        S2, dust2 = model.score_assignment([{"x": 0.0, "y": 0.0, "z": 0.0, "kf_t": 0.0}], [])
     assert empty_pairs.numel() == 0
     assert S.shape[0] == 0
     assert dust.numel() == 0
+    assert S2.shape == (1, 0)
+    assert dust2.shape == (1,)
 
 
 def test_config_backend_default_mlp():

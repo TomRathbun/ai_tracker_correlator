@@ -614,7 +614,7 @@ class NewHybridUpdater(StateUpdater):
         if use_v8 and gated:
             idx = torch.tensor(gated, dtype=torch.long, device=self.device)
             with torch.no_grad():
-                logits = self.v8.score_pairs(measurements, idx)
+                logits = self.v8.score_pairs(measurements, measurements, idx)
                 probs = torch.sigmoid(logits).detach().cpu().numpy()
             for k, (i, j) in enumerate(gated):
                 v8_map[(i, j)] = float(probs[k])
