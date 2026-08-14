@@ -2,7 +2,7 @@
 
 **Status:** design only (not implemented)
 **Date:** 2026-08-14
-**Depends on:** `NewHybridUpdater` (`src/updater.py`), `SimpleKalmanFilter`, pairwise feature helpers
+**Depends on:** `NewHybridUpdater` (`src/updater.py`), `SimpleKalmanFilter`, `src/pairwise_features.py`, `src/data_schema.py`
 **Supersedes for research:** V7 pure transformer tracker (`artifacts/design_v7_transformer.md`)
 **Does not replace:** Hybrid-MLP as the default operational path
 
@@ -126,66 +126,128 @@ flowchart TD
     COAST --> OUT
 ```
 
+### Hyperparameters (v1)
+
+| Name | Value | Notes |
+|------|------:|-------|
+| `d_model` | 64 | same width as V7; plenty for scoring |
+| `nhead` | 4 | 16-d per head |
+| `num_layers` | 2 | self-attn per set |
+| `ffn_mult` | 4 | 256-d FFN |
+| `dropout` | 0.1 | |
+| `norm` | pre-norm | |
+| `activation` | GELU | |
+| `cross_attn` | off | add only after ablation 2 wins |
+| `gru` | **none** | hard constraint |
+| expected params | 150–250k | |
+
 ### Token (per track or plot)
 
-Normalize before the Linear. Do not feed raw meters.
+Normalize before the Linear. Do not feed raw meters. Build via `src/data_schema.py` helpers (`get_meas_type`, `get_mode_3a`) so stream vs batch aliases stay consistent.
 
-| Field | Scale | Notes |
-|-------|--------|-------|
-| `x,y,z` | `/ 1e5` | same as current pairwise |
-| `vx,vy,vz` | `/ 1e3`, 0 if missing | + `has_vx` / `has_vy` / `has_vz` flags |
-| `amplitude` | `/ 100`, 0 if missing | + `has_amp` |
-| `role` | embed {track, meas} | |
-| `meas_type` | embed {PSR, SSR} | tracks: SSR if they carry Mode 3A |
-| `sensor_id` | embed 0–8 | tracks: dummy id |
-| `mode_3a` | embed 12-bit squawk (0–4095), 0 = none | cue V7 dropped |
-| `mode_s` | hash → 1024 buckets | + `has_mode_s` |
-| `age`, `hits` | tracks only, clipped | 0 on measurements |
-| `dt` | seconds, track already projected | 0 inside a cluster frame |
+| Field | Dim | Scale / encoding | Notes |
+|-------|----:|------------------|-------|
+| `x,y,z` | 3 | `/ 1e5` | same as current pairwise |
+| `vx,vy,vz` | 3 | `/ 1e3`, 0 if missing | |
+| `has_vx, has_vy, has_vz` | 3 | `{0,1}` | SSR often missing vel |
+| `amplitude` | 1 | `/ 100`, 0 if missing | |
+| `has_amp` | 1 | `{0,1}` | |
+| `dt` | 1 | seconds | 0 inside a cluster frame; track already projected for assign |
+| `age` | 1 | `min(age, 30) / 30` | 0 on measurements |
+| `hits` | 1 | `min(hits, 20) / 20` | 0 on measurements |
+| `role` | `d_emb=8` | embed {track, meas} | |
+| `meas_type` | 8 | embed {PSR, SSR} | tracks: SSR if they carry Mode 3A |
+| `sensor_id` | 8 | embed 0–8 | tracks: dummy id 0 |
+| `mode_3a` | 8 | embed 12-bit squawk (0–4095), 0 = none | cue V7 dropped |
+| `has_mode_3a` | 1 | `{0,1}` | |
+| `mode_s` | 8 | hash → 1024 buckets | |
+| `has_mode_s` | 1 | `{0,1}` | |
 
-Capacity: hidden 64, 4 heads, 2 encoder layers, GELU, pre-norm, dropout 0.1. **No GRU.** Roughly 150–250k params.
+Numeric block is 15-d. Concatenate embeddings after a `Linear(15, d_model)` and add the four embeds (role / type / sensor / ids). Missing identity must be a dedicated pad index, never squawk `0000`.
 
 ### Relative pair features `rel_ij`
 
 Always concatenated into the score head. Reuse and extend `src/pairwise_features.py`:
 
 ```
-dx, dy, dz, dist/1e5,
-dv_mag/1e3, cos_vel,
-d_az, d_el,
-dt,
-mode_3a_match ∈ {+1, 0, −1},
-mode_s_match  ∈ {+1, 0, −1},
-same_sensor   ∈ {0, 1}
+dx, dy, dz, dist/1e5,          # 4
+dv_mag/1e3, cos_vel,           # 2  (cos_vel = 0 if either vel missing)
+d_az, d_el,                    # 2
+dt,                            # 1
+mode_3a_match ∈ {+1, 0, −1},  # 1
+mode_s_match  ∈ {+1, 0, −1},  # 1
+same_sensor   ∈ {0, 1}         # 1
+                               # — 12-d total
 ```
 
+Match convention matches today's SSR-ANY features: `+1` both present and equal, `−1` both present and unequal, `0` either missing.
+
 The transformer sees *context* (nearby tracks, co-located PSR/SSR). The MLP head still sees the physics features Hybrid already uses. That is the inductive bias V7 promised and never built.
+
+### Score heads
+
+```
+h_i, h_j  ∈ R^{64}
+rel_ij    ∈ R^{12}
+S[i,j]    = MLP_score([h_i ; h_j ; rel_ij])     # 140 → 64 → 1, no sigmoid in the module
+dustbin[i]= MLP_dust(h_i)                       # 64 → 32 → 1
+```
+
+Return **logits**. Callers apply `sigmoid`.
 
 ### Dustbin
 
 Every track (and, for clustering leftovers, every unmatched plot) gets an unmatched score. Softmax over competitors is **not** required at inference. Hungarian gets an extra column:
 
 ```python
-cost[i, j]     = 1 - sigmoid(S[i, j])
-cost[i, dust]  = 1 - sigmoid(dustbin[i])
+cost[i, j]     = 1.0 - sigmoid(S[i, j])
+cost[i, dust]  = 1.0 - sigmoid(dustbin[i])
 row, col = linear_sum_assignment(cost)
-keep if col[k] != dust and cost < 1 - tau
+keep if col[k] != dust and cost[row, col] < 1.0 - tau
 ```
 
 A coasting track in a radar shadow can choose dustbin. That column is what V7's forced-nearest-neighbor mask destroyed.
+
+Default `tau` = current Hybrid association threshold (`PairwiseConfig.ssr_any_threshold` / `psr_psr_threshold`, typically 0.35–0.50). Do not invent a new one until Sweden says so.
 
 ### Two call signatures (same weights)
 
 ```python
 class AssociationTransformerV8(nn.Module):
-    def score_pairs(self, left, right, pair_index) -> Tensor:
+    def __init__(self, d_model: int = 64, nhead: int = 4, num_layers: int = 2):
+        ...
+
+    def encode(self, items: list[dict], role: str) -> Tensor:
+        """(N, d_model) contextualized tokens. role in {track, meas}."""
+
+    def score_pairs(
+        self,
+        left: list[dict],
+        right: list[dict],
+        pair_index: Tensor,   # (P, 2) int64
+    ) -> Tensor:
         """(P,) logits for gated pairs. Used by _spatial_cluster."""
 
-    def score_assignment(self, tracks, metas) -> tuple[Tensor, Tensor]:
+    def score_assignment(
+        self,
+        tracks: list[dict],
+        metas: list[dict],
+    ) -> tuple[Tensor, Tensor]:
         """S: (T, M) logits, dustbin: (T,) logits. Used by _associate."""
 ```
 
 Clustering stays local (2 km, usually tiny cliques). Association is the set problem (tens of tracks × tens of metas). One encoder, two heads sharing `h`.
+
+### Empty / degenerate inputs (must not crash Hybrid)
+
+| Case | `score_pairs` | `score_assignment` |
+|------|---------------|--------------------|
+| `P = 0` pairs | return empty `(0,)` | n/a |
+| `T = 0` tracks | n/a | skip Hungarian; all metas initiate |
+| `M = 0` metas | n/a | all tracks → dustbin / coast |
+| `T = 1, M = 1` | works | 1×1 + dustbin column |
+
+No padding tricks required at inference: each Hybrid call is one ungated-out set, typically `N < 80`. Training may pad windows to a max (`T_max=64`, `M_max=128`) with a key-padding mask on self-attn. Masked tokens must not appear in `rel_ij` positives.
 
 ## Time: Hybrid already solved it
 
@@ -209,9 +271,10 @@ Hard gates stay in front of the net. V8 never scores a 50 km pair. That was V7's
 backend = getattr(config.pairwise, "backend", "mlp")
 if backend in ("transformer", "ensemble"):
     self.v8 = AssociationTransformerV8()
-    state = torch.load(config.pairwise.v8_model_path, map_location=self.device, weights_only=True)
+    raw = torch.load(config.pairwise.v8_model_path, map_location=self.device, weights_only=True)
+    state = raw["model_state_dict"] if isinstance(raw, dict) and "model_state_dict" in raw else raw
     self.v8.load_state_dict(state)
-    self.v8.eval()
+    self.v8.to(self.device).eval()
 else:
     self.v8 = None
 # always load existing MLPs so ensemble / fallback works
@@ -241,7 +304,7 @@ row, col = linear_sum_assignment(cost)
 valid = (col < M) & (cost[row, col] < 1.0 - tau)
 ```
 
-Unmatched metas still initiate exactly as they do now. The KF update path is untouched.
+Unmatched metas still initiate exactly as they do now. The KF update path is untouched. If the checkpoint is missing and `backend != mlp`, log a warning and fall back to MLP — do not crash eval.
 
 ## Training
 
@@ -269,7 +332,7 @@ L =  focal_BCE(S[pos], 1)                 # true pairs
   +  0.1 * entropy(row-softmax(S|dust))   # peaked, optional
 ```
 
-No MSE-to-logit-4.0. No cardinality-on-track-count. Pos weight from class balance, same trick as the current pairwise trainer.
+No MSE-to-logit-4.0. No cardinality-on-track-count. Pos weight from class balance, same trick as the current pairwise trainer. Cap negatives at ~8× positives per window so easy far pairs do not dominate.
 
 ### Loop
 
@@ -280,9 +343,22 @@ uv run python -m src.train_associator_v8 \
   --out checkpoints/model_v8_assoc.pt
 ```
 
-AdamW `1e-3`, batch of 8–16 windows (set context), not 512 independent pairs only.
+AdamW `1e-3`, weight decay `1e-4`, batch of 8–16 windows (set context), not 512 independent pairs only. Clip grad-norm 1.0. Cosine decay optional.
 
 Curriculum if needed: freeze encoder, train score head as a pairwise MLP on `rel_ij` only (should match current pairwise F1), then unfreeze self-attn.
+
+### Checkpoint format
+
+```python
+{
+  "model_state_dict": ...,
+  "config": {"d_model": 64, "nhead": 4, "num_layers": 2},
+  "metrics": {"val_pair_f1": ..., "val_assign_acc": ...},
+  "schema_version": 1,
+}
+```
+
+Do not require optimizer state to load for eval.
 
 ## Forbidden (how V7 died)
 
@@ -310,6 +386,15 @@ Treat these as hard constraints.
 | `run_cli.py` | `--assoc {mlp,transformer,ensemble}` |
 
 No `src/model_v8.py` GAT alias. No factory key `v8`.
+
+Suggested unit tests (`tests/test_v8_associator.py`) before any training run:
+
+- `rel_ij` Mode 3A match ∈ `{+1,0,−1}` on known pairs
+- `score_pairs` empty `pair_index` returns `(0,)`
+- `score_assignment` with `T=0` / `M=0` does not raise
+- Hungarian dustbin column lets a lone track go unmatched
+- Token builder uses `get_mode_3a` (stream `mode3a` alias works)
+- Missing vel → `has_v*=0` and `cos_vel=0`, not a fake 0-vector match
 
 ## Eval — beat Hybrid on the same contract
 
@@ -351,9 +436,29 @@ Also run Sweden holdout. Hybrid was tuned on sim; V8 only earns its keep if it g
 
 Step 2 is the kill-switch. If a randomly-initialized V8 with `rel_ij` cannot approximate the current MLPs, the drop-in is not actually a drop-in.
 
+## Risks and rollback
+
+| Risk | Symptom | Rollback |
+|------|---------|----------|
+| Token scale wrong | MOTA crash after first trained ckpt | keep `backend=mlp` (default) |
+| Dustbin too greedy | recall drop, extra coasts | disable dust column; use Hybrid τ only |
+| Dustbin too timid | ID switches > 0 | raise τ; check Hungarian column wiring |
+| Self-attn overfits sim | Sweden holdout worse than Hybrid | ship ensemble or stay on MLP |
+| Missing ckpt | eval crash | updater falls back to MLP + warning |
+
+Default CLI path stays `backend=mlp`. A bad V8 cannot silently replace Hybrid.
+
 ## Non-goals
 
 - Replacing Hybrid as the default CLI path.
 - End-to-end residual tracking (V7).
 - Learned continuous-time filter / KalmanNet.
 - Production hybrid handoff until Sweden holdout matches or beats Hybrid-MLP.
+- Multiplayer / server-side association. Single-process Hybrid loop only.
+
+## Open questions (do not block step 1–2)
+
+1. One shared encoder vs. separate track/meas stacks. Start shared + role embed.
+2. Whether PSR-PSR and SSR-ANY need two score heads. Start one head + `meas_type` embed; split only if pair-F1 lags the current dual MLPs.
+3. Sinkhorn (SuperGlue) vs. plain Hungarian. Hungarian first — Hybrid already depends on it.
+4. Train on Sweden streams from day one, or sim first then fine-tune. Sim first so the kill-switch is cheap.
