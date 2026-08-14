@@ -1,6 +1,7 @@
 # V8 Design: Transformer Associator + Hybrid KF
 
-**Status:** design only (not implemented)
+**Status:** scaffolding on `main` (untrained). Hybrid-MLP remains the default CLI path.
+**Implemented:** `src/model_v8_associator.py`, `src/train_associator_v8.py`, Hybrid backend dispatch in `src/updater.py`, `--assoc` on `run_cli.py`, `scripts/eval_v8_hybrid.py`, `tests/test_v8_associator.py`
 **Date:** 2026-08-14
 **Depends on:** `NewHybridUpdater` (`src/updater.py`), `SimpleKalmanFilter`, `src/pairwise_features.py`, `src/data_schema.py`
 **Supersedes for research:** V7 pure transformer tracker (`artifacts/design_v7_transformer.md`)

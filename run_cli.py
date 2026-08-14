@@ -57,6 +57,11 @@ def run_cli():
     # Core arguments
     parser.add_argument("--data", type=str, default="data/sim_hetero_001.jsonl", help="Dataset path")
     parser.add_argument("--mode", type=str, choices=["gnn", "kalman", "hybrid", "train"], default="hybrid", help="Operation mode (updater type or train)")
+    parser.add_argument("--assoc", type=str, choices=["mlp", "transformer", "ensemble"], default="mlp",
+                        help="Hybrid association backend (mlp=current pairwise, transformer=V8)")
+    parser.add_argument("--v8-model-path", type=str, default="checkpoints/model_v8_assoc.pt",
+                        help="Path to V8 associator checkpoint")
+    parser.add_argument("--dustbin", action="store_true", help="Enable V8 unmatched/dustbin column in Hungarian")
     parser.add_argument("--arch", type=str, default="gnn_hybrid", help="Architecture tag")
     parser.add_argument("--model", type=str, default="v4", help="Model architecture version to train/eval")
     parser.add_argument("--val-only", action="store_true", help="Only evaluate on validation split (frames 240-300)")
@@ -256,6 +261,9 @@ def run_cli():
     config = PipelineConfig()
     config.state_updater.type = args.mode
     config.state_updater.gnn_model_path = args.gnn_model_path
+    config.pairwise.backend = args.assoc
+    config.pairwise.v8_model_path = Path(args.v8_model_path)
+    config.pairwise.use_dustbin = bool(args.dustbin)
     config.track_manager.min_hits = args.min_hits
     config.track_manager.max_age = args.max_age
     config.state_updater.del_age = args.max_age

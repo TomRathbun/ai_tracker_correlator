@@ -395,6 +395,9 @@ class NewHybridUpdater(StateUpdater):
         self.thr = getattr(config.track_manager, 'association_threshold', 0.35)
         
         pw = getattr(config, 'pairwise', None)
+        self.assoc_backend = str(getattr(pw, 'backend', 'mlp') or 'mlp').lower()
+        self.use_dustbin = bool(getattr(pw, 'use_dustbin', False)) if pw else False
+        self.v8 = None
         psr_path = str(getattr(pw, 'psr_model_path', 'checkpoints/pairwise_psr_psr.pt')) if pw else 'checkpoints/pairwise_psr_psr.pt'
         ssr_path = str(getattr(pw, 'ssr_model_path', 'checkpoints/pairwise_ssr_any.pt')) if pw else 'checkpoints/pairwise_ssr_any.pt'
         
@@ -415,6 +418,21 @@ class NewHybridUpdater(StateUpdater):
             logging.info("NewHybridUpdater: Loaded dual association classifiers")
         except Exception as e:
             raise RuntimeError(f"CRITICAL: NewHybridUpdater failed to load classifiers: {e}")
+
+        if self.assoc_backend in ("transformer", "ensemble"):
+            self._load_v8(pw)
+
+    def _load_v8(self, pw) -> None:
+        from src.model_v8_associator import load_v8
+        path = str(getattr(pw, "v8_model_path", "checkpoints/model_v8_assoc.pt")) if pw else "checkpoints/model_v8_assoc.pt"
+        try:
+            self.v8 = load_v8(path, device=self.device)
+            logging.info("NewHybridUpdater: Loaded V8 associator from %s", path)
+        except Exception as exc:
+            logging.warning("V8 associator not loaded (%s); falling back to MLP scoring", exc)
+            self.v8 = None
+            if self.assoc_backend == "transformer":
+                self.assoc_backend = "mlp"
 
     def update(self, measurements: List[Dict], tracks: List[Dict], dt: float = 1.0, frame_t: float = None) -> List[Dict]:
         if not measurements:
@@ -573,21 +591,43 @@ class NewHybridUpdater(StateUpdater):
             else:
                 ssr_pairs.append((i, j, compute_ssr_any_features(m1n, m2n)))
 
-        # Batch PSR-PSR
-        if psr_pairs and self.psr_classifier:
-            feats = torch.from_numpy(np.array([p[2] for p in psr_pairs])).float().to(self.device)
+        gated = [(i, j) for (i, j, _) in psr_pairs + ssr_pairs]
+        mlp_map = {}
+        v8_map = {}
+        use_v8 = self.v8 is not None and self.assoc_backend in ("transformer", "ensemble")
+        use_mlp = self.assoc_backend in ("mlp", "ensemble") or not use_v8
+
+        if use_mlp:
+            if psr_pairs and self.psr_classifier:
+                feats = torch.from_numpy(np.array([p[2] for p in psr_pairs])).float().to(self.device)
+                with torch.no_grad():
+                    probs = torch.sigmoid(self.psr_classifier(feats)).cpu().numpy()
+                for (i, j, _), p in zip(psr_pairs, probs):
+                    mlp_map[(i, j)] = float(p)
+            if ssr_pairs and self.ssr_classifier:
+                feats = torch.from_numpy(np.array([p[2] for p in ssr_pairs])).float().to(self.device)
+                with torch.no_grad():
+                    probs = torch.sigmoid(self.ssr_classifier(feats)).cpu().numpy()
+                for (i, j, _), p in zip(ssr_pairs, probs):
+                    mlp_map[(i, j)] = float(p)
+
+        if use_v8 and gated:
+            idx = torch.tensor(gated, dtype=torch.long, device=self.device)
             with torch.no_grad():
-                probs = torch.sigmoid(self.psr_classifier(feats)).cpu().numpy()
-            for (i, j, _), p in zip(psr_pairs, probs):
-                if p > 0.5: adj[i, j] = adj[j, i] = 1
-        
-        # Batch SSR-ANY
-        if ssr_pairs and self.ssr_classifier:
-            feats = torch.from_numpy(np.array([p[2] for p in ssr_pairs])).float().to(self.device)
-            with torch.no_grad():
-                probs = torch.sigmoid(self.ssr_classifier(feats)).cpu().numpy()
-            for (i, j, _), p in zip(ssr_pairs, probs):
-                if p > 0.5: adj[i, j] = adj[j, i] = 1
+                logits = self.v8.score_pairs(measurements, idx)
+                probs = torch.sigmoid(logits).detach().cpu().numpy()
+            for k, (i, j) in enumerate(gated):
+                v8_map[(i, j)] = float(probs[k])
+
+        for i, j in gated:
+            if self.assoc_backend == "transformer" and use_v8:
+                p = v8_map.get((i, j), 0.0)
+            elif self.assoc_backend == "ensemble" and use_v8:
+                p = 0.5 * mlp_map.get((i, j), 0.0) + 0.5 * v8_map.get((i, j), 0.0)
+            else:
+                p = mlp_map.get((i, j), 0.0)
+            if p > 0.5:
+                adj[i, j] = adj[j, i] = 1
                 
         n_comp, labels = connected_components(csr_matrix(adj))
         meta = []
@@ -626,8 +666,11 @@ class NewHybridUpdater(StateUpdater):
     def _associate(self, tracks: List[Dict], meta: List[Dict]) -> Tuple[np.ndarray, np.ndarray]:
         if not tracks or not meta: return np.array([]), np.array([])
         from src.pairwise_features import compute_psr_psr_features, compute_ssr_any_features
+        from src.model_v8_associator import project_track_to_time
         
-        costs = np.ones((len(tracks), len(meta)))
+        T, M = len(tracks), len(meta)
+        costs = np.ones((T, M))
+        gated = []
         
         # Collect all pairs for batch
         psr_pairs = []
@@ -639,36 +682,60 @@ class NewHybridUpdater(StateUpdater):
                 t2 = 'SSR' if m.get('mode_3a') else 'PSR'
                 
                 # Temporarily predict track state EXACTLY to measurement time for distance check
-                tmp_t = dict(t)
-                if 't' in m:
-                    dt = m['t'] - t.get('kf_t', m['t'])
-                    if dt > 0:
-                        tmp_t['x'] += t.get('vx', 0) * dt
-                        tmp_t['y'] += t.get('vy', 0) * dt
-                        tmp_t['z'] += t.get('vz', 0) * dt
+                tmp_t = project_track_to_time(t, m.get('t'))
                         
                 dist = np.sqrt((tmp_t['x']-m['x'])**2 + (tmp_t['y']-m['y'])**2)
                 
                 if dist < 8000.0:
+                    gated.append((i, j))
                     if t1 == 'PSR' and t2 == 'PSR':
                         psr_pairs.append((i, j, compute_psr_psr_features(tmp_t, m)))
                     else:
                         ssr_pairs.append((i, j, compute_ssr_any_features(tmp_t, m)))
 
-        # Batch inference
-        if psr_pairs and self.psr_classifier:
-            feats = torch.from_numpy(np.array([p[2] for p in psr_pairs])).float().to(self.device)
+        use_v8 = self.v8 is not None and self.assoc_backend in ("transformer", "ensemble")
+        use_mlp = self.assoc_backend in ("mlp", "ensemble") or not use_v8
+
+        mlp_p = np.zeros((T, M), dtype=np.float32)
+        if use_mlp:
+            if psr_pairs and self.psr_classifier:
+                feats = torch.from_numpy(np.array([p[2] for p in psr_pairs])).float().to(self.device)
+                with torch.no_grad():
+                    probs = torch.sigmoid(self.psr_classifier(feats)).cpu().numpy()
+                for (i, j, _), p in zip(psr_pairs, probs):
+                    mlp_p[i, j] = float(p)
+            if ssr_pairs and self.ssr_classifier:
+                feats = torch.from_numpy(np.array([p[2] for p in ssr_pairs])).float().to(self.device)
+                with torch.no_grad():
+                    probs = torch.sigmoid(self.ssr_classifier(feats)).cpu().numpy()
+                for (i, j, _), p in zip(ssr_pairs, probs):
+                    mlp_p[i, j] = float(p)
+
+        v8_p = np.zeros((T, M), dtype=np.float32)
+        dust_p = np.zeros((T,), dtype=np.float32)
+        if use_v8:
             with torch.no_grad():
-                probs = torch.sigmoid(self.psr_classifier(feats)).cpu().numpy()
-            for (i, j, _), p in zip(psr_pairs, probs):
-                costs[i, j] = 1.0 - p
-                
-        if ssr_pairs and self.ssr_classifier:
-            feats = torch.from_numpy(np.array([p[2] for p in ssr_pairs])).float().to(self.device)
-            with torch.no_grad():
-                probs = torch.sigmoid(self.ssr_classifier(feats)).cpu().numpy()
-            for (i, j, _), p in zip(ssr_pairs, probs):
-                costs[i, j] = 1.0 - p
+                S, dust = self.v8.score_assignment(tracks, meta)
+                v8_p = torch.sigmoid(S).detach().cpu().numpy()
+                dust_p = torch.sigmoid(dust).detach().cpu().numpy()
+
+        if use_v8 and self.use_dustbin and self.assoc_backend == "transformer":
+            cost = np.ones((T, M + 1), dtype=np.float64)
+            for i, j in gated:
+                cost[i, j] = 1.0 - float(v8_p[i, j])
+            cost[:, M] = 1.0 - dust_p
+            row, col = linear_sum_assignment(cost)
+            valid = (col < M) & (cost[row, col] < 1.0)
+            return row[valid], col[valid]
+
+        for i, j in gated:
+            if self.assoc_backend == "transformer" and use_v8:
+                p = float(v8_p[i, j])
+            elif self.assoc_backend == "ensemble" and use_v8:
+                p = 0.5 * float(mlp_p[i, j]) + 0.5 * float(v8_p[i, j])
+            else:
+                p = float(mlp_p[i, j])
+            costs[i, j] = 1.0 - p
                     
         row, col = linear_sum_assignment(costs)
         # Match hybrid_tracker.py logic: In temporal mode, accept any match within 8km gate

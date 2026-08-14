@@ -63,15 +63,21 @@ For batch processing and scripting, use the `run_cli.py` interface.
 # Run the Hybrid tracker on default data
 uv run run_cli.py --mode hybrid --arch gnn_hybrid
 
+# Hybrid + V8 transformer associator (after training checkpoints/model_v8_assoc.pt)
+uv run run_cli.py --mode hybrid --assoc transformer --data data/stream_radar_001.jsonl
+
 # Run the GNN baseline with custom parameters
 uv run run_cli.py --mode gnn --arch gnn_only --run-name "GNN_Test_01" --threshold 0.45
 ```
 
 **Key Arguments:**
 - `--mode`: `gnn`, `kalman`, or `hybrid`
+- `--assoc`: Hybrid scoring backend — `mlp` (default), `transformer` (V8), or `ensemble`
 - `--arch`: Archive tag for MLflow categorization
 - `--data`: Path to dataset (JSONL)
 - `--no-mlflow`: Disable experiment logging
+
+V8 is a **drop-in associator** inside Hybrid (not a replacement tracker). See [`artifacts/design_v8.md`](artifacts/design_v8.md). Train with `uv run python -m src.train_associator_v8 --data data/sim_hetero_001.jsonl`.
 
 ### 📈 Experiment Tracking (MLflow)
 All experiments are automatically logged to **MLflow**.
@@ -88,6 +94,7 @@ Open [http://localhost:5000](http://localhost:5000) to compare MOTA, Precision, 
 uv run scripts/train_hetero_pairwise.py
 uv run scripts/train_clutter_filter.py
 uv run scripts/train_gnn_tracker.py
+uv run python -m src.train_associator_v8 --data data/sim_hetero_001.jsonl
 ```
 
 ### Hyperparameter Optimization

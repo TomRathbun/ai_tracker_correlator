@@ -17,6 +17,10 @@ class ClutterFilterConfig(BaseModel):
 
 class PairwiseConfig(BaseModel):
     """Configuration for pairwise association classifiers."""
+    backend: Literal["mlp", "transformer", "ensemble"] = "mlp"
+    v8_model_path: Optional[Path] = Path("checkpoints/model_v8_assoc.pt")
+    use_dustbin: bool = False
+    use_self_attn: bool = True
     psr_psr_threshold: float = Field(0.35, ge=0.0, le=1.0)
     ssr_any_threshold: float = Field(0.5, ge=0.0, le=1.0)
     psr_model_path: Optional[Path] = Path("checkpoints/pairwise_psr_psr.pt")
