@@ -86,6 +86,40 @@ flowchart TD
 4. **Asynchronous Update (Continuous-Time Kalman Filter):** Matched tracks take a mathematical step forward using precisely `dt = meas_t - track_last_t`. The Kalman Filter optimally balances its continuous-time prediction against the new measurement via Process Noise ($Q$) and Measurement Noise ($R$). The updated track is stored natively at `meas_t`. 
 5. **Initiation:** Any measurements left unmatched are assumed to be new aircraft and spawn a brand-new track with a highly uncertain initial Kalman covariance ($P$).
 
+### V8 drop-in scorer (same Hybrid, different pair net)
+
+V8 does **not** replace this flowchart. It replaces only the two “Pairwise ML Classifiers” diamonds (`score_pairs` on the 2 km cluster, `score_assignment` on the 8 km assign). Kalman, Hungarian, gates, and M/N stay.
+
+```mermaid
+flowchart LR
+    subgraph Tokens
+        T["Track tokens<br/>projected KF state"]
+        M["Plot / meta tokens"]
+    end
+    subgraph Encode
+        N["15-d numeric → Linear 64<br/>+ 5 embeds: role type sensor Mode-3A Mode-S"]
+        SA_T["Self-attn tracks<br/>2 × 4-head d=64"]
+        SA_M["Self-attn plots<br/>same weights, no cross-attn"]
+    end
+    subgraph Head
+        REL["rel_ij 12-d<br/>geometry · identity · same radar"]
+        SP["score_pairs → cluster logit"]
+        SA["score_assignment → S + dustbin"]
+    end
+    T --> N
+    M --> N
+    N --> SA_T
+    N --> SA_M
+    SA_T --> SP
+    SA_M --> SP
+    SA_T --> SA
+    SA_M --> SA
+    REL --> SP
+    REL --> SA
+```
+
+See `artifacts/architecture_hybrid_v8.png` (Figure 1 in the progress report).
+
 ---
 
 ## 3. GNN Tracker Architecture (`RecurrentGATTrackerV3`)

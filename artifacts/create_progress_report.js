@@ -142,6 +142,7 @@ function img(relPath, maxW, maxH, alt) {
   // Natural sizes known from inspection; keep aspect.
   const natives = {
     "artifacts/tracking_visualization.png": [1600, 900],
+    "artifacts/architecture_hybrid_v8.png": [2412, 1728],
     "artifacts/tracks_sweden_30min_holdout.png": [1960, 980],
     "artifacts/tracks_canonical_comparison.png": [2084, 1796],
   };
@@ -239,8 +240,10 @@ async function main() {
   );
   children.push(
     p("Two specialist MLPs do the learned work today. Each pair is scored alone. Hungarian and the Kalman filter never see a neural state vector. Section 4 specifies those MLPs — features, training, and the transformer that can replace or average them."),
-    img("artifacts/tracking_visualization.png", 620, 420, "Hybrid tracker simulation with confirmed tracks and trails"),
-    caption("Figure 1. Hybrid correlator on a streaming holdout: clutter, measurements, ground truth, and confirmed tracks with trails."),
+    img("artifacts/architecture_hybrid_v8.png", 640, 460, "Hybrid pipeline and V8 associator architecture"),
+    caption("Figure 1. How the model works. Top: Hybrid pipeline. Purple block is the only neural scorer — MLP, V8, ensemble, or split. Kalman, gates, Hungarian, and M/N stay classical. Bottom: V8 token path. Self-attention is within tracks and within plots; geometry stays in rel_ij. The net never predicts state or existence."),
+    img("artifacts/tracking_visualization.png", 620, 360, "Hybrid tracker simulation with confirmed tracks and trails"),
+    caption("Figure 2. Hybrid correlator on a streaming holdout: clutter, measurements, ground truth, and confirmed tracks with trails."),
   );
 
   // ----- 4. AI/ML deep dive -----
@@ -472,7 +475,7 @@ async function main() {
     caption("Table 9. Sweden holdout (tiled CAT-062 observation-model stream). Hybrid is already near the ceiling. Ensemble matches it to three decimals — V8 is not changing those decisions. Pure V8 again loses precision."),
     p("The holdout is the second half of a 6-tile pack of Sweden CAT-062 traffic, regenerated through the multi-radar observation model (see data/canonical/DATA_MANIFEST.md). Median nearest-neighbor distance is about 32 km and concurrent traffic tops out around 32 aircraft, so pairs inside the 2 km / 8 km gates are uncommon. Tiling stretches duration without adding new geometry. Treat Table 9 as a long easy-geometry run, not as a crossing study."),
     img("artifacts/tracks_sweden_30min_holdout.png", 620, 340, "Sweden 30-minute holdout track picture"),
-    caption("Figure 2. Sweden 30-minute holdout traffic used for the Hybrid / V8 / ensemble comparison."),
+    caption("Figure 3. Sweden 30-minute holdout traffic used for the Hybrid / V8 / ensemble comparison."),
     h2("6.4  Ablations on the dense stream"),
   );
   children.push(
