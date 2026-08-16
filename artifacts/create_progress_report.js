@@ -12,6 +12,7 @@ const {
 
 const ROOT = path.resolve(__dirname, "..");
 const OUT = path.join(__dirname, "Capstone_Progress_Report.docx");
+const OUT_ALT = path.join(__dirname, "Capstone_Progress_Report_AIML.docx");
 
 const NAVY = "0B3D5C";
 const STEEL = "1F4E79";
@@ -199,7 +200,7 @@ async function main() {
   children.push(
     h1("1.  Executive summary"),
     p("Today’s surveillance stack still looks like the 1990s: each radar runs its own physics tracker on one ASTERIX category (typically CAT-048 plots or CAT-062 system tracks), then a separate correlator tries to decide which of those local tracks are the same aircraft. That split creates latency, duplicate tracks, and a maintenance surface that grows with every sensor."),
-    p("This project asked whether one AI/ML system can ingest multi-sensor plots, reject clutter, associate PSR with SSR, and output a single correlated track picture. The short answer is yes — but not by handing the entire job to one network."),
+    p("This project asked whether one AI/ML system can ingest multi-sensor plots, reject clutter, associate PSR with SSR, and output a single correlated track picture. The short answer is yes — but not by handing the entire job to one network. The learned part is association. Section 4 is the deep dive on those two associators."),
     p("The working system is Hybrid: a clutter MLP, two pairwise association MLPs, Hungarian assignment, and an asynchronous Kalman filter. On the dense 120-second multi-radar stream it holds MOTA 0.865 with zero ID switches. On a 30-minute Sweden holdout it reaches MOTA 0.971. End-to-end learned trackers (GNN V3–V6 and the V7 transformer) did not. They flooded the picture with false tracks."),
     p("V8 is the course correction. It is not a new tracker. It is a transformer that scores gated pairs inside Hybrid — looking at the surrounding traffic, not just one pair in isolation. Pure V8 is not ready to ship. Averaging it with the MLP (ensemble) slightly beats Hybrid on the dense sim stream (MOTA 0.872 vs 0.865) and ties Hybrid on Sweden. That is the research result, not the operational default."),
     p("Hybrid has the best standalone numbers on the data we have. The reason to keep the transformer is the next environment: crossings, SSR dropouts, and overlapping trails where a pair looked at in isolation is ambiguous, and the set around it is not."),
@@ -238,20 +239,134 @@ async function main() {
     bullet("M/N manager. Three hits to confirm, about ten coasts through a radar shadow, then delete."),
   );
   children.push(
-    p("Two specialist MLPs do the learned work. PSR–PSR uses six kinematic features (distance, velocity cosine, speed difference, Δaz, Δel, amplitude). SSR–ANY uses four (distance, Δaz, Mode-3A match, Mode-S match). Each pair is scored alone. Hungarian and the Kalman filter never see a neural state vector."),
+    p("Two specialist MLPs do the learned work today. Each pair is scored alone. Hungarian and the Kalman filter never see a neural state vector. Section 4 specifies those MLPs — features, training, and the transformer that can replace or average them."),
     img("artifacts/tracker_simulation_holdout_2min_trails.png", 620, 420, "Hybrid tracker simulation with confirmed tracks and trails"),
     caption("Figure 1. Hybrid correlator on a streaming holdout: clutter, measurements, ground truth, and confirmed tracks with trails."),
   );
 
-  // ----- 4. MLP vs Transformer (the definition they asked for) -----
+  // ----- 4. AI/ML deep dive -----
   children.push(
-    h1("4.  MLP vs transformer: what each one actually sees"),
-    p("This distinction is the rest of the story. Both models answer the same question — “are these two things the same aircraft?” — and they live in the same Hybrid pipeline. They do not see the same world."),
-    h2("4.1  The MLP looks at one pair"),
-    p("The pairwise MLP is a specialist that never looks up from the two objects in front of it. Give it plot A and plot B (or track A and plot B). It computes a handful of hand-built features — how far apart they are, whether their velocities agree, whether the squawks match — and outputs a probability. If a third aircraft is crossing 3 km away, the MLP does not know. If six other SSR plots share a similar Mode-3A, it does not know. Isolation is why it is precise: it only fires when the pair itself looks right."),
-    h2("4.2  The transformer looks at the pair and the traffic around it"),
-    p("The V8 transformer is a set matcher, not a tracker. It turns every gated track and every gated plot into a token (position, velocity, identity embeddings, sensor, role). It runs self-attention inside the track set and inside the measurement set, so token A can change because C is nearby. Then it scores the pair with both contextual embeddings and the same kind of geometry/identity features the MLP uses."),
-    p("In a crossing, the MLP sees two close plots and may say “same.” The transformer can see that two established tracks are already claiming those plots, and that a third measurement is a better fit. That is the capability Hybrid does not have today, and the reason the transformer is still worth the research even when Hybrid wins the current scoreboard."),
+    h1("4.  The AI/ML core: pairwise MLP vs association transformer"),
+    p("Everything that is actually machine learning in the shipping system lives here. The Kalman filter, the 2 km / 8 km gates, Hungarian assignment, and the M/N track manager are classical. The learned question is only: given two gated objects, how likely are they the same aircraft? Two different networks answer that question. They share a pipeline and a loss family. They do not share a worldview."),
+    p("Say it once, then unpack it. The MLP looks at one pair. The transformer looks at that pair and the traffic around it. That is the entire AI/ML distinction that matters going forward."),
+
+    h2("4.1  What both models are allowed to do — and forbidden to do"),
+    p("Both models emit a logit. Callers apply a sigmoid to get p ∈ [0, 1]. Hybrid turns p into a graph edge (cluster if p > 0.5) or a Hungarian cost (cost = 1 − p). Neither model predicts position, velocity, existence, or a next-step residual. Neither carries hidden state across time. Time is the Kalman filter’s job. Uniqueness is Hungarian’s job. Those constraints are why V8 is an associator and V7 was a failed tracker."),
+    p("Supervision is the same label for both: track_id equality. A pair is positive if both objects share a real track_id (not clutter, not −1). The networks never see track_id as an input feature. Identity, if used, comes only from Mode-3A / Mode-S fields that an operational plot would actually carry."),
+
+    h2("4.2  Pairwise MLPs — a specialist that never looks up"),
+    h3("Job and inductive bias"),
+    p("The pairwise MLP is a feed-forward classifier on a hand-built feature vector of one pair. It is deliberately local. If aircraft C is crossing three kilometers away, or if six other SSR plots share a similar squawk, the MLP does not know. Isolation is the bias: only fire when this pair’s own kinematics and identity look right. That is why Hybrid is precise, and why it can miss a crossing that is only obvious from the rest of the set."),
+    h3("Two specialists, not one net"),
+    p("Heterogeneous radar forced a split. Primary plots have Doppler velocity and amplitude, and no reliable identity. Secondary plots have Mode-3A (12-bit squawk) and Mode-S (ICAO address), and often no velocity. A single feature vector that pretends both sides always have both kinds of information trains poorly. Hybrid therefore loads two small networks from checkpoints/pairwise_psr_psr.pt and checkpoints/pairwise_ssr_any.pt."),
+  );
+
+  children.push(
+    table(
+      ["Network", "When used", "Input dim", "Architecture"],
+      [
+        ["PSR–PSR", "Both objects are primary", "6", "6 → 64 → 32 → 1, ReLU, dropout 0.2"],
+        ["SSR–ANY", "Either object is secondary", "4", "4 → 64 → 32 → 1, ReLU, dropout 0.2"],
+      ],
+      [1800, 2800, 1400, 4080]
+    ),
+    caption("Table 1. Dual pairwise MLPs (src/pairwise_classifier.py). Each is a few thousand parameters."),
+    h3("PSR–PSR features (kinematics + amplitude)"),
+    p("Both sides are assumed to have velocity. Features are normalized so raw meters never enter the first linear layer."),
+  );
+  children.push(
+    table(
+      ["#", "Feature", "Scale / encoding", "Why it is there"],
+      [
+        ["1", "Position distance", "‖p1 − p2‖ / 1e5", "Same-aircraft plots sit inside ~2 km"],
+        ["2", "Velocity cosine", "v1·v2 / (|v1||v2|)", "Co-located PSR hits share heading"],
+        ["3", "Speed difference", "| |v1| − |v2| | / 1e3", "Rejects crossing traffic at similar range"],
+        ["4", "Azimuth separation", "wrapped |az1 − az2|", "Angular gate in radar coordinates"],
+        ["5", "Elevation separation", "|el1 − el2|", "Separates stacked traffic"],
+        ["6", "Amplitude difference", "|amp1 − amp2| / 100", "PSR-only; similar RCS / range"],
+      ],
+      [700, 2400, 2800, 4180]
+    ),
+    caption("Table 2. compute_psr_psr_features. Six numbers, one pair, no identity."),
+    h3("SSR–ANY features (geometry + identity flags)"),
+    p("Used for PSR–SSR fusion and SSR–SSR pairs. Identity is not the raw squawk. It is a three-way flag so a missing code is not confused with squawk 0000."),
+  );
+  children.push(
+    table(
+      ["#", "Feature", "Encoding", "Why it is there"],
+      [
+        ["1", "Position distance", "‖p1 − p2‖ / 1e5", "Still the spatial prior"],
+        ["2", "Azimuth separation", "wrapped |az1 − az2|", "Works when velocity is missing"],
+        ["3", "Mode-3A match", "+1 match / −1 mismatch / 0 missing", "Squawk is first-class SSR cue"],
+        ["4", "Mode-S match", "+1 / −1 / 0", "ICAO address; stronger than squawk"],
+      ],
+      [700, 2400, 3400, 3580]
+    ),
+    caption("Table 3. compute_ssr_any_features. An ablation (--no-identity-features) zeros channels 3–4 so association is kinematics-only; dimension stays 4 so pretrained weights still load."),
+    h3("How the MLP is trained"),
+    p("scripts/train_hetero_pairwise.py extracts every specialized pair in each training frame. Label is 1 if track_ids match and are not clutter. Batches are 512 independent pairs — there is no sequence and no set. Optimizer is Adam at 1e-3. Loss is binary cross-entropy with a pos_weight = n_neg / n_pos so the rare true pairs are not drowned by easy far negatives. The network never sees a third object in the same forward pass. After sigmoid, Hybrid treats p > 0.5 as a cluster edge and cost = 1 − p as a Hungarian entry."),
+    h3("What that means in a crossing"),
+    p("Two aircraft cross inside the 8 km gate. The MLP scores track A vs plot B using only (A, B). If distance is small and headings are briefly similar, p can be high even though track C is the rightful owner. Hungarian may still pick the globally cheapest assignment — but only from those independent scores. The MLP cannot say “B looks good for A until I notice C is closer and already carries this Mode-S.” That sentence requires looking around."),
+
+    h2("4.3  V8 transformer — a set matcher, not a tracker"),
+    h3("Job and inductive bias"),
+    p("AssociationTransformerV8 (src/model_v8_associator.py, ~150–250k parameters) is SuperGlue-style matching, not DETR-style tracking. It builds a token per gated track and per gated plot, contextualizes each side with self-attention, then scores pairs with an MLP head on [h_i ; h_j ; rel_ij]. The transformer is the context encoder. The last layer is still an MLP. The difference is what h_i contains: after attention, h_i knows about the other tokens on its side of the gate."),
+    h3("Token: 15 numbers plus embeddings"),
+    p("Raw meters are never fed in. Numeric features are normalized, then projected Linear(15 → 64). Six embeddings, each 64-d, are added: role (track vs measurement), type (PSR vs SSR), sensor id (0–8), Mode-3A (0–4095, pad 0 = missing), and hashed Mode-S (1024 buckets, 0 = missing). Missing identity is a dedicated pad index, never squawk 0000."),
+  );
+  children.push(
+    table(
+      ["Block", "Dim", "Scale / encoding", "Notes"],
+      [
+        ["x, y, z", "3", "/ 1e5", "Same scale as pairwise MLPs"],
+        ["vx, vy, vz", "3", "/ 1e3; 0 if missing", "SSR often has no Doppler"],
+        ["has_vx, has_vy, has_vz", "3", "{0, 1}", "Stops a missing vel looking like 0 m/s"],
+        ["amplitude, has_amp", "2", "amp / 100", "PSR cue; SSR usually missing"],
+        ["age, hits", "2", "min(·,20)/20; 0 on plots", "Track maturity; 0 on measurements"],
+        ["dt", "1", "seconds", "0 inside a cluster; track already projected for assign"],
+        ["has_mode_3a", "1", "{0, 1}", "Numeric companion to the embed"],
+      ],
+      [2400, 900, 3200, 3580]
+    ),
+    caption("Table 4. Numeric token (15-d) before Linear(15, 64). Embeddings for role, type, sensor, Mode-3A, and Mode-S are added after the projection."),
+    h3("Relative pair features rel_ij (12-d)"),
+    p("Attention is not asked to rediscover geometry. The score head always concatenates an explicit 12-d pair vector. This is the inductive bias V7 promised and never built: the transformer sees context; the head still sees physics."),
+  );
+  children.push(
+    table(
+      ["Group", "Channels", "Detail"],
+      [
+        ["Geometry", "dx, dy, dz, dist / 1e5", "Same spatial language as the MLP"],
+        ["Velocity", "Δ|v| / 1e3, cos_vel", "cos_vel = 0 if either velocity is missing — no fake 0-vector match"],
+        ["Angles", "Δaz, Δel", "Radar-native separation"],
+        ["Time", "dt", "Track already projected to meas_t"],
+        ["Identity", "Mode-3A match, Mode-S match", "+1 / 0 / −1, same convention as SSR–ANY"],
+        ["Sensor", "same_sensor ∈ {0,1}", "Two plots from one radar vs two radars"],
+      ],
+      [1800, 3600, 4680]
+    ),
+    caption("Table 5. rel_ij. The transformer is not allowed to ignore the pair geometry the MLP already uses."),
+    h3("Self-attention"),
+    p("Two pre-norm TransformerEncoder layers, d_model = 64, 4 heads (16-d each), FFN 256, GELU, dropout 0.1. Attention runs within the track set and within the measurement set separately. There is no cross-attention in v1 — rel_ij already carries the geometry between sides. Optional later: one cross-attention block after self-attention, only if an ablation shows set context without identity does nothing."),
+    p("Hard gates stay in front of the net. V8 never scores a 50 km pair. That was V7’s max_assoc_m = 50,000 mistake. Clustering is usually a tiny 2 km clique. Assignment is the set problem: tens of tracks times tens of metas, typically N < 80, no padding required at inference."),
+    h3("Two heads, two call signatures, same weights"),
+    p("score_pairs(left, right, pair_index) returns a (P,) logit vector for the gated meas–meas pairs Hybrid already enumerated. Used by _spatial_cluster."),
+    p("score_assignment(tracks, metas) returns S ∈ R^{T×M} and a dustbin vector ∈ R^T. Used by _associate. Dustbin is the unmatched score: “this track owns none of these plots.” Softmax over competitors is not required at inference. Hungarian can take an extra column cost[:, dust] = 1 − σ(dustbin). A coasting track in a radar shadow can choose that column instead of stealing a neighbor. With current weights the dustbin column is unused — the head is not calibrated — but the API is there."),
+    p("Logits leave the module unsigned. Hybrid applies sigmoid. That keeps training and eval on the same numeric scale as the MLPs."),
+    h3("How the transformer is trained"),
+    p("src/train_associator_v8.py is supervised matching, not train_streaming_v7. There is no residual loss, no existence logit, no GRU, no Hungarian-on-state. Windows are 2 s. Two tasks share weights:"),
+  );
+  children.push(
+    bullet("Cluster task. All 2 km gated plot–plot pairs in the window. Label 1 if same track_id and not clutter."),
+    bullet("Assign task. Teacher-forced “tracks” are the last plot of each live id, time-projected to each candidate. Label 1 if ids match and distance < 8 km. A track with no true in-gate plot is a dustbin positive."),
+  );
+  children.push(
+    p("Split is by track id (seed 42, 80/20), not by time, so holdout aircraft are unseen. Loss is focal BCE on positives and gated negatives, plus dustbin BCE, plus a light 0.1 entropy term so assignment rows peak. Negatives are capped at about 8× positives. Class mass is balanced inside each batch (real pos_weight), unlike the first V8 run, which used a constant α and overfit 16 sim IDs. Early-stop is on holdout pair F1, not train loss and not precision-only (precision-only produced a timid net that refused true pairs). AdamW 1e-3, weight decay 1e-4, grad clip 1.0."),
+    p("A later fine-tune on the Sweden 30-minute train stream, from the sim checkpoint, is the weight file used in ensemble eval (checkpoints/model_v8_assoc_sweden_best.pt)."),
+    h3("What that means in a crossing"),
+    p("The same two aircraft cross. After self-attention, track A’s token has mixed with track C’s token: both are live, close, and claiming plots. Plot B’s token has mixed with the other plots in the gate, including the one that actually carries C’s Mode-S. The score head then sees [h_A ; h_B ; rel_AB]. rel_AB still says “close.” h_A and h_B can now say “but C is a better owner.” The MLP cannot produce that sentence. That is the only reason to keep a transformer in a system whose Kalman filter already wins MOTA."),
+
+    h2("4.4  Side by side"),
   );
 
   const cmpW = [2200, 3940, 3940];
@@ -261,17 +376,26 @@ async function main() {
       [
         ["Question", "Same aircraft?", "Same aircraft?"],
         ["Sees", "Only this pair", "This pair and the other gated tracks / plots"],
-        ["Features", "4–6 hand numbers", "Tokens + 12-d pair geometry / identity"],
-        ["Identity", "Match flags only (+1 / 0 / −1)", "Embeds Mode-3A and hashed Mode-S"],
-        ["Specialists", "Two nets (PSR vs SSR)", "One net, type / role embeddings"],
-        ["Uniqueness", "Hungarian after the fact", "Hungarian; optional unmatched (dustbin) score"],
+        ["Forward pass", "One 4–6-d vector", "Set of tokens, then one pair head"],
+        ["Parameters", "A few thousand × 2 nets", "~180k (d=64, 2 layers, 4 heads)"],
+        ["Identity", "Match flags only", "Flags in rel_ij plus Mode-3A / Mode-S embeds"],
+        ["Specialists", "PSR–PSR and SSR–ANY", "One net, type / role embeds"],
+        ["Time", "Uses Hybrid’s projected dict", "Same — must consume tmp_t, never raw KF state"],
+        ["Training", "i.i.d. pairs, weighted BCE", "Windowed sets, focal BCE + dustbin + entropy"],
+        ["Uniqueness", "Hungarian after the fact", "Hungarian; optional dustbin column"],
         ["Strength", "High precision, 0 ID switches", "Set context in crossings and dropouts"],
-        ["Weakness", "Blind to the rest of the scene", "Can over-associate; extra false tracks"],
+        ["Weakness", "Blind to the rest of the scene", "Over-associates; extra false tracks if used alone"],
       ],
       cmpW
     ),
-    caption("Table 1. Scorer vs scorer. Both sit inside Hybrid. Neither replaces the Kalman filter."),
-    p("Ensemble is not a third architecture. It is the average of the two probabilities (0.5 MLP + 0.5 V8). The MLP vetoes reckless transformer edges; the transformer still nudges the cases where the pair alone is ambiguous. That mix is the best V8-related result we have."),
+    caption("Table 6. Both sit inside Hybrid. Neither replaces the Kalman filter. The AI/ML difference is pairwise isolation versus set context."),
+
+    h2("4.5  Ensemble and split — composing the two learners"),
+    p("Ensemble is not a third network. At each gated pair Hybrid computes p = 0.5 p_MLP + 0.5 p_V8, then uses that p exactly as it would use a single scorer. The MLP vetoes reckless transformer edges; the transformer still nudges pairs the MLP cannot see in context. On the dense stream that mix is MOTA 0.872 versus Hybrid 0.865, with zero ID switches. On Sweden it ties Hybrid. Dustbin is off on this path."),
+    p("Split scoring is the other composition: MLP owns clustering (the local 2 km clique the specialists already solve), V8 owns assignment (the set problem). That recovered most of the precision pure V8 lost, without training a new net. Raising V8’s own cluster threshold made things worse — the net under-merged PSR+SSR and started two tracks for one aircraft. The lesson for the AI/ML design is sharp: give the transformer the job that needs set context, not the job the pairwise MLP already does well."),
+
+    h2("4.6  Why this section is the project’s ML claim"),
+    p("The feasibility question was never “can a Kalman filter track an airplane.” It was whether a learned associator can replace the per-sensor CAT tracker plus correlator without breaking identity. The MLP is the learned associator that already does that, by looking at one pair at a time with physics features. The transformer is the learned associator that can look around — and, on today’s medium-geometry Sweden holdout, does not yet need to. The next hard environment (overlaps, dropouts, crossings inside the gate) is exactly the environment where looking around stops being optional."),
   );
 
   // ----- 5. Lineage -----
@@ -308,7 +432,7 @@ async function main() {
       ],
       linW
     ),
-    caption("Table 2. Lineage. The turning point is V8: the network stops owning time and identity uniqueness."),
+    caption("Table 7. Lineage. The turning point is V8: the network stops owning time and identity uniqueness."),
   );
 
   // ----- 6. Results -----
@@ -333,7 +457,7 @@ async function main() {
       ],
       resW
     ),
-    caption("Table 3. stream_radar_001. Hybrid is the first system that is actually a tracker. Ensemble is a small, honest gain on top of it."),
+    caption("Table 8. stream_radar_001. Hybrid is the first system that is actually a tracker. Ensemble is a small, honest gain on top of it."),
     h2("6.3  Sweden 30-minute holdout"),
   );
   children.push(
@@ -346,7 +470,7 @@ async function main() {
       ],
       resW
     ),
-    caption("Table 4. Sweden holdout. Hybrid is already near the ceiling. Ensemble ties it. Pure V8 again loses precision."),
+    caption("Table 9. Sweden holdout. Hybrid is already near the ceiling. Ensemble ties it. Pure V8 again loses precision."),
     img("artifacts/tracks_sweden_30min_holdout.png", 620, 340, "Sweden 30-minute holdout track picture"),
     caption("Figure 2. Sweden 30-minute holdout traffic used for the Hybrid / V8 / ensemble comparison."),
     h2("6.4  How to read this"),
@@ -470,8 +594,17 @@ async function main() {
   });
 
   const buf = await Packer.toBuffer(doc);
-  fs.writeFileSync(OUT, buf);
-  console.log("Wrote", OUT);
+  try {
+    fs.writeFileSync(OUT, buf);
+    console.log("Wrote", OUT);
+  } catch (err) {
+    if (err && err.code === "EBUSY") {
+      fs.writeFileSync(OUT_ALT, buf);
+      console.log("Original report is open in Word. Wrote", OUT_ALT);
+    } else {
+      throw err;
+    }
+  }
 }
 
 main().catch((err) => {
