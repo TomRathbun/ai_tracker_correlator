@@ -26,17 +26,29 @@ def evaluate(
     match_threshold: float = 7000.0,
     min_hits: int = 3,
     max_age: int = 10,
+    cluster_assoc: str | None = None,
+    assign_assoc: str | None = None,
+    cluster_threshold: float = 0.5,
+    assign_threshold: float = 0.0,
 ):
     cfg = PipelineConfig()
     cfg.state_updater.type = "hybrid"
     cfg.pairwise.backend = assoc
+    cfg.pairwise.cluster_backend = cluster_assoc
+    cfg.pairwise.assign_backend = assign_assoc
+    cfg.pairwise.cluster_threshold = cluster_threshold
+    cfg.pairwise.assign_threshold = assign_threshold
     cfg.pairwise.v8_model_path = Path(v8_path)
     cfg.pairwise.use_dustbin = use_dustbin
     cfg.track_manager.min_hits = min_hits
     cfg.track_manager.max_age = max_age
     cfg.clutter_filter.enabled = True
 
-    print(f"Assoc backend: {assoc}  dustbin={use_dustbin}  v8={v8_path}")
+    print(
+        f"Assoc backend: {assoc} cluster={cluster_assoc or assoc} "
+        f"assign={assign_assoc or assoc} thr_c={cluster_threshold} thr_a={assign_threshold} "
+        f"dustbin={use_dustbin}  v8={v8_path}"
+    )
     pipeline = Pipeline(cfg)
 
     measurements_all, truth_trajectories, all_track_ids = load_stream_and_truth(data_file)
@@ -81,6 +93,10 @@ def main():
     p.add_argument("--assoc", choices=["mlp", "transformer", "ensemble"], default="transformer")
     p.add_argument("--v8-model", default="checkpoints/model_v8_assoc.pt")
     p.add_argument("--dustbin", action="store_true")
+    p.add_argument("--cluster-assoc", choices=["mlp", "transformer", "ensemble"], default=None)
+    p.add_argument("--assign-assoc", choices=["mlp", "transformer", "ensemble"], default=None)
+    p.add_argument("--cluster-threshold", type=float, default=0.5)
+    p.add_argument("--assign-threshold", type=float, default=0.0)
     p.add_argument("--window", type=float, default=1.0)
     p.add_argument("--max-age", type=int, default=2)
     p.add_argument("--min-hits", type=int, default=3)
@@ -95,6 +111,10 @@ def main():
         window_size=args.window,
         max_age=args.max_age,
         min_hits=args.min_hits,
+        cluster_assoc=args.cluster_assoc,
+        assign_assoc=args.assign_assoc,
+        cluster_threshold=args.cluster_threshold,
+        assign_threshold=args.assign_threshold,
     )
 
 

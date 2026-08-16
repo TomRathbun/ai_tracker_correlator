@@ -1,11 +1,73 @@
 # V8 Design: Transformer Associator + Hybrid KF
 
-**Status:** scaffolding on `main` (untrained). Hybrid-MLP remains the default CLI path.
+**Status:** associator implemented on `main`, untrained. Hybrid-MLP remains the default CLI path.
 **Implemented:** `src/model_v8_associator.py`, `src/train_associator_v8.py`, Hybrid backend dispatch in `src/updater.py`, `--assoc` on `run_cli.py`, `scripts/eval_v8_hybrid.py`, `tests/test_v8_associator.py`
-**Date:** 2026-08-14
+**Date:** 2026-08-14 (explainer added 2026-08-16)
 **Depends on:** `NewHybridUpdater` (`src/updater.py`), `SimpleKalmanFilter`, `src/pairwise_features.py`, `src/data_schema.py`
 **Supersedes for research:** V7 pure transformer tracker (`artifacts/design_v7_transformer.md`)
 **Does not replace:** Hybrid-MLP as the default operational path
+
+## What V8 is
+
+V8 is **not a new tracker**. It is a drop-in **pair scorer** inside the existing Hybrid pipeline (`NewHybridUpdater`).
+
+Hybrid already does the operational work: reject clutter, cluster PSR+SSR from the same aircraft, assign plots to tracks, update kinematics with an async Kalman filter, and promote or delete tracks with M/N logic. Today two small pairwise MLPs answer the only learned questions: “are these two plots the same aircraft?” and “does this track own this plot?”
+
+V8 replaces **only those two scoring calls**. A small transformer looks at the gated set (nearby tracks, co-located PSR/SSR), then scores each pair with explicit geometry and Mode-3A / Mode-S match flags. Gates, Kalman, Hungarian, clutter, initiation, and coasting stay Hybrid.
+
+**One-line rule:** the net scores pairs. The Kalman filter owns state. Hungarian owns uniqueness.
+
+```
+Same Hybrid pipeline
+Clutter MLP → 2 km cluster → 8 km assign → Hungarian → async KF → M/N manager
+                 ▲                    ▲
+                 └──── only these two scorers swap (MLP ↔ V8) ────┘
+```
+
+Use `--mode hybrid --assoc transformer` after training `checkpoints/model_v8_assoc.pt`. Default remains `--assoc mlp` (Hybrid-MLP). `--assoc ensemble` averages the two scores while V8 is being proven.
+
+## Hybrid vs V8
+
+Both paths are the **same tracker**. The table is scorer-vs-scorer, not tracker-vs-tracker. V7 is listed only as the failed alternative V8 refuses to repeat.
+
+| | Hybrid-MLP (default, operational) | Hybrid + V8 |
+|---|---|---|
+| What it is | Current best tracker | Same tracker, transformer pair scorer |
+| Pipeline | Clutter → 2 km cluster → 8 km assign → Hungarian → async CV KF → M/N | **Identical** |
+| Cluster scorer | Two independent MLPs: PSR-PSR (6-d) and SSR-ANY (4-d) | `score_pairs` over the same 2 km gated pairs |
+| Assign scorer | Same MLPs → cost `1−p` → Hungarian | `score_assignment` → cost `1−p` → Hungarian, optional dustbin column |
+| Sees the rest of the set? | No — each pair is scored alone | Yes — self-attn inside the gated track set and meas set |
+| Geometry | Hand features in the MLP input | Same idea, richer 12-d `rel_ij` still concatenated into the score head |
+| Identity (Mode 3A/S) | First-class SSR-ANY channels (`+1 / 0 / −1`) | Token embeds **and** `rel_ij` match flags |
+| Time | Track projected to `meas_t` before scoring; KF uses `dt = meas_t − track_t` | **Unchanged** — V8 must consume the projected dict |
+| Motion / state | Continuous-time CV Kalman | **Unchanged** — V8 must not predict `Δs` |
+| Clutter | Dedicated clutter MLP | **Unchanged** |
+| Birth / death | Unmatched metas initiate; M/N (`min_hits=3`, `max_age≈10`) | **Unchanged** |
+| Radar shadows | KF predict (coast) | Same, plus optional dustbin so a track can refuse every plot |
+| Network job | Independent pair probability | Set-contextual pair logit + unmatched logit |
+| Forbidden | — | Residual state, existence heads, GRU, attention argmax, scoring outside the gates |
+| Size | Two tiny MLPs | ~150–250k params, `d_model=64`, 2 self-attn layers |
+| CLI | `--mode hybrid` (or `--assoc mlp`) | `--mode hybrid --assoc transformer` |
+| Status | Trained, published MOTA **0.82–0.925**, **0** ID switches | Code on `main`, **untrained** — ships only if it holds Hybrid MOTA / precision / 0 ID switches |
+| Expected win | Baseline | Recall in crossings and SSR dropouts (joint scoring), without extra false tracks |
+| Rollback | — | Leave default on MLP; missing V8 checkpoint already falls back to MLP |
+
+When to use which:
+
+- **Hybrid-MLP** — operational default. Use this unless a trained V8 checkpoint beats the bar below.
+- **Hybrid + V8** — research path. Same physics, different scorer. Not a replacement until Sweden holdout matches or beats Hybrid-MLP.
+- **Ensemble** (`0.5 p_mlp + 0.5 p_v8`) — staging mode while proving the net.
+- **V7** — do not use. It tried to own association, initiation, coast, and state. Holdout MOTA went negative.
+
+Published reference (same streaming problem). V8 has no trained numbers yet; the last column is the ship contract, not a result.
+
+| | Hybrid-MLP | V6 GNN | V7 (best / default) | V8 ships if |
+|---|---:|---:|---:|---|
+| MOTA | **0.82 – 0.925** | −0.70 | −1.09 / −3.03 | **≥ Hybrid** |
+| MOTP | **~806 m** | 3240 m | 3539 / 3261 m | ≤ 900 m |
+| Precision | **0.89 – 0.999** | 0.005 | 0.049 / 0.105 | ≥ 0.88 |
+| Recall | **0.93 – 0.94** | 0.004 | 0.059 / 0.374 | **≥ Hybrid** (only place V8 should win) |
+| ID switches | **0** | high | 29 / 546 | **0** |
 
 ## Goal
 
@@ -28,17 +90,7 @@ V7 asked one network to associate, initiate, coast, and estimate state from 2 s 
 | Initiation | Unmatched metas, M/N hits | Any meas with `P(exist) > init` | Unchanged unmatched-meta init |
 | Coasting | KF predict through shadows | GRU + existence logit | Unchanged KF coast |
 
-Published reference numbers (same streaming problem):
-
-| | Hybrid | V6 GNN | V7 (best / default) |
-|---|---:|---:|---:|
-| MOTA | **0.82 – 0.925** | −0.70 | −1.09 / −3.03 |
-| MOTP | **~806 m** | 3240 m | 3539 / 3261 m |
-| Precision | **0.89 – 0.999** | 0.005 | 0.049 / 0.105 |
-| Recall | **0.93 – 0.94** | 0.004 | 0.059 / 0.374 |
-| ID switches | **0** | high | 29 / 546 |
-
-V8 ships only if it holds Hybrid's MOTA / zero ID switches and does not lose precision. The expected win is recall in crossings and SSR dropouts (joint scoring).
+Numbers and the V8 ship bar are in [Hybrid vs V8](#hybrid-vs-v8). V7's holdout MOTA is negative because it owned initiation, coast, and state — V8 is not a retry of that.
 
 ## What does not change
 

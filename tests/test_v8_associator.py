@@ -103,11 +103,25 @@ def test_empty_sets():
 def test_config_backend_default_mlp():
     cfg = PipelineConfig()
     assert cfg.pairwise.backend == "mlp"
+    assert cfg.pairwise.cluster_backend is None
+    assert cfg.pairwise.assign_backend is None
+    assert cfg.pairwise.cluster_threshold == 0.5
+    assert cfg.pairwise.assign_threshold == 0.0
     assert cfg.pairwise.use_dustbin is False
-    pw = PairwiseConfig(backend="transformer", use_dustbin=True)
+    pw = PairwiseConfig(backend="transformer", use_dustbin=True, cluster_backend="mlp")
     assert pw.backend == "transformer"
+    assert pw.cluster_backend == "mlp"
     assert pw.use_dustbin is True
     print("test_config_backend_default_mlp PASSED")
+
+
+def test_subsample_binary_caps_negatives():
+    from src.train_associator_v8 import subsample_binary
+    y = torch.tensor([1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    rng = np.random.RandomState(0)
+    keep = subsample_binary(y, max_neg_ratio=2.0, rng=rng)
+    assert int((y[keep] > 0.5).sum()) == 2
+    assert int((y[keep] <= 0.5).sum()) == 4
 
 
 def test_assoc_gate_constant():
@@ -121,5 +135,6 @@ if __name__ == "__main__":
     test_forward_score_pairs_and_assignment()
     test_empty_sets()
     test_config_backend_default_mlp()
+    test_subsample_binary_caps_negatives()
     test_assoc_gate_constant()
     print("\nAll V8 associator tests passed!")

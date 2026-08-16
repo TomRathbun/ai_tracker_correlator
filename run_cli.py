@@ -59,6 +59,14 @@ def run_cli():
     parser.add_argument("--mode", type=str, choices=["gnn", "kalman", "hybrid", "train"], default="hybrid", help="Operation mode (updater type or train)")
     parser.add_argument("--assoc", type=str, choices=["mlp", "transformer", "ensemble"], default="mlp",
                         help="Hybrid association backend (mlp=current pairwise, transformer=V8)")
+    parser.add_argument("--cluster-assoc", type=str, choices=["mlp", "transformer", "ensemble"], default=None,
+                        help="Override scorer for spatial clustering (default: --assoc)")
+    parser.add_argument("--assign-assoc", type=str, choices=["mlp", "transformer", "ensemble"], default=None,
+                        help="Override scorer for track↔plot assignment (default: --assoc)")
+    parser.add_argument("--cluster-threshold", type=float, default=0.5,
+                        help="Draw a cluster edge if pair probability exceeds this")
+    parser.add_argument("--assign-threshold", type=float, default=0.0,
+                        help="Accept a Hungarian match if pair probability exceeds this (0=any gated p>0)")
     parser.add_argument("--v8-model-path", type=str, default="checkpoints/model_v8_assoc.pt",
                         help="Path to V8 associator checkpoint")
     parser.add_argument("--dustbin", action="store_true", help="Enable V8 unmatched/dustbin column in Hungarian")
@@ -76,6 +84,11 @@ def run_cli():
     parser.add_argument("--suppress-thresh", type=float, default=0.75, help="GNN suppression threshold")
     parser.add_argument("--clutter-threshold", type=float, default=0.70, help="Clutter prob threshold (P > T is rejected)")
     parser.add_argument("--no-clutter-filter", action="store_true", help="Disable Phase 0 Pre-trained Clutter Filter (Native V6 mode)")
+    parser.add_argument(
+        "--no-identity-features",
+        action="store_true",
+        help="Ablation: zero Mode-3A/Mode-S match features in SSR pairwise association (kinematics-only)",
+    )
     parser.add_argument("--match-threshold", type=float, default=7000.0, help="Metrics match threshold (m)")
     parser.add_argument("--track-cap", type=int, default=500, help="Max active tracks")
     
@@ -262,6 +275,10 @@ def run_cli():
     config.state_updater.type = args.mode
     config.state_updater.gnn_model_path = args.gnn_model_path
     config.pairwise.backend = args.assoc
+    config.pairwise.cluster_backend = args.cluster_assoc
+    config.pairwise.assign_backend = args.assign_assoc
+    config.pairwise.cluster_threshold = args.cluster_threshold
+    config.pairwise.assign_threshold = args.assign_threshold
     config.pairwise.v8_model_path = Path(args.v8_model_path)
     config.pairwise.use_dustbin = bool(args.dustbin)
     config.track_manager.min_hits = args.min_hits
@@ -279,6 +296,10 @@ def run_cli():
         config.clutter_filter.enabled = False
         print("[OK] Native Mode: Phase 0 Clutter Filter Disabled.")
     config.clutter_filter.threshold = args.clutter_threshold
+
+    if args.no_identity_features:
+        config.pairwise.use_identity_features = False
+        print("[OK] Ablation: Mode-3A/Mode-S identity features DISABLED for SSR pairwise.")
     
     # Initialize Pipeline (all modes except train now use the single config object)
     print(f"\n Initializing AI Tracker ({args.mode.upper()} mode)...")

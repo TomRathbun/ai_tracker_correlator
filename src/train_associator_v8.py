@@ -2,12 +2,14 @@
 Train V8 association transformer on track_id labels.
 
 Supervised matching only — no residual state, no existence, no GRU.
+Negatives are capped (~8× positives) and loss is class-balanced.
+Early-stop on holdout pair F1, not train loss or precision.
 """
 from __future__ import annotations
 
 import argparse
 import os
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import torch
@@ -60,6 +62,31 @@ def _tid(m: Dict) -> int:
         return -1
 
 
+def subsample_binary(
+    y: torch.Tensor, max_neg_ratio: float, rng: np.random.RandomState
+) -> torch.Tensor:
+    """Boolean keep-mask: all positives + up to max_neg_ratio * n_pos negatives."""
+    yf = y.reshape(-1)
+    pos = (yf > 0.5).detach().cpu().numpy()
+    n_pos = int(pos.sum())
+    n_neg = int((~pos).sum())
+    cap = int(max(n_pos, 1) * max_neg_ratio)
+    keep = np.ones(yf.numel(), dtype=bool)
+    if n_neg > cap:
+        drop = rng.choice(np.flatnonzero(~pos), size=n_neg - cap, replace=False)
+        keep[drop] = False
+    return torch.from_numpy(keep).to(y.device)
+
+
+def pair_prf(pred: torch.Tensor, y: torch.Tensor) -> Tuple[int, int, int]:
+    pos = y > 0.5
+    pr = pred > 0.5
+    tp = int((pr & pos).sum().item())
+    fp = int((pr & ~pos).sum().item())
+    fn = int((~pr & pos).sum().item())
+    return tp, fp, fn
+
+
 def cluster_pairs(window: List[Dict], allowed: Set[int]) -> Tuple[torch.Tensor, torch.Tensor]:
     """Gated meas-meas pairs + labels (same track_id)."""
     pairs: List[Tuple[int, int]] = []
@@ -109,6 +136,35 @@ def assign_sample(
     return tracks, metas, pair_y, dust_y
 
 
+@torch.no_grad()
+def eval_pair_metrics(
+    model: AssociationTransformerV8,
+    windows: List[List[Dict]],
+    allowed: Set[int],
+    device: torch.device,
+    thr: float = 0.5,
+) -> Dict[str, float]:
+    model.eval()
+    tp = fp = fn = 0
+    last: Dict[int, Dict] = {}
+    for window in windows:
+        # Holdout plots + clutter only, so train-id pairs are not counted as false positives.
+        sliced = [m for m in window if _tid(m) == -1 or _tid(m) in allowed]
+        pair_idx, pair_y = cluster_pairs(sliced, allowed)
+        if pair_idx.numel() > 0:
+            logits = model.score_pairs(window, window, pair_idx.to(device))
+            pred = torch.sigmoid(logits) > thr
+            t, f, n = pair_prf(pred, pair_y.to(device))
+            tp += t
+            fp += f
+            fn += n
+        _update_last(last, window, allowed)
+    prec = tp / (tp + fp + 1e-9)
+    rec = tp / (tp + fn + 1e-9)
+    f1 = 2 * prec * rec / (prec + rec + 1e-9)
+    return {"precision": prec, "recall": rec, "f1": f1, "tp": float(tp), "fp": float(fp), "fn": float(fn)}
+
+
 def train_associator(
     data_file: str = "data/sim_hetero_001.jsonl",
     num_epochs: int = 20,
@@ -120,9 +176,14 @@ def train_associator(
     num_heads: int = 4,
     use_self_attn: bool = True,
     max_windows: int | None = None,
+    init_path: Optional[str] = None,
+    neg_ratio: float = 8.0,
+    patience: int = 6,
+    seed: int = 42,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+    rng = np.random.RandomState(seed)
+    print(f"Device: {device}  neg_ratio={neg_ratio}  patience={patience}")
 
     measurements, _truth, all_ids = load_stream_and_truth(data_file)
     train_ids, test_ids = make_split(all_ids, split_ratio=split_ratio)
@@ -140,18 +201,20 @@ def train_associator(
     ).to(device)
 
     os.makedirs(os.path.dirname(checkpoint_path) or ".", exist_ok=True)
-    if os.path.exists(checkpoint_path):
+    warm = init_path or (checkpoint_path if os.path.exists(checkpoint_path) else None)
+    if warm and os.path.exists(warm):
         try:
-            ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+            ckpt = torch.load(warm, map_location=device, weights_only=False)
             state = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
             model.load_state_dict(state, strict=False)
-            print(f"Resumed V8 from {checkpoint_path}")
+            print(f"Resumed V8 from {warm}")
         except Exception as exc:
             print(f"Could not load checkpoint ({exc}); training from scratch")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     history = []
-    best_loss = float("inf")
+    best_val_f1 = -1.0
+    stale = 0
 
     for epoch in range(num_epochs):
         model.train()
@@ -167,10 +230,13 @@ def train_associator(
             n_terms = 0
 
             if pair_idx.numel() > 0:
-                logits = model.score_pairs(window, window, pair_idx.to(device))
-                y = pair_y.to(device)
-                loss = loss + focal_bce(logits, y)
-                n_terms += 1
+                keep = subsample_binary(pair_y, neg_ratio, rng)
+                pair_idx_b = pair_idx[keep]
+                pair_y_b = pair_y[keep]
+                if pair_idx_b.numel() > 0:
+                    logits = model.score_pairs(window, window, pair_idx_b.to(device))
+                    loss = loss + focal_bce(logits, pair_y_b.to(device), balance=True)
+                    n_terms += 1
 
             if tracks and metas:
                 S, dust = model.score_assignment(tracks, metas)
@@ -185,11 +251,13 @@ def train_associator(
                         if dx * dx + dyv * dyv <= ASSOC_GATE_M ** 2:
                             gate[i, j] = True
                 if gate.any():
-                    loss = loss + focal_bce(S[gate], ay[gate])
+                    s_g, y_g = S[gate], ay[gate]
+                    keep = subsample_binary(y_g, neg_ratio, rng)
+                    loss = loss + focal_bce(s_g[keep], y_g[keep], balance=True)
                     n_terms += 1
-                loss = loss + focal_bce(dust, dy)
+                # Dustbin: keep all rows (rare positives / coasts)
+                loss = loss + 2.0 * focal_bce(dust, dy, balance=True)
                 n_terms += 1
-                # peaked rows (optional, light)
                 if S.numel() > 0:
                     logits_row = torch.cat([S, dust.unsqueeze(-1)], dim=-1)
                     p = torch.softmax(logits_row, dim=-1).clamp_min(1e-8)
@@ -208,8 +276,14 @@ def train_associator(
             _update_last(last, window, train_ids)
 
         mean_loss = float(np.mean(losses)) if losses else float("nan")
-        print(f"Epoch {epoch + 1}: mean_loss={mean_loss:.4f} steps={len(losses)}")
-        history.append({"epoch": epoch + 1, "mean_loss": mean_loss, "steps": len(losses)})
+        val = eval_pair_metrics(model, windows, test_ids, device)
+        print(
+            f"Epoch {epoch + 1}: mean_loss={mean_loss:.4f} steps={len(losses)} "
+            f"val_prec={val['precision']:.3f} val_rec={val['recall']:.3f} val_f1={val['f1']:.3f} "
+            f"tp={int(val['tp'])} fp={int(val['fp'])} fn={int(val['fn'])}"
+        )
+        row = {"epoch": epoch + 1, "mean_loss": mean_loss, "steps": len(losses), **{f"val_{k}": v for k, v in val.items()}}
+        history.append(row)
 
         payload = {
             "model_state_dict": model.state_dict(),
@@ -221,17 +295,24 @@ def train_associator(
                 "num_heads": num_heads,
                 "use_self_attn": use_self_attn,
             },
+            "metrics": {"val_pair_precision": val["precision"], "val_pair_f1": val["f1"]},
+            "schema_version": 1,
         }
         torch.save(payload, checkpoint_path)
-        if mean_loss < best_loss:
-            best_loss = mean_loss
+        if val["f1"] > best_val_f1 + 1e-4:
+            best_val_f1 = val["f1"]
+            stale = 0
             best_path = checkpoint_path.replace(".pt", "_best.pt")
             torch.save(payload, best_path)
-            print(f"Saved {checkpoint_path} (best {best_path})")
+            print(f"Saved {checkpoint_path} (best val_f1={best_val_f1:.3f} → {best_path})")
         else:
-            print(f"Saved {checkpoint_path}")
+            stale += 1
+            print(f"Saved {checkpoint_path} (stale={stale}/{patience})")
+            if stale >= patience:
+                print(f"Early stop: val pair F1 did not improve for {patience} epochs")
+                break
 
-    return {"history": history, "checkpoint": checkpoint_path, "device": str(device)}
+    return {"history": history, "checkpoint": checkpoint_path, "device": str(device), "best_val_f1": best_val_f1}
 
 
 def _update_last(last: Dict[int, Dict], window: List[Dict], allowed: Set[int]) -> None:
@@ -248,6 +329,9 @@ def main():
     p.add_argument("--window", type=float, default=2.0)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--checkpoint", "--out", dest="checkpoint", default="checkpoints/model_v8_assoc.pt")
+    p.add_argument("--init", default=None, help="Warm-start weights (does not have to be --checkpoint)")
+    p.add_argument("--neg-ratio", type=float, default=8.0, help="Max negatives per positive after gating")
+    p.add_argument("--patience", type=int, default=6, help="Early-stop epochs without val pair-F1 gain")
     p.add_argument("--max-windows", type=int, default=None)
     p.add_argument("--no-self-attn", action="store_true")
     args = p.parse_args()
@@ -259,6 +343,9 @@ def main():
         checkpoint_path=args.checkpoint,
         use_self_attn=not args.no_self_attn,
         max_windows=args.max_windows,
+        init_path=args.init,
+        neg_ratio=args.neg_ratio,
+        patience=args.patience,
     )
 
 

@@ -45,23 +45,37 @@ def compute_psr_psr_features(m1: Dict, m2: Dict) -> np.ndarray:
     
     return np.array(features, dtype=np.float32)
 
-def compute_ssr_any_features(m1: Dict, m2: Dict) -> np.ndarray:
-    """Features for PSR-SSR or SSR-SSR pairs (uses ID codes if available)"""
+def compute_ssr_any_features(
+    m1: Dict, m2: Dict, use_identity_features: bool = True
+) -> np.ndarray:
+    """
+    Features for PSR-SSR or SSR-SSR pairs.
+
+    When use_identity_features=False (ablation), Mode-3A / Mode-S match
+    channels are forced to 0.0 (N/A) so association is kinematics-only.
+    Feature dimension stays 4 so pretrained SSR MLP weights still load.
+    """
     p1 = np.array([m1['x'], m1['y'], m1['z']])
     p2 = np.array([m2['x'], m2['y'], m2['z']])
-    
+
     features = []
-    
+
     # Position distance
     pos_dist = np.linalg.norm(p1 - p2)
     features.append(pos_dist / 100000.0)
-    
+
     # Angular separation (always useful)
     az1, az2 = np.arctan2(p1[1], p1[0]), np.arctan2(p2[1], p2[0])
     az_diff = abs(az1 - az2)
-    if az_diff > np.pi: az_diff = 2*np.pi - az_diff
+    if az_diff > np.pi:
+        az_diff = 2 * np.pi - az_diff
     features.append(az_diff)
-    
+
+    if not use_identity_features:
+        features.append(0.0)  # Mode-3A match N/A
+        features.append(0.0)  # Mode-S match N/A
+        return np.array(features, dtype=np.float32)
+
     # Mode 3A (Squawk) match — accept mode_3a or mode3a via adapter helpers
     # 1.0 = match, -1.0 = mismatch, 0.0 = N/A (one side missing)
     m3a_1 = get_mode_3a(m1)

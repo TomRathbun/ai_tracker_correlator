@@ -396,10 +396,18 @@ class NewHybridUpdater(StateUpdater):
         
         pw = getattr(config, 'pairwise', None)
         self.assoc_backend = str(getattr(pw, 'backend', 'mlp') or 'mlp').lower()
+        self.cluster_backend = str(getattr(pw, 'cluster_backend', None) or self.assoc_backend).lower()
+        self.assign_backend = str(getattr(pw, 'assign_backend', None) or self.assoc_backend).lower()
+        self.cluster_threshold = float(getattr(pw, 'cluster_threshold', 0.5) if pw else 0.5)
+        self.assign_threshold = float(getattr(pw, 'assign_threshold', 0.0) if pw else 0.0)
         self.use_dustbin = bool(getattr(pw, 'use_dustbin', False)) if pw else False
         self.v8 = None
         psr_path = str(getattr(pw, 'psr_model_path', 'checkpoints/pairwise_psr_psr.pt')) if pw else 'checkpoints/pairwise_psr_psr.pt'
         ssr_path = str(getattr(pw, 'ssr_model_path', 'checkpoints/pairwise_ssr_any.pt')) if pw else 'checkpoints/pairwise_ssr_any.pt'
+        # Ablation: disable Mode-3A/Mode-S match features in SSR pairwise path
+        self.use_identity_features = bool(getattr(pw, 'use_identity_features', True)) if pw else True
+        if not self.use_identity_features:
+            logging.info("NewHybridUpdater: SSR identity features (Mode-3A/S) DISABLED (kinematics-only ablation)")
         
         try:
             # PSR-PSR
@@ -419,7 +427,11 @@ class NewHybridUpdater(StateUpdater):
         except Exception as e:
             raise RuntimeError(f"CRITICAL: NewHybridUpdater failed to load classifiers: {e}")
 
-        if self.assoc_backend in ("transformer", "ensemble"):
+        need_v8 = any(
+            b in ("transformer", "ensemble")
+            for b in (self.assoc_backend, self.cluster_backend, self.assign_backend)
+        )
+        if need_v8:
             self._load_v8(pw)
 
     def _load_v8(self, pw) -> None:
@@ -427,12 +439,27 @@ class NewHybridUpdater(StateUpdater):
         path = str(getattr(pw, "v8_model_path", "checkpoints/model_v8_assoc.pt")) if pw else "checkpoints/model_v8_assoc.pt"
         try:
             self.v8 = load_v8(path, device=self.device)
-            logging.info("NewHybridUpdater: Loaded V8 associator from %s", path)
+            logging.info(
+                "NewHybridUpdater: Loaded V8 associator from %s (cluster=%s assign=%s thr_c=%.2f thr_a=%.2f)",
+                path, self.cluster_backend, self.assign_backend, self.cluster_threshold, self.assign_threshold,
+            )
         except Exception as exc:
             logging.warning("V8 associator not loaded (%s); falling back to MLP scoring", exc)
             self.v8 = None
             if self.assoc_backend == "transformer":
                 self.assoc_backend = "mlp"
+            if self.cluster_backend == "transformer":
+                self.cluster_backend = "mlp"
+            if self.assign_backend == "transformer":
+                self.assign_backend = "mlp"
+
+    @staticmethod
+    def _mix_score(backend: str, mlp_p: float, v8_p: float, use_v8: bool) -> float:
+        if backend == "transformer" and use_v8:
+            return float(v8_p)
+        if backend == "ensemble" and use_v8:
+            return 0.5 * float(mlp_p) + 0.5 * float(v8_p)
+        return float(mlp_p)
 
     def update(self, measurements: List[Dict], tracks: List[Dict], dt: float = 1.0, frame_t: float = None) -> List[Dict]:
         if not measurements:
@@ -589,13 +616,18 @@ class NewHybridUpdater(StateUpdater):
             if t1 == 'PSR' and t2 == 'PSR':
                 psr_pairs.append((i, j, compute_psr_psr_features(m1n, m2n)))
             else:
-                ssr_pairs.append((i, j, compute_ssr_any_features(m1n, m2n)))
+                ssr_pairs.append((
+                    i, j,
+                    compute_ssr_any_features(
+                        m1n, m2n, use_identity_features=self.use_identity_features
+                    ),
+                ))
 
         gated = [(i, j) for (i, j, _) in psr_pairs + ssr_pairs]
         mlp_map = {}
         v8_map = {}
-        use_v8 = self.v8 is not None and self.assoc_backend in ("transformer", "ensemble")
-        use_mlp = self.assoc_backend in ("mlp", "ensemble") or not use_v8
+        use_v8 = self.v8 is not None and self.cluster_backend in ("transformer", "ensemble")
+        use_mlp = self.cluster_backend in ("mlp", "ensemble") or not use_v8
 
         if use_mlp:
             if psr_pairs and self.psr_classifier:
@@ -620,13 +652,13 @@ class NewHybridUpdater(StateUpdater):
                 v8_map[(i, j)] = float(probs[k])
 
         for i, j in gated:
-            if self.assoc_backend == "transformer" and use_v8:
-                p = v8_map.get((i, j), 0.0)
-            elif self.assoc_backend == "ensemble" and use_v8:
-                p = 0.5 * mlp_map.get((i, j), 0.0) + 0.5 * v8_map.get((i, j), 0.0)
-            else:
-                p = mlp_map.get((i, j), 0.0)
-            if p > 0.5:
+            p = self._mix_score(
+                self.cluster_backend,
+                mlp_map.get((i, j), 0.0),
+                v8_map.get((i, j), 0.0),
+                use_v8,
+            )
+            if p > self.cluster_threshold:
                 adj[i, j] = adj[j, i] = 1
                 
         n_comp, labels = connected_components(csr_matrix(adj))
@@ -691,10 +723,15 @@ class NewHybridUpdater(StateUpdater):
                     if t1 == 'PSR' and t2 == 'PSR':
                         psr_pairs.append((i, j, compute_psr_psr_features(tmp_t, m)))
                     else:
-                        ssr_pairs.append((i, j, compute_ssr_any_features(tmp_t, m)))
+                        ssr_pairs.append((
+                            i, j,
+                            compute_ssr_any_features(
+                                tmp_t, m, use_identity_features=self.use_identity_features
+                            ),
+                        ))
 
-        use_v8 = self.v8 is not None and self.assoc_backend in ("transformer", "ensemble")
-        use_mlp = self.assoc_backend in ("mlp", "ensemble") or not use_v8
+        use_v8 = self.v8 is not None and self.assign_backend in ("transformer", "ensemble")
+        use_mlp = self.assign_backend in ("mlp", "ensemble") or not use_v8
 
         mlp_p = np.zeros((T, M), dtype=np.float32)
         if use_mlp:
@@ -719,25 +756,21 @@ class NewHybridUpdater(StateUpdater):
                 v8_p = torch.sigmoid(S).detach().cpu().numpy()
                 dust_p = torch.sigmoid(dust).detach().cpu().numpy()
 
-        if use_v8 and self.use_dustbin and self.assoc_backend == "transformer":
+        tau = self.assign_threshold
+        if use_v8 and self.use_dustbin and self.assign_backend == "transformer":
             cost = np.ones((T, M + 1), dtype=np.float64)
             for i, j in gated:
                 cost[i, j] = 1.0 - float(v8_p[i, j])
             cost[:, M] = 1.0 - dust_p
             row, col = linear_sum_assignment(cost)
-            valid = (col < M) & (cost[row, col] < 1.0)
+            valid = (col < M) & (cost[row, col] < 1.0 - tau)
             return row[valid], col[valid]
 
         for i, j in gated:
-            if self.assoc_backend == "transformer" and use_v8:
-                p = float(v8_p[i, j])
-            elif self.assoc_backend == "ensemble" and use_v8:
-                p = 0.5 * float(mlp_p[i, j]) + 0.5 * float(v8_p[i, j])
-            else:
-                p = float(mlp_p[i, j])
+            p = self._mix_score(self.assign_backend, mlp_p[i, j], v8_p[i, j], use_v8)
             costs[i, j] = 1.0 - p
                     
         row, col = linear_sum_assignment(costs)
-        # Match hybrid_tracker.py logic: In temporal mode, accept any match within 8km gate
-        valid = costs[row, col] < 1.0 
+        # Accept Hungarian matches with p > assign_threshold (default 0 = any gated p > 0)
+        valid = costs[row, col] < 1.0 - tau
         return row[valid], col[valid]

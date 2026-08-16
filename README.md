@@ -77,7 +77,7 @@ uv run run_cli.py --mode gnn --arch gnn_only --run-name "GNN_Test_01" --threshol
 - `--data`: Path to dataset (JSONL)
 - `--no-mlflow`: Disable experiment logging
 
-V8 is a **drop-in associator** inside Hybrid (not a replacement tracker). See [`artifacts/design_v8.md`](artifacts/design_v8.md). Train with `uv run python -m src.train_associator_v8 --data data/sim_hetero_001.jsonl`.
+**What V8 is:** not a new tracker. Hybrid-MLP is the operational path (clutter → 2 km cluster → 8 km assign → Hungarian → async Kalman → M/N). V8 swaps only the two pair scorers for a small transformer; gates, KF, and track management stay Hybrid. Default `--assoc mlp`. Opt in with `--assoc transformer` after training `checkpoints/model_v8_assoc.pt`. Comparison and spec: [`artifacts/design_v8.md`](artifacts/design_v8.md). Train with `uv run python -m src.train_associator_v8 --data data/sim_hetero_001.jsonl`.
 
 ### 📈 Experiment Tracking (MLflow)
 All experiments are automatically logged to **MLflow**.

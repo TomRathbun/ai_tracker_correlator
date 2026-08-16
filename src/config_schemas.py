@@ -15,16 +15,27 @@ class ClutterFilterConfig(BaseModel):
     model_path: Optional[Path] = Path("checkpoints/clutter_classifier.pt")
 
 
+AssocBackend = Literal["mlp", "transformer", "ensemble"]
+
+
 class PairwiseConfig(BaseModel):
     """Configuration for pairwise association classifiers."""
-    backend: Literal["mlp", "transformer", "ensemble"] = "mlp"
+    backend: AssocBackend = "mlp"
+    # None = inherit backend. Split lets MLP cluster (precise) while V8 assigns.
+    cluster_backend: Optional[AssocBackend] = None
+    assign_backend: Optional[AssocBackend] = None
     v8_model_path: Optional[Path] = Path("checkpoints/model_v8_assoc.pt")
     use_dustbin: bool = False
     use_self_attn: bool = True
+    # Cluster edge if p > this. Assign accept if p > this (cost < 1 - tau).
+    cluster_threshold: float = Field(0.5, ge=0.0, le=1.0)
+    assign_threshold: float = Field(0.0, ge=0.0, le=1.0)
     psr_psr_threshold: float = Field(0.35, ge=0.0, le=1.0)
     ssr_any_threshold: float = Field(0.5, ge=0.0, le=1.0)
     psr_model_path: Optional[Path] = Path("checkpoints/pairwise_psr_psr.pt")
     ssr_model_path: Optional[Path] = Path("checkpoints/pairwise_ssr_any.pt")
+    # Ablation: when False, Mode-3A/Mode-S match features are forced to 0 (N/A)
+    use_identity_features: bool = True
 
 
 class StateUpdaterConfig(BaseModel):

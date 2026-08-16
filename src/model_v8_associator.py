@@ -382,10 +382,22 @@ def load_v8(path: str | Path, device: Optional[torch.device] = None, **kwargs) -
     return model
 
 
-def focal_bce(logits: torch.Tensor, targets: torch.Tensor, alpha: float = 0.25, gamma: float = 2.0) -> torch.Tensor:
+def focal_bce(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    alpha: float = 0.25,
+    gamma: float = 2.0,
+    balance: bool = False,
+) -> torch.Tensor:
     if logits.numel() == 0:
         return logits.sum() * 0.0
     probs = torch.sigmoid(logits)
     bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
     p_t = probs * targets + (1.0 - probs) * (1.0 - targets)
-    return (alpha * (1.0 - p_t).pow(gamma) * bce).mean()
+    w = alpha * (1.0 - p_t).pow(gamma)
+    if balance:
+        n_pos = targets.sum().clamp(min=1.0)
+        n_neg = (1.0 - targets).sum().clamp(min=1.0)
+        # Equal total mass on pos vs neg (real pos_weight; alpha is no longer a class prior).
+        w = w * torch.where(targets > 0.5, n_neg / n_pos, torch.ones_like(targets))
+    return (w * bce).mean()
