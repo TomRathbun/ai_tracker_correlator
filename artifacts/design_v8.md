@@ -1,8 +1,9 @@
 # V8 Design: Transformer Associator + Hybrid KF
 
-**Status:** associator implemented on `main`, untrained. Hybrid-MLP remains the default CLI path.
-**Implemented:** `src/model_v8_associator.py`, `src/train_associator_v8.py`, Hybrid backend dispatch in `src/updater.py`, `--assoc` on `run_cli.py`, `scripts/eval_v8_hybrid.py`, `tests/test_v8_associator.py`
-**Date:** 2026-08-14 (explainer added 2026-08-16)
+**Status:** associator implemented and trained on `main`. Hybrid-MLP remains the default CLI path. Pure V8 does not ship; ensemble is the research blend.
+**Implemented:** `src/model_v8_associator.py`, `src/train_associator_v8.py`, Hybrid backend dispatch in `src/updater.py`, `--assoc mlp|transformer|ensemble` on `run_cli.py`, split scoring in `scripts/eval_v8_hybrid.py`, `tests/test_v8_associator.py`
+**Checkpoints:** `checkpoints/model_v8_assoc_best.pt` (sim), `checkpoints/model_v8_assoc_sweden_best.pt` (Sweden fine-tune)
+**Date:** 2026-08-14 (explainer 2026-08-16; trained-numbers update 2026-08-16)
 **Depends on:** `NewHybridUpdater` (`src/updater.py`), `SimpleKalmanFilter`, `src/pairwise_features.py`, `src/data_schema.py`
 **Supersedes for research:** V7 pure transformer tracker (`artifacts/design_v7_transformer.md`)
 **Does not replace:** Hybrid-MLP as the default operational path
@@ -48,26 +49,29 @@ Both paths are the **same tracker**. The table is scorer-vs-scorer, not tracker-
 | Forbidden | — | Residual state, existence heads, GRU, attention argmax, scoring outside the gates |
 | Size | Two tiny MLPs | ~150–250k params, `d_model=64`, 2 self-attn layers |
 | CLI | `--mode hybrid` (or `--assoc mlp`) | `--mode hybrid --assoc transformer` |
-| Status | Trained, published MOTA **0.82–0.925**, **0** ID switches | Code on `main`, **untrained** — ships only if it holds Hybrid MOTA / precision / 0 ID switches |
+| Status | Trained, MOTA **0.865** / **0.971** (`max_age=10`), **0** ID switches | Trained. Pure V8: MOTA 0.526 / 0.745. Ensemble: single-run **+0.007** on dense stream, Sweden tie. Does not replace Hybrid |
 | Expected win | Baseline | Recall in crossings and SSR dropouts (joint scoring), without extra false tracks |
 | Rollback | — | Leave default on MLP; missing V8 checkpoint already falls back to MLP |
 
 When to use which:
 
 - **Hybrid-MLP** — operational default. Use this unless a trained V8 checkpoint beats the bar below.
-- **Hybrid + V8** — research path. Same physics, different scorer. Not a replacement until Sweden holdout matches or beats Hybrid-MLP.
-- **Ensemble** (`0.5 p_mlp + 0.5 p_v8`) — staging mode while proving the net.
+- **Hybrid + V8** — research path. Same physics, different scorer. Pure transformer over-associates; do not run alone operationally.
+- **Ensemble** (`0.5 p_mlp + 0.5 p_v8`) — staging mode. Single-run +0.007 MOTA on `stream_radar_001`, Sweden tie to three decimals.
+- **Split** — MLP owns 2 km clustering, V8 owns 8 km assignment. Recovers most of the precision pure V8 lost.
 - **V7** — do not use. It tried to own association, initiation, coast, and state. Holdout MOTA went negative.
 
-Published reference (same streaming problem). V8 has no trained numbers yet; the last column is the ship contract, not a result.
+Published reference (`stream_radar_001`, `max_age=10`, 7 km match). CLI `max_age=2` is a different, lower MOTA (~0.58 Hybrid) and is not this table.
 
-| | Hybrid-MLP | V6 GNN | V7 (best / default) | V8 ships if |
-|---|---:|---:|---:|---|
-| MOTA | **0.82 – 0.925** | −0.70 | −1.09 / −3.03 | **≥ Hybrid** |
-| MOTP | **~806 m** | 3240 m | 3539 / 3261 m | ≤ 900 m |
-| Precision | **0.89 – 0.999** | 0.005 | 0.049 / 0.105 | ≥ 0.88 |
-| Recall | **0.93 – 0.94** | 0.004 | 0.059 / 0.374 | **≥ Hybrid** (only place V8 should win) |
-| ID switches | **0** | high | 29 / 546 | **0** |
+| | Hybrid-MLP | V6 GNN | V7 (best / default) | V8 only | Ensemble | V8 ships if |
+|---|---:|---:|---:|---:|---:|---|
+| MOTA | **0.865** | −0.70 | −1.09 / −3.03 | 0.526 | 0.872 | **≥ Hybrid** |
+| MOTP | **877 m** | 3240 m | 3539 / 3261 m | 1056 m | 901 m | ≤ 900 m |
+| Precision | **0.929** | 0.005 | 0.049 / 0.105 | 0.692 | 0.931 | ≥ 0.88 |
+| Recall | **0.937** | 0.004 | 0.059 / 0.374 | 0.946 | 0.941 | **≥ Hybrid** |
+| ID switches | **0** | high | 29 / 546 | **0** | **0** | **0** |
+
+Sweden 30-min holdout (tiled CAT-062 observation-model stream): Hybrid **0.971**, ensemble **0.971** (identical to 3 decimals), V8-only 0.745. Ensemble does not ship over Hybrid; the +0.007 dense-stream delta is one run, no CI.
 
 ## Goal
 
@@ -216,7 +220,7 @@ Normalize before the Linear. Do not feed raw meters. Build via `src/data_schema.
 | `mode_s` | 8 | hash → 1024 buckets | |
 | `has_mode_s` | 1 | `{0,1}` | |
 
-Numeric block is 15-d. Concatenate embeddings after a `Linear(15, d_model)` and add the four embeds (role / type / sensor / ids). Missing identity must be a dedicated pad index, never squawk `0000`.
+Numeric block is 15-d. Concatenate embeddings after a `Linear(15, d_model)` and add the five embeds (role / type / sensor / Mode-3A / Mode-S). Missing identity uses pad index 0; present squawk `0000` collides with that pad — `has_mode_3a` is the disambiguator.
 
 ### Relative pair features `rel_ij`
 

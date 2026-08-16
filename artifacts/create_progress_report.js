@@ -12,7 +12,6 @@ const {
 
 const ROOT = path.resolve(__dirname, "..");
 const OUT = path.join(__dirname, "Capstone_Progress_Report.docx");
-const OUT_ALT = path.join(__dirname, "Capstone_Progress_Report_AIML.docx");
 
 const NAVY = "0B3D5C";
 const STEEL = "1F4E79";
@@ -142,7 +141,7 @@ function img(relPath, maxW, maxH, alt) {
   const data = fs.readFileSync(abs);
   // Natural sizes known from inspection; keep aspect.
   const natives = {
-    "artifacts/tracker_simulation_holdout_2min_trails.png": [4500, 3000],
+    "artifacts/tracking_visualization.png": [1600, 900],
     "artifacts/tracks_sweden_30min_holdout.png": [1960, 980],
     "artifacts/tracks_canonical_comparison.png": [2084, 1796],
   };
@@ -201,8 +200,8 @@ async function main() {
     h1("1.  Executive summary"),
     p("Today’s surveillance stack still looks like the 1990s: each radar runs its own physics tracker on one ASTERIX category (typically CAT-048 plots or CAT-062 system tracks), then a separate correlator tries to decide which of those local tracks are the same aircraft. That split creates latency, duplicate tracks, and a maintenance surface that grows with every sensor."),
     p("This project asked whether one AI/ML system can ingest multi-sensor plots, reject clutter, associate PSR with SSR, and output a single correlated track picture. The short answer is yes — but not by handing the entire job to one network. The learned part is association. Section 4 is the deep dive on those two associators."),
-    p("The working system is Hybrid: a clutter MLP, two pairwise association MLPs, Hungarian assignment, and an asynchronous Kalman filter. On the dense 120-second multi-radar stream it holds MOTA 0.865 with zero ID switches. On a 30-minute Sweden holdout it reaches MOTA 0.971. End-to-end learned trackers (GNN V3–V6 and the V7 transformer) did not. They flooded the picture with false tracks."),
-    p("V8 is the course correction. It is not a new tracker. It is a transformer that scores gated pairs inside Hybrid — looking at the surrounding traffic, not just one pair in isolation. Pure V8 is not ready to ship. Averaging it with the MLP (ensemble) slightly beats Hybrid on the dense sim stream (MOTA 0.872 vs 0.865) and ties Hybrid on Sweden. That is the research result, not the operational default."),
+    p("The working system is Hybrid: a clutter MLP, two pairwise association MLPs, Hungarian assignment, and an asynchronous Kalman filter. On the dense 120-second multi-radar stream, under the max_age = 10 eval contract in §6.1, it holds MOTA 0.865 with zero ID switches. On a 30-minute Sweden holdout it reaches MOTA 0.971. End-to-end learned trackers (GNN V3–V6 and the V7 transformer) did not. They flooded the picture with false tracks."),
+    p("V8 is the course correction. It is not a new tracker. It is a transformer that scores gated pairs inside Hybrid — looking at the surrounding traffic, not just one pair in isolation. Pure V8 is not ready to ship. Averaging it with the MLP (ensemble) is a single-run +0.007 MOTA on the dense sim stream (0.872 vs 0.865) with zero ID switches, and it ties Hybrid on Sweden. That is a hint, not a claim that the transformer beats Hybrid, and not the operational default."),
     p("Hybrid has the best standalone numbers on the data we have. The reason to keep the transformer is the next environment: crossings, SSR dropouts, and overlapping trails where a pair looked at in isolation is ambiguous, and the set around it is not."),
   );
 
@@ -240,7 +239,7 @@ async function main() {
   );
   children.push(
     p("Two specialist MLPs do the learned work today. Each pair is scored alone. Hungarian and the Kalman filter never see a neural state vector. Section 4 specifies those MLPs — features, training, and the transformer that can replace or average them."),
-    img("artifacts/tracker_simulation_holdout_2min_trails.png", 620, 420, "Hybrid tracker simulation with confirmed tracks and trails"),
+    img("artifacts/tracking_visualization.png", 620, 420, "Hybrid tracker simulation with confirmed tracks and trails"),
     caption("Figure 1. Hybrid correlator on a streaming holdout: clutter, measurements, ground truth, and confirmed tracks with trails."),
   );
 
@@ -312,7 +311,7 @@ async function main() {
     h3("Job and inductive bias"),
     p("AssociationTransformerV8 (src/model_v8_associator.py, ~150–250k parameters) is SuperGlue-style matching, not DETR-style tracking. It builds a token per gated track and per gated plot, contextualizes each side with self-attention, then scores pairs with an MLP head on [h_i ; h_j ; rel_ij]. The transformer is the context encoder. The last layer is still an MLP. The difference is what h_i contains: after attention, h_i knows about the other tokens on its side of the gate."),
     h3("Token: 15 numbers plus embeddings"),
-    p("Raw meters are never fed in. Numeric features are normalized, then projected Linear(15 → 64). Six embeddings, each 64-d, are added: role (track vs measurement), type (PSR vs SSR), sensor id (0–8), Mode-3A (0–4095, pad 0 = missing), and hashed Mode-S (1024 buckets, 0 = missing). Missing identity is a dedicated pad index, never squawk 0000."),
+    p("Raw meters are never fed in. Numeric features are normalized, then projected Linear(15 → 64). Five embeddings, each 64-d, are added: role (track vs measurement), type (PSR vs SSR), sensor id (0–8), Mode-3A (0–4095), and hashed Mode-S (1024 buckets). Missing identity uses pad index 0. Present squawk 0000 collides with that pad; the numeric has_mode_3a flag is the disambiguator, not a separate unused pad token."),
   );
   children.push(
     table(
@@ -364,7 +363,7 @@ async function main() {
     p("Split is by track id (seed 42, 80/20), not by time, so holdout aircraft are unseen. Loss is focal BCE on positives and gated negatives, plus dustbin BCE, plus a light 0.1 entropy term so assignment rows peak. Negatives are capped at about 8× positives. Class mass is balanced inside each batch (real pos_weight), unlike the first V8 run, which used a constant α and overfit 16 sim IDs. Early-stop is on holdout pair F1, not train loss and not precision-only (precision-only produced a timid net that refused true pairs). AdamW 1e-3, weight decay 1e-4, grad clip 1.0."),
     p("A later fine-tune on the Sweden 30-minute train stream, from the sim checkpoint, is the weight file used in ensemble eval (checkpoints/model_v8_assoc_sweden_best.pt)."),
     h3("What that means in a crossing"),
-    p("The same two aircraft cross. After self-attention, track A’s token has mixed with track C’s token: both are live, close, and claiming plots. Plot B’s token has mixed with the other plots in the gate, including the one that actually carries C’s Mode-S. The score head then sees [h_A ; h_B ; rel_AB]. rel_AB still says “close.” h_A and h_B can now say “but C is a better owner.” The MLP cannot produce that sentence. That is the only reason to keep a transformer in a system whose Kalman filter already wins MOTA."),
+    p("The same two aircraft cross. After self-attention, track A’s token has mixed with track C’s token: both are live, close, and claiming plots. Plot B’s token has mixed with the other plots in the gate, including the one that actually carries C’s Mode-S. The score head then sees [h_A ; h_B ; rel_AB]. rel_AB still says “close.” The intended mechanism is that h_A and h_B can now carry “C is a better owner.” We have not shown an attention map or a crossing slice where V8 flips a pair the MLP got wrong. Until that overlap holdout exists, it is a hypothesis with a single-run +0.007 MOTA hint, not a demonstrated capability."),
 
     h2("4.4  Side by side"),
   );
@@ -391,7 +390,7 @@ async function main() {
     caption("Table 6. Both sit inside Hybrid. Neither replaces the Kalman filter. The AI/ML difference is pairwise isolation versus set context."),
 
     h2("4.5  Ensemble and split — composing the two learners"),
-    p("Ensemble is not a third network. At each gated pair Hybrid computes p = 0.5 p_MLP + 0.5 p_V8, then uses that p exactly as it would use a single scorer. The MLP vetoes reckless transformer edges; the transformer still nudges pairs the MLP cannot see in context. On the dense stream that mix is MOTA 0.872 versus Hybrid 0.865, with zero ID switches. On Sweden it ties Hybrid. Dustbin is off on this path."),
+    p("Ensemble is not a third network. At each gated pair Hybrid computes p = 0.5 p_MLP + 0.5 p_V8, then uses that p exactly as it would use a single scorer. The MLP vetoes reckless transformer edges; the transformer still nudges pairs the MLP cannot see in context. On the dense stream that mix is a single-run +0.007 MOTA (0.872 vs 0.865) with zero ID switches. On Sweden the three reported decimals are identical to Hybrid — consistent with V8 not changing those decisions. Dustbin is off on this path."),
     p("Split scoring is the other composition: MLP owns clustering (the local 2 km clique the specialists already solve), V8 owns assignment (the set problem). That recovered most of the precision pure V8 lost, without training a new net. Raising V8’s own cluster threshold made things worse — the net under-merged PSR+SSR and started two tracks for one aircraft. The lesson for the AI/ML design is sharp: give the transformer the job that needs set context, not the job the pairwise MLP already does well."),
 
     h2("4.6  Why this section is the project’s ML claim"),
@@ -427,8 +426,8 @@ async function main() {
         ["V6", "Bipartite track→meas attention", "Yes", "MOTA −0.70 on stream_radar"],
         ["V7", "Full transformer tracker", "Yes", "MOTA −1.1 to −3.0; ID floods"],
         ["Hybrid", "MLP pairs + async KF + Hungarian", "Kalman", "MOTA 0.87 / 0.97; 0 IDs"],
-        ["V8", "Transformer scores pairs inside Hybrid", "Kalman", "Recall up, precision down"],
-        ["Ensemble", "0.5 MLP + 0.5 V8, same Hybrid", "Kalman", "Slight MOTA win on dense sim"],
+        ["V8", "Transformer scores pairs inside Hybrid", "Kalman", "Dense stream: recall up, precision down"],
+        ["Ensemble", "0.5 MLP + 0.5 V8, same Hybrid", "Kalman", "Single-run +0.007 MOTA on dense sim"],
       ],
       linW
     ),
@@ -439,7 +438,7 @@ async function main() {
   children.push(
     h1("6.  What we measured"),
     h2("6.1  Protocol"),
-    p("Unless noted, numbers below use the same contract: 1-second evaluation windows, min_hits = 3, max_age = 10, match threshold 7 km. The dense stream is data/stream_radar_001.jsonl (~126 s, five asynchronous radars, 246 truth IDs). The real-traffic holdout is data/canonical/stream_sweden_30min_holdout.jsonl (~30 min, 163 IDs, built from CAT-062 traffic through a multi-radar observation model). V6/V7 rows on the dense stream are from the earlier streaming campaign on that same file."),
+    p("Unless noted, numbers below use the same contract: 1-second evaluation windows, min_hits = 3, max_age = 10, match threshold 7 km. The CLI default is max_age = 2; that shorter coast produces a different Hybrid MOTA (about 0.58 on this file) and is not the table below. The dense stream is data/stream_radar_001.jsonl (~126 s, five asynchronous radars, 246 truth IDs). The real-traffic holdout is data/canonical/stream_sweden_30min_holdout.jsonl (~30 min, 163 IDs). It is CAT-062 traffic passed through a multi-radar observation model, then packed as a 6-tile / 3×-mini stream — duration is real, geometry is repeated, not 30 independent minutes of new crossings. V6/V7 rows on the dense stream are from the earlier streaming campaign on that same file."),
     h2("6.2  Dense multi-radar stream"),
   );
 
@@ -457,7 +456,7 @@ async function main() {
       ],
       resW
     ),
-    caption("Table 8. stream_radar_001. Hybrid is the first system that is actually a tracker. Ensemble is a small, honest gain on top of it."),
+    caption("Table 8. stream_radar_001, max_age = 10. Hybrid is the first system that is actually a tracker. Ensemble is a single-run +0.007 MOTA on top of it, not a statistically tested win."),
     h2("6.3  Sweden 30-minute holdout"),
   );
   children.push(
@@ -470,11 +469,26 @@ async function main() {
       ],
       resW
     ),
-    caption("Table 9. Sweden holdout. Hybrid is already near the ceiling. Ensemble ties it. Pure V8 again loses precision."),
+    caption("Table 9. Sweden holdout (tiled CAT-062 observation-model stream). Hybrid is already near the ceiling. Ensemble matches it to three decimals — V8 is not changing those decisions. Pure V8 again loses precision."),
+    p("The holdout is the second half of a 6-tile pack of Sweden CAT-062 traffic, regenerated through the multi-radar observation model (see data/canonical/DATA_MANIFEST.md). Median nearest-neighbor distance is about 32 km and concurrent traffic tops out around 32 aircraft, so pairs inside the 2 km / 8 km gates are uncommon. Tiling stretches duration without adding new geometry. Treat Table 9 as a long easy-geometry run, not as a crossing study."),
     img("artifacts/tracks_sweden_30min_holdout.png", 620, 340, "Sweden 30-minute holdout track picture"),
     caption("Figure 2. Sweden 30-minute holdout traffic used for the Hybrid / V8 / ensemble comparison."),
-    h2("6.4  How to read this"),
-    p("Pure V8 does not ship. It keeps zero ID switches — Hungarian is doing its job — and it slightly raises recall on the dense stream. Precision collapses because it starts extra tracks. Ablations showed the leak is mostly in clustering: the transformer draws edges the MLP would refuse. Giving clustering back to the MLP (split) recovered most of the precision. Raising the transformer’s cluster threshold made things worse (under-merge, then two tracks for one aircraft)."),
+    h2("6.4  Ablations on the dense stream"),
+  );
+  children.push(
+    table(
+      ["Variant", "MOTA", "Prec.", "Recall", "IDs"],
+      [
+        ["V8 only (cluster + assign)", "0.526", "0.692", "0.946", "0"],
+        ["MLP cluster + V8 assign (split)", "0.845", "0.916", "0.929", "0"],
+        ["Ensemble 0.5 / 0.5", "0.872", "0.931", "0.941", "0"],
+        ["V8 + dustbin column", "no gain", "—", "—", "0"],
+      ],
+      [3600, 1600, 1600, 1640, 1640]
+    ),
+    caption("Table 10. stream_radar_001 ablations, same max_age = 10 contract as Table 8. Dustbin is implemented but uncalibrated — it did not move the scoreboard. Raising V8’s cluster threshold (not tabulated) under-merged PSR+SSR and birthed two tracks per aircraft."),
+    h2("6.5  How to read this"),
+    p("Pure V8 does not ship. It keeps zero ID switches — Hungarian is doing its job — and it slightly raises recall on the dense stream. Precision collapses because it starts extra tracks. Table 10 shows the leak is mostly in clustering: the transformer draws edges the MLP would refuse. Giving clustering back to the MLP (split) recovered most of the precision. Raising the transformer’s cluster threshold made things worse (under-merge, then two tracks for one aircraft)."),
     p("Dustbin — an extra Hungarian column so a track can refuse every plot — did nothing with the current weights. The unmatched head is not calibrated."),
     p("Training longer on the 16-ID sim set was the wrong next step. Loss was still falling because the net was memorizing easy pairs. Early-stopping on pair precision made it too timid; early-stopping on pair F1 kept a better epoch and still did not beat Hybrid as a standalone scorer. The useful training signal is denser, more overlapping traffic, not more epochs on sim_hetero_001."),
   );
@@ -484,7 +498,7 @@ async function main() {
     h1("7.  Why the transformer is still the next architecture"),
     p("Hybrid wins the tables we can fill in today. That is not the same as Hybrid being the last word on association."),
     p("The Sweden holdout is not an easy dataset in duration — 30 minutes, 163 tracks — but geometrically it is medium. Median nearest-neighbor distance is about 32 km. Concurrent traffic tops out around 32 aircraft. Crossings inside the 2 km / 8 km gates are uncommon. A pair-only MLP is in its comfort zone: the pair features already separate “same” from “other.” There is little for set attention to do, and a lot of ways for it to invent extra edges."),
-    p("The dense sim stream is harder (many more IDs in two minutes, five unsynchronized radars). Ensemble’s small MOTA and recall gain there is the first quantitative hint that set context helps when pairs get crowded. It is not yet a crossing study."),
+    p("The dense sim stream is harder (many more IDs in two minutes, five unsynchronized radars). Ensemble’s single-run +0.007 MOTA and small recall bump there is the first quantitative hint that set context helps when pairs get crowded. It is not yet a crossing study, and it is not a repeated-seed result."),
     p("The environment that will need the transformer is the one Hybrid’s own literature flags: terminal-area overlaps, formation or parallel tracks inside the spatial gate, SSR dropouts at the moment two aircraft cross, and multi-radar bias that makes raw distance lie. In those frames the MLP is looking at a pair that looks legal, and the transformer is the only module we have that can see the other claimants."),
     p("That is why V8 was designed as a drop-in scorer rather than V7-again. We can keep Hybrid’s Kalman, gates, and Hungarian — the parts that produced zero ID switches — and still grow a set model behind them. Ensemble is the staging mode: Hybrid stays in charge, the transformer is allowed to vote."),
   );
@@ -496,7 +510,7 @@ async function main() {
   );
   children.push(
     bullet("Operational default: Hybrid-MLP (--mode hybrid --assoc mlp). It is trained, measured, and stable on sim and Sweden."),
-    bullet("Research path: Hybrid + ensemble with the Sweden-tuned V8 checkpoint. Slight dense-sim gain, Sweden tie, zero ID switches."),
+    bullet("Research path: Hybrid + ensemble with the Sweden-tuned V8 checkpoint. Single-run +0.007 MOTA on the dense stream, Sweden tie to three decimals, zero ID switches."),
     bullet("Do not run --assoc transformer alone in an operational eval. It under-clusters or over-clusters depending on threshold and floods false tracks."),
     bullet("Do not reopen V7. A transformer that owns initiation and state has already failed this problem."),
   );
@@ -514,7 +528,7 @@ async function main() {
   children.push(
     h1("9.  Closing"),
     p("We set out to replace a stack of single-CAT trackers and a correlator with one system. We tried to make that system a single network. The networks that owned everything (V3–V7) failed in the same way: they could not be trusted with birth, death, and time. Hybrid succeeded because it refused those jobs to the net."),
-    p("V8 is how the net comes back — as a pair scorer that can see the traffic around the pair. Ensemble is the first time that idea helps the scoreboard without breaking identity. Hybrid still has the highest standalone results. The transformer is the architecture we will need when the pairs start to lie."),
+    p("V8 is how the net comes back — as a pair scorer that can see the traffic around the pair. Ensemble is the first time that idea moves the dense-stream scoreboard without breaking identity, and only by a single-run +0.007 MOTA. Hybrid still has the highest standalone results. The transformer is the architecture we will need when the pairs start to lie."),
     p("Research is paused here so this story can be submitted. The code path is on main: Hybrid by default, V8 behind --assoc, ensemble as the blend."),
   );
 
@@ -594,17 +608,8 @@ async function main() {
   });
 
   const buf = await Packer.toBuffer(doc);
-  try {
-    fs.writeFileSync(OUT, buf);
-    console.log("Wrote", OUT);
-  } catch (err) {
-    if (err && err.code === "EBUSY") {
-      fs.writeFileSync(OUT_ALT, buf);
-      console.log("Original report is open in Word. Wrote", OUT_ALT);
-    } else {
-      throw err;
-    }
-  }
+  fs.writeFileSync(OUT, buf);
+  console.log("Wrote", OUT);
 }
 
 main().catch((err) => {
