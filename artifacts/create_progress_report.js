@@ -241,7 +241,7 @@ async function main() {
   children.push(
     p("Two specialist MLPs do the learned work today. Each pair is scored alone. Hungarian and the Kalman filter never see a neural state vector. Section 4 specifies those MLPs — features, training, and the transformer that can replace or average them."),
     img("artifacts/architecture_hybrid_v8.png", 640, 460, "Hybrid pipeline and V8 associator architecture"),
-    caption("Figure 1. How the model works. Top: Hybrid pipeline. Purple block is the only neural scorer — MLP, V8, ensemble, or split. Kalman, gates, Hungarian, and M/N stay classical. Bottom: V8 token path. Self-attention is within tracks and within plots; geometry stays in rel_ij. The net never predicts state or existence."),
+    caption("Figure 1. How the model works. Top: Hybrid pipeline. Purple block is the only neural scorer — MLP, V8, ensemble, or split. Kalman, gates, Hungarian, and M/N stay classical. Bottom: V8 token path. Self-attention is within tracks and within plots; geometry stays in rel_ij. The net never predicts state or existence. Briefing script for every box: artifacts/Architecture_Block_Guide.docx."),
     img("artifacts/tracking_visualization.png", 620, 360, "Hybrid tracker simulation with confirmed tracks and trails"),
     caption("Figure 2. Hybrid correlator on a streaming holdout: clutter, measurements, ground truth, and confirmed tracks with trails."),
   );
