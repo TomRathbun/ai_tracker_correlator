@@ -6,7 +6,7 @@ const OUT = path.join(ART, "Software_Architecture.pptx");
 
 const pres = new pptxgen();
 pres.layout = "LAYOUT_16x9";
-pres.author = "Tom Rathbun";
+pres.author = "Thomas Rathbun, PhD";
 pres.title = "Software Architecture — AI Tracker Correlator";
 pres.subject = "System architecture, components, and design trade-offs";
 
@@ -39,6 +39,14 @@ function base(title, eyebrow = "SOFTWARE ARCHITECTURE  ·  AI TRACKER CORRELATOR
   s.addText(title, {
     x: 0.45, y: 0.44, w: 9.1, h: 0.45,
     fontSize: 24, fontFace: "Calibri", color: C.white, bold: true, margin: 0,
+  });
+  s.addText("LOCKHEED MARTIN PROPRIETARY INFORMATION", {
+    x: 0.45, y: 0.02, w: 6.4, h: 0.16,
+    fontSize: 8, fontFace: "Calibri", color: "FECACA", bold: true, margin: 0,
+  });
+  s.addText("Thomas Rathbun, PhD  ·  LOCKHEED MARTIN PROPRIETARY INFORMATION", {
+    x: 0.45, y: 5.38, w: 8.4, h: 0.2,
+    fontSize: 9, fontFace: "Calibri", color: C.muted, margin: 0,
   });
   return s;
 }
@@ -83,6 +91,14 @@ function pill(s, x, y, w, h, text, fill, textColor) {
   s.addText("SYSTEM DESIGN OVERVIEW", {
     x: 0.55, y: 1.35, w: 9, h: 0.3,
     fontSize: 13, fontFace: "Calibri", color: C.accent, bold: true, margin: 0, charSpacing: 2,
+  });
+  s.addText("LOCKHEED MARTIN PROPRIETARY INFORMATION", {
+    x: 0.55, y: 0.18, w: 8.5, h: 0.22,
+    fontSize: 10, fontFace: "Calibri", color: "FECACA", bold: true, margin: 0,
+  });
+  s.addText("Thomas Rathbun, PhD  ·  LOCKHEED MARTIN PROPRIETARY INFORMATION", {
+    x: 0.55, y: 5.28, w: 8.8, h: 0.22,
+    fontSize: 10, fontFace: "Calibri", color: C.muted, margin: 0,
   });
   s.addText("Software Architecture\n& Components", {
     x: 0.55, y: 1.8, w: 9, h: 1.15,
@@ -735,6 +751,14 @@ function pill(s, x, y, w, h, text, fill, textColor) {
   s.addText("THANK YOU", {
     x: 0.55, y: 1.8, w: 9, h: 0.4,
     fontSize: 14, fontFace: "Calibri", color: C.accent, bold: true, margin: 0, charSpacing: 2,
+  });
+  s.addText("LOCKHEED MARTIN PROPRIETARY INFORMATION", {
+    x: 0.55, y: 0.18, w: 8.5, h: 0.22,
+    fontSize: 10, fontFace: "Calibri", color: "FECACA", bold: true, margin: 0,
+  });
+  s.addText("Thomas Rathbun, PhD  ·  LOCKHEED MARTIN PROPRIETARY INFORMATION", {
+    x: 0.55, y: 5.28, w: 8.8, h: 0.22,
+    fontSize: 10, fontFace: "Calibri", color: C.muted, margin: 0,
   });
   s.addText("Questions & discussion", {
     x: 0.55, y: 2.3, w: 9, h: 0.7,

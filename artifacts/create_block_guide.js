@@ -516,7 +516,7 @@ async function main() {
   );
 
   const doc = new Document({
-    creator: "Tom Rathbun",
+    creator: "Thomas Rathbun, PhD",
     title: "Architecture Block Guide — AI Tracker Correlator",
     description: "Briefing script: every Figure 1 block, every acronym.",
     styles: {
@@ -543,10 +543,18 @@ async function main() {
             new Paragraph({
               tabStops: [{ type: TabStopType.RIGHT, position: CONTENT }],
               border: { bottom: { style: BorderStyle.SINGLE, size: 8, color: NAVY, space: 6 } },
-              spacing: { after: 80 },
+              spacing: { after: 40 },
               children: [
-                r("AI Tracker Correlator", { size: 16, bold: true, color: NAVY }),
-                r("\tArchitecture block guide  ·  briefing script", { size: 16, color: MUTED }),
+                r("AI Tracker Correlator", { size: 15, bold: true, color: NAVY }),
+                r("  ·  Architecture block guide  ·  briefing script", { size: 15, color: MUTED }),
+              ],
+            }),
+            new Paragraph({
+              tabStops: [{ type: TabStopType.RIGHT, position: CONTENT }],
+              spacing: { after: 60 },
+              children: [
+                r("LOCKHEED MARTIN PROPRIETARY INFORMATION", { size: 14, bold: true, color: "7A1F1F" }),
+                r("\tThomas Rathbun, PhD", { size: 14, color: MUTED }),
               ],
             }),
           ],
@@ -557,13 +565,18 @@ async function main() {
           children: [
             new Paragraph({
               tabStops: [{ type: TabStopType.RIGHT, position: CONTENT }],
-              border: { top: { style: BorderStyle.SINGLE, size: 6, color: LINE, space: 6 } },
-              spacing: { before: 60 },
+              border: { top: { style: BorderStyle.SINGLE, size: 6, color: LINE, space: 4 } },
+              spacing: { before: 40, after: 20 },
               children: [
-                r("Tom Rathbun  ·  16 August 2026  ·  Point at the box, then read its heading", { size: 15, color: MUTED }),
+                r("LOCKHEED MARTIN PROPRIETARY INFORMATION", { size: 13, bold: true, color: "7A1F1F" }),
                 r("\t"),
-                r("Page ", { size: 15, color: MUTED }),
-                new TextRun({ children: [PageNumber.CURRENT], font: "Arial", size: 15, color: MUTED }),
+                r("Page ", { size: 13, color: MUTED }),
+                new TextRun({ children: [PageNumber.CURRENT], font: "Arial", size: 13, color: MUTED }),
+              ],
+            }),
+            new Paragraph({
+              children: [
+                r("Thomas Rathbun, PhD  ·  16 August 2026  ·  Point at the box, then read its heading", { size: 13, color: MUTED }),
               ],
             }),
           ],

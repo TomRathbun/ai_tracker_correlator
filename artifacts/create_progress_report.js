@@ -184,7 +184,7 @@ async function main() {
     }),
     p("An AI / ML tracker-correlator for multi-radar air-traffic surveillance: problem, architecture lineage (V3–V8), and what the numbers actually say.", { size: 22, italics: true, color: MUTED, align: AlignmentType.LEFT, after: 240 }),
     rich([
-      r("Author: ", { bold: true }), r("Tom Rathbun"),
+      r("Author: ", { bold: true }), r("Thomas Rathbun, PhD"),
       r("    ·    "),
       r("Project: ", { bold: true }), r("AI Tracker Correlator"),
       r("    ·    "),
@@ -536,7 +536,7 @@ async function main() {
   );
 
   const doc = new Document({
-    creator: "Tom Rathbun",
+    creator: "Thomas Rathbun, PhD",
     title: "Capstone Progress Report — AI Tracker Correlator",
     description: "From per-sensor CAT trackers to Hybrid, V3–V8, and the MLP / transformer ensemble.",
     styles: {
@@ -580,10 +580,18 @@ async function main() {
             new Paragraph({
               tabStops: [{ type: TabStopType.RIGHT, position: CONTENT }],
               border: { bottom: { style: BorderStyle.SINGLE, size: 8, color: NAVY, space: 6 } },
-              spacing: { after: 120 },
+              spacing: { after: 80 },
               children: [
-                r("AI Tracker Correlator", { size: 16, bold: true, color: NAVY }),
-                r("\tCapstone progress report", { size: 16, color: MUTED }),
+                r("AI Tracker Correlator", { size: 15, bold: true, color: NAVY }),
+                r("  ·  Capstone progress report", { size: 15, color: MUTED }),
+              ],
+            }),
+            new Paragraph({
+              tabStops: [{ type: TabStopType.RIGHT, position: CONTENT }],
+              spacing: { after: 80 },
+              children: [
+                r("LOCKHEED MARTIN PROPRIETARY INFORMATION", { size: 14, bold: true, color: "7A1F1F" }),
+                r("\tThomas Rathbun, PhD", { size: 14, color: MUTED }),
               ],
             }),
           ],
@@ -594,13 +602,18 @@ async function main() {
           children: [
             new Paragraph({
               tabStops: [{ type: TabStopType.RIGHT, position: CONTENT }],
-              border: { top: { style: BorderStyle.SINGLE, size: 6, color: LINE, space: 6 } },
-              spacing: { before: 80 },
+              border: { top: { style: BorderStyle.SINGLE, size: 6, color: LINE, space: 4 } },
+              spacing: { before: 60, after: 20 },
               children: [
-                r("Tom Rathbun  ·  16 August 2026  ·  Not for operational use", { size: 16, color: MUTED }),
+                r("LOCKHEED MARTIN PROPRIETARY INFORMATION", { size: 14, bold: true, color: "7A1F1F" }),
                 r("\t"),
-                r("Page ", { size: 16, color: MUTED }),
-                new TextRun({ children: [PageNumber.CURRENT], font: "Arial", size: 16, color: MUTED }),
+                r("Page ", { size: 14, color: MUTED }),
+                new TextRun({ children: [PageNumber.CURRENT], font: "Arial", size: 14, color: MUTED }),
+              ],
+            }),
+            new Paragraph({
+              children: [
+                r("Thomas Rathbun, PhD  ·  16 August 2026  ·  Not for operational use", { size: 13, color: MUTED }),
               ],
             }),
           ],

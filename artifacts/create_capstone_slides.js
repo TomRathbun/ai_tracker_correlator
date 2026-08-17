@@ -2,7 +2,7 @@ const pptxgen = require("pptxgenjs");
 
 const pres = new pptxgen();
 pres.layout = "LAYOUT_16x9";
-pres.author = "Tom Rathbun";
+pres.author = "Thomas Rathbun, PhD";
 pres.title = "AI Tracker Correlator — Capstone Brief";
 pres.subject = "Company Capstone Project";
 
@@ -36,6 +36,14 @@ function baseSlide(title, eyebrow = "CAPSTONE  ·  AIR TRAFFIC SURVEILLANCE") {
     x: 0.45, y: 0.48, w: 9.1, h: 0.5,
     fontSize: 28, fontFace: "Calibri", color: C.white,
     bold: true, margin: 0,
+  });
+  slide.addText("LOCKHEED MARTIN PROPRIETARY INFORMATION", {
+    x: 0.45, y: 0.02, w: 6.4, h: 0.18,
+    fontSize: 8, fontFace: "Calibri", color: "FECACA", bold: true, margin: 0,
+  });
+  slide.addText("Thomas Rathbun, PhD  ·  LOCKHEED MARTIN PROPRIETARY INFORMATION", {
+    x: 0.45, y: 5.38, w: 8.2, h: 0.2,
+    fontSize: 9, fontFace: "Calibri", color: C.muted, margin: 0,
   });
   return slide;
 }
