@@ -81,7 +81,8 @@ uv run run_cli.py --mode gnn --arch gnn_only --run-name "GNN_Test_01" --threshol
 
 ### PlotForge (UAE sim) domain adapt
 
-Fine-tune clutter + pairwise MLPs on a PlotForge canonical JSONL stream, then eval MOTA on a held-out seed. Ablations 1–4 (gated-clique encode, rel_ij-only V8, dual score heads, cluster/assign τ) are in [`artifacts/plotforge_ablations.md`](artifacts/plotforge_ablations.md).
+Simulator: [TomRathbun/PlotForge](https://github.com/TomRathbun/PlotForge). Fine-tune clutter + pairwise MLPs on a PlotForge canonical JSONL stream, then eval MOTA on a held-out seed. Ablations 1–4 (gated-clique encode, rel_ij-only V8, dual score heads, cluster/assign τ) are in [`artifacts/plotforge_ablations.md`](artifacts/plotforge_ablations.md).
+
 
 **Ship on PlotForge:** Hybrid MLP, `--cluster-threshold 0.2 --assign-threshold 0.35 --dustbin` (holdout MOTA **0.896**). Native Sweden hybrid remains 0.976.
 
