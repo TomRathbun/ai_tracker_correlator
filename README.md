@@ -79,6 +79,25 @@ uv run run_cli.py --mode gnn --arch gnn_only --run-name "GNN_Test_01" --threshol
 
 **What V8 is:** not a new tracker. Hybrid-MLP is the operational path (clutter → 2 km cluster → 8 km assign → Hungarian → async Kalman → M/N). V8 swaps only the two pair scorers for a small transformer; gates, KF, and track management stay Hybrid. Default `--assoc mlp`. Opt in with `--assoc transformer` after training `checkpoints/model_v8_assoc.pt`. Comparison and spec: [`artifacts/design_v8.md`](artifacts/design_v8.md). Train with `uv run python -m src.train_associator_v8 --data data/sim_hetero_001.jsonl`.
 
+### PlotForge (UAE sim) domain adapt
+
+Fine-tune clutter + pairwise MLPs on a PlotForge canonical JSONL stream, then eval MOTA on a held-out seed. Ablations 1–4 (gated-clique encode, rel_ij-only V8, dual score heads, cluster/assign τ) are in [`artifacts/plotforge_ablations.md`](artifacts/plotforge_ablations.md).
+
+**Ship on PlotForge:** Hybrid MLP, `--cluster-threshold 0.2 --assign-threshold 0.35 --dustbin` (holdout MOTA **0.896**). Native Sweden hybrid remains 0.976.
+
+```powershell
+uv run python train_plotforge.py --data path/to/plotforge_train.jsonl --out checkpoints/plotforge
+uv run python eval_plotforge.py --data path/to/plotforge_holdout.jsonl --assoc mlp `
+  --clutter-model checkpoints/plotforge/clutter_classifier.pt `
+  --psr-model checkpoints/plotforge/pairwise_psr_psr.pt `
+  --ssr-model checkpoints/plotforge/pairwise_ssr_any.pt `
+  --cluster-threshold 0.2 --assign-threshold 0.35 --dustbin `
+  --min-hits 2 --max-age 10 --no-snapshots --out artifacts/plotforge_eval/holdout.json
+```
+
+V8 extras: `--assoc transformer --v8-model-path checkpoints/plotforge/ablate_a2_rel_best.pt` (best V8, MOTA 0.878 at the same τ). `--rel-only` / `--gated-encode` / `--dual-heads` on `src.train_associator_v8`.
+
+
 ### 📈 Experiment Tracking (MLflow)
 All experiments are automatically logged to **MLflow**.
 

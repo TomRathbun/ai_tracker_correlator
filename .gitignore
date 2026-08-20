@@ -30,6 +30,15 @@ optimization_reports/
 *.jsonl
 *.pt
 *.json
+# PlotForge domain-adapt best weights + eval JSON (force-tracked)
+!checkpoints/plotforge/
+!checkpoints/plotforge/*.pt
+!checkpoints/plotforge/*.json
+!artifacts/plotforge_ablations.md
+!artifacts/plotforge_eval_latest.json
+!artifacts/plotforge_eval/
+!artifacts/plotforge_eval/**
+
 # Canonical training datasets are intentionally versioned
 !data/canonical/
 !data/canonical/**

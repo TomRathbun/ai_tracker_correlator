@@ -180,10 +180,13 @@ def train_associator(
     neg_ratio: float = 8.0,
     patience: int = 6,
     seed: int = 42,
+    rel_only: bool = False,
+    gated_encode: bool = False,
+    dual_heads: bool = False,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     rng = np.random.RandomState(seed)
-    print(f"Device: {device}  neg_ratio={neg_ratio}  patience={patience}")
+    print(f"Device: {device}  neg_ratio={neg_ratio}  patience={patience}  rel_only={rel_only} gated={gated_encode} dual={dual_heads} attn={use_self_attn}")
 
     measurements, _truth, all_ids = load_stream_and_truth(data_file)
     train_ids, test_ids = make_split(all_ids, split_ratio=split_ratio)
@@ -198,6 +201,9 @@ def train_associator(
         hidden_dim=hidden_dim,
         num_heads=num_heads,
         use_self_attn=use_self_attn,
+        rel_only=rel_only,
+        gated_encode=gated_encode,
+        dual_heads=dual_heads,
     ).to(device)
 
     os.makedirs(os.path.dirname(checkpoint_path) or ".", exist_ok=True)
@@ -207,6 +213,11 @@ def train_associator(
             ckpt = torch.load(warm, map_location=device, weights_only=False)
             state = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
             model.load_state_dict(state, strict=False)
+            if dual_heads:
+                has_psr = any(str(k).startswith("psr_head") for k in state.keys())
+                if not has_psr:
+                    model.copy_shared_to_dual()
+                    print("  cloned shared score_head into dual PSR/SSR heads")
             print(f"Resumed V8 from {warm}")
         except Exception as exc:
             print(f"Could not load checkpoint ({exc}); training from scratch")
@@ -294,6 +305,9 @@ def train_associator(
                 "hidden_dim": hidden_dim,
                 "num_heads": num_heads,
                 "use_self_attn": use_self_attn,
+                "rel_only": rel_only,
+                "gated_encode": gated_encode,
+                "dual_heads": dual_heads,
             },
             "metrics": {"val_pair_precision": val["precision"], "val_pair_f1": val["f1"]},
             "schema_version": 1,
@@ -334,6 +348,9 @@ def main():
     p.add_argument("--patience", type=int, default=6, help="Early-stop epochs without val pair-F1 gain")
     p.add_argument("--max-windows", type=int, default=None)
     p.add_argument("--no-self-attn", action="store_true")
+    p.add_argument("--rel-only", action="store_true")
+    p.add_argument("--gated-encode", action="store_true")
+    p.add_argument("--dual-heads", action="store_true")
     args = p.parse_args()
     train_associator(
         data_file=args.data,
@@ -346,6 +363,9 @@ def main():
         init_path=args.init,
         neg_ratio=args.neg_ratio,
         patience=args.patience,
+        rel_only=args.rel_only,
+        gated_encode=args.gated_encode,
+        dual_heads=args.dual_heads,
     )
 
 

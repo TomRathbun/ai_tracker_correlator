@@ -1,0 +1,50 @@
+{
+  "ok": true,
+  "generatedAt": "2026-08-20T09:28:03.811847+00:00",
+  "data": "/tmp/plotforge_eval_s91_90s.jsonl",
+  "mode": "hybrid",
+  "assoc": "transformer",
+  "clusterBackend": "transformer",
+  "assignBackend": "transformer",
+  "minHits": 2,
+  "maxAge": 10,
+  "matchThresholdM": 7000.0,
+  "clusterThreshold": 0.3,
+  "assignThreshold": 0.35,
+  "dustbin": false,
+  "v8GatedEncode": false,
+  "v8Temperature": null,
+  "checkpoints": {
+    "clutter": "checkpoints/plotforge/clutter_classifier.pt",
+    "psr": "checkpoints/plotforge/pairwise_psr_psr.pt",
+    "ssr": "checkpoints/plotforge/pairwise_ssr_any.pt",
+    "v8": "checkpoints/model_v8_assoc_best.pt"
+  },
+  "durationS": 99.85,
+  "nMeasurements": 20258,
+  "nTruthTracks": 47,
+  "nFrames": 100,
+  "elapsedS": 12.15,
+  "metrics": {
+    "mota": 0.5405,
+    "motpM": 329.8,
+    "precision": 0.738,
+    "recall": 0.9975,
+    "f1": 0.8484,
+    "idSwitches": 462,
+    "fp": 1589,
+    "fn": 11,
+    "matches": 4476,
+    "fpPerFrame": 15.89,
+    "fnPerFrame": 0.11
+  },
+  "baselineSwedenHoldout": {
+    "source": "artifacts/TRAINING_DATA_CHAPTER.md hybrid max-age=10 min-hits=2",
+    "mota": 0.976,
+    "motpM": 105,
+    "precision": 0.979,
+    "recall": 0.998,
+    "idSwitches": 0
+  },
+  "snapshots": []
+}

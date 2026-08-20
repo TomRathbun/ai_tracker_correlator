@@ -1,0 +1,62 @@
+{
+  "data": "/tmp/plotforge_train_s7_180s.jsonl",
+  "nHits": 43646,
+  "nWindows": 192,
+  "models": [
+    {
+      "name": "clutter",
+      "nTrain": 37099,
+      "nVal": 6547,
+      "posRate": 0.0697,
+      "bestF1": 1.0,
+      "best": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "tp": 443.0,
+        "fp": 0.0,
+        "fn": 0.0,
+        "loss": 0.0038
+      },
+      "epochs": 20,
+      "path": "checkpoints/plotforge/clutter_classifier.pt"
+    },
+    {
+      "name": "psr-psr",
+      "nTrain": 33893,
+      "nVal": 5982,
+      "posRate": 0.3779,
+      "bestF1": 0.9971,
+      "best": {
+        "precision": 0.9991,
+        "recall": 0.9952,
+        "f1": 0.9971,
+        "tp": 2261.0,
+        "fp": 2.0,
+        "fn": 11.0,
+        "loss": 0.0378
+      },
+      "epochs": 20,
+      "path": "checkpoints/plotforge/pairwise_psr_psr.pt"
+    },
+    {
+      "name": "ssr-any",
+      "nTrain": 167926,
+      "nVal": 29635,
+      "posRate": 0.5315,
+      "bestF1": 0.9758,
+      "best": {
+        "precision": 0.9649,
+        "recall": 0.9871,
+        "f1": 0.9758,
+        "tp": 15569.0,
+        "fp": 567.0,
+        "fn": 204.0,
+        "loss": 0.0687
+      },
+      "epochs": 20,
+      "path": "checkpoints/plotforge/pairwise_ssr_any.pt"
+    }
+  ],
+  "elapsedS": 54.62
+}

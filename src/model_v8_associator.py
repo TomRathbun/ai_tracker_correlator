@@ -198,6 +198,9 @@ class AssociationTransformerV8(nn.Module):
         dropout: float = 0.1,
         max_sensors: int = 8,
         use_self_attn: bool = True,
+        rel_only: bool = False,
+        gated_encode: bool = False,
+        dual_heads: bool = False,
     ):
         super().__init__()
         if hidden_dim % num_heads != 0:
@@ -205,6 +208,9 @@ class AssociationTransformerV8(nn.Module):
         self.hidden_dim = hidden_dim
         self.use_self_attn = use_self_attn
         self.max_sensors = max_sensors
+        self.rel_only = bool(rel_only)
+        self.gated_encode = bool(gated_encode)
+        self.dual_heads = bool(dual_heads)
 
         self.input_proj = nn.Linear(NUMERIC_DIM, hidden_dim)
         self.role_emb = nn.Embedding(2, hidden_dim)
@@ -224,19 +230,31 @@ class AssociationTransformerV8(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
 
-        pair_in = hidden_dim * 2 + REL_DIM
-        self.score_head = nn.Sequential(
-            nn.Linear(pair_in, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1),
-        )
+        pair_in = REL_DIM if self.rel_only else hidden_dim * 2 + REL_DIM
+
+        def _head() -> nn.Sequential:
+            return nn.Sequential(
+                nn.Linear(pair_in, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, 1),
+            )
+
+        self.score_head = _head()
+        self.psr_head = _head() if self.dual_heads else None
+        self.ssr_head = _head() if self.dual_heads else None
         self.dustbin_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
         )
+        self.register_buffer("temperature", torch.tensor(1.0))
+
+    def copy_shared_to_dual(self) -> None:
+        if self.dual_heads and self.psr_head is not None and self.ssr_head is not None:
+            self.psr_head.load_state_dict(self.score_head.state_dict())
+            self.ssr_head.load_state_dict(self.score_head.state_dict())
 
     def _role_id(self, role) -> int:
         if isinstance(role, str):
@@ -260,7 +278,6 @@ class AssociationTransformerV8(nn.Module):
                 item = normalize_measurement_dict(raw)
             except Exception:
                 item = {}
-            # keep kinematics / age from the raw track dict (may not be a measurement)
             merged = dict(item)
             for k in ("x", "y", "z", "vx", "vy", "vz", "age", "hits", "kf_t", "_dt", "mode_3a", "mode3a", "mode_s"):
                 if k in raw and raw[k] is not None:
@@ -299,8 +316,83 @@ class AssociationTransformerV8(nn.Module):
             h = self.encoder(h.unsqueeze(0)).squeeze(0)
         return h
 
-    def _pair_logits(self, h_left: torch.Tensor, h_right: torch.Tensor, rel: torch.Tensor) -> torch.Tensor:
-        return self.score_head(torch.cat([h_left, h_right, rel], dim=-1)).squeeze(-1)
+    def encode_cliques(
+        self,
+        items: Sequence[Dict],
+        pair_index: torch.Tensor,
+        role: str = "meas",
+    ) -> torch.Tensor:
+        """Self-attn inside connected components of the gated pair graph (ablation 1)."""
+        n = len(items)
+        device = next(self.parameters()).device
+        if n == 0:
+            return torch.zeros((0, self.hidden_dim), device=device)
+        if pair_index is None or pair_index.numel() == 0 or n == 1:
+            return self.encode(items, role)
+        from scipy.sparse import csr_matrix
+        from scipy.sparse.csgraph import connected_components
+
+        ii = pair_index[:, 0].detach().cpu().numpy().astype(np.int64)
+        jj = pair_index[:, 1].detach().cpu().numpy().astype(np.int64)
+        used = np.unique(np.concatenate([ii, jj]))
+        h = torch.zeros((n, self.hidden_dim), device=device)
+        if used.size == 0:
+            return h
+        # components on the used-node subgraph
+        remap = {int(old): k for k, old in enumerate(used.tolist())}
+        u = np.array([remap[int(a)] for a in ii], dtype=np.int64)
+        v = np.array([remap[int(b)] for b in jj], dtype=np.int64)
+        m = used.size
+        adj = csr_matrix(
+            (np.ones(len(u) * 2, dtype=np.float32), (np.concatenate([u, v]), np.concatenate([v, u]))),
+            shape=(m, m),
+        )
+        n_comp, labels = connected_components(adj, directed=False)
+        for c in range(n_comp):
+            local = np.where(labels == c)[0]
+            orig = used[local].tolist()
+            sub = [items[int(i)] for i in orig]
+            h_sub = self.encode(sub, role)
+            h[torch.tensor(orig, dtype=torch.long, device=device)] = h_sub
+        return h
+
+    def _pair_feat(self, h_left: torch.Tensor, h_right: torch.Tensor, rel: torch.Tensor) -> torch.Tensor:
+        if self.rel_only:
+            return rel
+        return torch.cat([h_left, h_right, rel], dim=-1)
+
+    def _apply_head(self, feat: torch.Tensor, psr_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if self.dual_heads and self.psr_head is not None and self.ssr_head is not None:
+            logits = self.ssr_head(feat).squeeze(-1)
+            if psr_mask is not None:
+                logits = torch.where(psr_mask, self.psr_head(feat).squeeze(-1), logits)
+        else:
+            logits = self.score_head(feat).squeeze(-1)
+        temp = float(self.temperature.clamp_min(1e-3).item()) if self.temperature.ndim == 0 else float(self.temperature.reshape(-1)[0].clamp_min(1e-3).item())
+        return logits / temp
+
+    def _psr_mask_pairs(self, left: Sequence[Dict], right: Sequence[Dict], ii, jj, device) -> torch.Tensor:
+        mask = []
+        for i, j in zip(ii, jj):
+            a, b = left[int(i)], right[int(j)]
+            t1 = get_meas_type(a, "PSR")
+            t2 = get_meas_type(b, "PSR")
+            # tracks: SSR if they carry identity
+            if a.get("mode_3a") or a.get("mode3a") or a.get("mode_s"):
+                t1 = "SSR"
+            if b.get("mode_3a") or b.get("mode3a") or b.get("mode_s"):
+                t2 = "SSR"
+            mask.append(t1 == "PSR" and t2 == "PSR")
+        return torch.tensor(mask, dtype=torch.bool, device=device)
+
+    def _pair_logits(
+        self,
+        h_left: torch.Tensor,
+        h_right: torch.Tensor,
+        rel: torch.Tensor,
+        psr_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return self._apply_head(self._pair_feat(h_left, h_right, rel), psr_mask)
 
     def score_pairs(
         self,
@@ -308,11 +400,7 @@ class AssociationTransformerV8(nn.Module):
         right: Optional[Sequence[Dict]] = None,
         pair_index: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """(P,) logits for gated pairs. Used by _spatial_cluster.
-
-        Accepts the design signature ``score_pairs(left, right, pair_index)``
-        and the clustering shorthand ``score_pairs(items, pair_index)``.
-        """
+        """(P,) logits for gated pairs. Used by _spatial_cluster."""
         if pair_index is None and torch.is_tensor(right):
             pair_index = right
             right = left
@@ -321,44 +409,60 @@ class AssociationTransformerV8(nn.Module):
         if pair_index is None or pair_index.numel() == 0:
             return torch.zeros(0, device=next(self.parameters()).device)
         same = left is right
-        h_l = self.encode(left, role="meas")
-        h_r = h_l if same else self.encode(right, role="meas")
         ii = pair_index[:, 0].long()
         jj = pair_index[:, 1].long()
+        if self.rel_only:
+            device = next(self.parameters()).device
+            h_l = torch.zeros((len(left), self.hidden_dim), device=device)
+            h_r = h_l if same else torch.zeros((len(right), self.hidden_dim), device=device)
+        elif self.gated_encode:
+            h_l = self.encode_cliques(left, pair_index, role="meas")
+            h_r = h_l if same else self.encode_cliques(right, pair_index, role="meas")
+        else:
+            h_l = self.encode(left, role="meas")
+            h_r = h_l if same else self.encode(right, role="meas")
         rel_np = np.stack(
             [relative_feature_vec(left[int(i)], right[int(j)]) for i, j in zip(ii.tolist(), jj.tolist())]
         )
         rel = torch.from_numpy(rel_np).to(h_l.device)
-        return self._pair_logits(h_l[ii], h_r[jj], rel)
+        psr_mask = self._psr_mask_pairs(left, right, ii.tolist(), jj.tolist(), h_l.device) if self.dual_heads else None
+        return self._pair_logits(h_l[ii], h_r[jj], rel, psr_mask)
 
     def score_assignment(
         self,
         tracks: Sequence[Dict],
         metas: Sequence[Dict],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        S: (T, M) logits, dustbin: (T,) logits.
-        Track tokens stay at last KF time; rel_ij uses Hybrid time-projection.
-        """
+        """S: (T, M) logits, dustbin: (T,) logits."""
         device = next(self.parameters()).device
         t_n, m_n = len(tracks), len(metas)
         if t_n == 0:
             return torch.zeros((0, m_n), device=device), torch.zeros((0,), device=device)
         h_t = self.encode(tracks, role="track")
-        dust = self.dustbin_head(h_t).squeeze(-1)
+        dust = self.dustbin_head(h_t).squeeze(-1) / float(self.temperature.clamp_min(1e-3).reshape(-1)[0].item())
         if m_n == 0:
             return torch.zeros((t_n, 0), device=device), dust
         h_m = self.encode(metas, role="meas")
         rel_np = np.zeros((t_n, m_n, REL_DIM), dtype=np.float32)
+        psr = np.zeros((t_n, m_n), dtype=bool)
         for i, tr in enumerate(tracks):
+            t1 = "SSR" if (tr.get("mode_3a") or tr.get("mode3a") or tr.get("mode_s")) else "PSR"
             for j, meta in enumerate(metas):
                 mt = get_time(meta, None)
                 proj = project_track_to_time(tr, mt)
                 rel_np[i, j] = relative_feature_vec(proj, meta)
+                t2 = get_meas_type(meta, "PSR")
+                psr[i, j] = t1 == "PSR" and t2 == "PSR"
         rel = torch.from_numpy(rel_np).to(device)
         h_i = h_t.unsqueeze(1).expand(-1, m_n, -1)
         h_j = h_m.unsqueeze(0).expand(t_n, -1, -1)
-        scores = self._pair_logits(h_i.reshape(-1, self.hidden_dim), h_j.reshape(-1, self.hidden_dim), rel.reshape(-1, REL_DIM))
+        psr_mask = torch.from_numpy(psr).to(device).reshape(-1) if self.dual_heads else None
+        scores = self._pair_logits(
+            h_i.reshape(-1, self.hidden_dim),
+            h_j.reshape(-1, self.hidden_dim),
+            rel.reshape(-1, REL_DIM),
+            psr_mask,
+        )
         return scores.view(t_n, m_n), dust
 
 
@@ -367,17 +471,30 @@ def load_v8(path: str | Path, device: Optional[torch.device] = None, **kwargs) -
     ckpt = torch.load(path, map_location=device, weights_only=False)
     cfg = {}
     state = ckpt
+    extra = {}
     if isinstance(ckpt, dict):
         cfg = dict(ckpt.get("config") or {})
         state = ckpt.get("model_state_dict", ckpt)
+        extra = {k: ckpt[k] for k in ("temperature",) if k in ckpt}
     if "d_model" in cfg and "hidden_dim" not in cfg:
         cfg["hidden_dim"] = cfg.pop("d_model")
     if "nhead" in cfg and "num_heads" not in cfg:
         cfg["num_heads"] = cfg.pop("nhead")
-    cfg = {k: v for k, v in cfg.items() if k in {"hidden_dim", "num_heads", "num_layers", "dropout", "use_self_attn"}}
+    allowed = {
+        "hidden_dim", "num_heads", "num_layers", "dropout", "use_self_attn",
+        "rel_only", "gated_encode", "dual_heads", "max_sensors",
+    }
+    cfg = {k: v for k, v in cfg.items() if k in allowed}
     cfg.update(kwargs)
     model = AssociationTransformerV8(**cfg).to(device)
     model.load_state_dict(state, strict=False)
+    if model.dual_heads:
+        # If the ckpt was a shared head, clone it into both specialized heads.
+        has_psr = any(k.startswith("psr_head") for k in (state.keys() if hasattr(state, "keys") else []))
+        if not has_psr:
+            model.copy_shared_to_dual()
+    if "temperature" in extra:
+        model.temperature.fill_(float(extra["temperature"]))
     model.eval()
     return model
 
