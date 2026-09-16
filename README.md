@@ -6,6 +6,7 @@ A deep learning-based multi-target tracker using Graph Attention Networks (GAT) 
 
 - Markdown: [PHASE2_WRITEUP.md](PHASE2_WRITEUP.md)
 - **Confluence paste:** open [PHASE2_WRITEUP.html](PHASE2_WRITEUP.html) in a browser, Select all, Copy, then paste into the Confluence *visual* editor (not the Markdown file). Wiki markup: [PHASE2_WRITEUP.confluence.txt](PHASE2_WRITEUP.confluence.txt).
+Architecture figure for Confluence (section 15): [artifacts/hybrid_architecture_confluence.png](artifacts/hybrid_architecture_confluence.png). Editable draw.io: [artifacts/hybrid_architecture.drawio](artifacts/hybrid_architecture.drawio). Two-panel V8 figure: [artifacts/architecture_hybrid_v8.png](artifacts/architecture_hybrid_v8.png).
 
 ## Features
 

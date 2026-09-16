@@ -501,6 +501,8 @@ I can defend every line of {{src/kalman_filter.py}} without an assistant. The in
 
 h2. 15. Architecture / Workflow
 
+!https://raw.githubusercontent.com/TomRathbun/ai_tracker_correlator/main/artifacts/hybrid_architecture_confluence.png|alt="Operational Hybrid architecture"!
+
 !https://raw.githubusercontent.com/TomRathbun/ai_tracker_correlator/main/artifacts/pipeline_diagram.png|alt="Operational pipeline from plots to confirmed tracks"!
 
 {code}

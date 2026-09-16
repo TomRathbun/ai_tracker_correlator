@@ -590,6 +590,8 @@ I can defend every line of `src/kalman_filter.py` without an assistant. The inte
 
 ## 15. Architecture / Workflow
 
+![Operational Hybrid architecture](artifacts/hybrid_architecture_confluence.png)
+
 ![Operational pipeline from plots to confirmed tracks](artifacts/pipeline_diagram.png)
 
 ```
