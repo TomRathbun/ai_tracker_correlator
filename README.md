@@ -2,7 +2,10 @@
 
 A deep learning-based multi-target tracker using Graph Attention Networks (GAT) with recurrent memory for radar tracking and sensor fusion.
 
-**Phase 2 final write-up** (AI/ML Fundamentals — Hybrid MLP + async Kalman, Sweden MOTA **0.976** / PlotForge MOTA **0.896**): [PHASE2_WRITEUP.md](PHASE2_WRITEUP.md).
+**Phase 2 final write-up** (AI/ML Fundamentals — Hybrid MLP + async Kalman, Sweden MOTA **0.976** / PlotForge MOTA **0.896**):
+
+- Markdown: [PHASE2_WRITEUP.md](PHASE2_WRITEUP.md)
+- **Confluence paste:** open [PHASE2_WRITEUP.html](PHASE2_WRITEUP.html) in a browser, Select all, Copy, then paste into the Confluence *visual* editor (not the Markdown file). Wiki markup: [PHASE2_WRITEUP.confluence.txt](PHASE2_WRITEUP.confluence.txt).
 
 ## Features
 
