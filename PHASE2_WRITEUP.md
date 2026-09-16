@@ -355,11 +355,13 @@ Major experiments that changed my mind (not every hyperparameter poke):
 
 ## 8. Model Evaluation
 
-**Metrics.** MOTA, MOTP, precision, recall, F1, ID switches, FP/frame, FN/frame. Formula used in `src/metrics.py`:
+**Metrics.** MOTA, MOTP, precision, recall, F1, ID switches, FP/frame, FN/frame. Formula used in `src/metrics.py` (CLEAR MOT):
 
-\[
-\mathrm{MOTA} = 1 - \frac{\mathrm{FN} + \mathrm{FP} + \mathrm{IDSW}}{\mathrm{GT}}
-\]
+**MOTA = 1 − (FN + FP + IDSW) / GT**
+
+FN, FP, and IDSW are counts after Hungarian matching to interpolated ground truth; GT is the number of ground-truth objects in the eval window. A miss, a false track, and an identity swap each cost 1 / GT.
+
+![MOTA formula](artifacts/mota_formula.png)
 
 MOTP = mean Euclidean position error of Hungarian matches under a distance gate (7–15 km depending on run — large vs radar σ, so MOTP is “how tight are the good matches,” not “did we match”).
 
