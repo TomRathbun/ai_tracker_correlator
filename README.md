@@ -2,6 +2,8 @@
 
 A deep learning-based multi-target tracker using Graph Attention Networks (GAT) with recurrent memory for radar tracking and sensor fusion.
 
+**Phase 2 final write-up** (AI/ML Fundamentals — Hybrid MLP + async Kalman, Sweden MOTA **0.976** / PlotForge MOTA **0.896**): [PHASE2_WRITEUP.md](PHASE2_WRITEUP.md).
+
 ## Features
 
 - **Graph Attention Networks (GATv2)** for modeling relationships between tracks and measurements

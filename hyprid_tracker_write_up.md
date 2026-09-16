@@ -1,4 +1,7 @@
+> **Superseded.** The AI/ML Fundamentals Phase 2 write-up is [PHASE2_WRITEUP.md](PHASE2_WRITEUP.md). This file is the earlier short feasibility note.
+
 ### Hybrid Tracker: AI/ML Feasibility for Unified Radar Fusion in Air Traffic Systems
+
 
 #### Core Concept: Single AI/ML Tracker for Multi-Sensor Inputs
 In standard setups, each radar (PSR for raw position/Doppler, SSR for transponder IDs) runs its own tracker to filter plots and build local tracks, then a correlator fuses them using rules like Mahalanobis gating or probabilistic matching to resolve duplicates. Our hybrid tracker flips this: One ML-driven system processes all decoded plots together, learning to associate and fuse across sensors for a single correlated output. It's "hybrid" because it combines classical elements (like Kalman for reliable updates) with AI (classifiers and GNNs) to handle real-world noise—PSR clutter, SSR intermittency, or datalink delays—more adaptively.

@@ -1,0 +1,774 @@
+# AI Tracker Correlator
+
+**AI/ML Fundamentals Phase 2 — Final Project Write-Up**
+
+| Field | Value |
+|---|---|
+| Project | AI Tracker Correlator |
+| Author | Thomas F. Rathbun |
+| Repositories | [ai_tracker_correlator](https://github.com/TomRathbun/ai_tracker_correlator), [PlotForge](https://github.com/TomRathbun/PlotForge) |
+| Status | Draft for Confluence — review before paste |
+| Primary result | Hybrid MLP + async Kalman, Sweden holdout **MOTA 0.976** (0 ID switches); PlotForge UAE holdout **MOTA 0.896** after domain adapt |
+
+This page is the reasoning record, not a README. Numbers come from logged evals on `stream_sweden_30min_holdout.jsonl`, `stream_radar_001.jsonl`, SORT baseline JSON, and PlotForge seed-91 holdout. Where a number changed across configs (`max_age=2` vs `10`), I say so.
+
+---
+
+## 1. Project Overview
+
+**Project name.** AI Tracker Correlator.
+
+**Project objective.** Determine whether a *single* AI/ML tracker can ingest multi-sensor radar plots (PSR and SSR), reject clutter, associate reports that belong to the same aircraft, estimate a fused kinematic state, and emit one correlated track picture — replacing the usual “one physics tracker per radar, then a downstream correlator.”
+
+**Business / user problem.** In air-traffic and air-defence surveillance, each radar currently runs its own tracker. Those local tracks are then correlated with Mahalanobis gates, identity matching, and a lot of hand-tuned thresholds. The pipeline is interpretable but brittle: scan-rate mismatch, PSR clutter, SSR dropouts, and crossing geometry all produce duplicate tracks or missed associations. Operators and C2 consumers need one track per aircraft, with stable identity, at scan-time latency.
+
+**Intended users / stakeholders.** Tracker / fusion engineers, surveillance ops, and the apprenticeship reviewers who need to see how the AI/ML reasoning was done — not just that a model trained.
+
+**What success looks like.** On held-out simulated streams that preserve real CAT-062 traffic patterns: MOTA competitive with a well-tuned physics hybrid, **zero or near-zero ID switches**, precision high enough that false tracks do not pollute the picture, and a system I can explain component-by-component.
+
+**Final solution (high level).** The operational path is **not** an end-to-end GNN. It is a **hybrid pipeline**:
+
+1. Unary MLP clutter filter  
+2. Dual pairwise MLPs (PSR–PSR kinematics; SSR–ANY identity + geometry)  
+3. 2 km spatial clustering into meta-measurements  
+4. 8 km assignment scored by the same MLPs, solved with Hungarian  
+5. Continuous-time constant-velocity Kalman update at `dt = meas_t − track_t`  
+6. M/N track management (`min_hits=2`, `max_age=10` on the golden eval)
+
+A transformer pair-scorer (V8) can swap in for the two MLP calls. It did not beat Hybrid-MLP on MOTA, so it is research-only.
+
+### Explain your thinking
+
+**What problem were you actually trying to solve?**  
+Not “train a neural net on radar.” The real problem is **multi-sensor plot-to-track association under asynchronous scans**. If association is wrong, every downstream filter is decorating a falsehood. If association is right, a Kalman filter is almost enough.
+
+**Why was AI/ML appropriate?**  
+The hard residual after physics is *which* plots belong together. That is a noisy, multi-modal classification problem: same-aircraft PSR+SSR pairs sit a few hundred metres apart with matching squawk; clutter and neighbours sit in the same range gate. Hand gates cannot encode “Mode-3A match + 400 m + similar heading” as a smooth score. Small supervised MLPs can.
+
+**Could this have been solved without ML?**  
+Yes — and I ran that. A Kalman-only tracker with nearest-neighbour association is the classical solution (GNN in the *Global Nearest Neighbour* sense, SORT-style). On the same Sweden-like stream it produced MOTA **−1.32** (precision 0.30) because it initiated on clutter and could not fuse PSR/SSR. A pure Mahalanobis correlator on local tracks is how production systems work; it would look like “per-radar KF + assignment.” That is a valid product. I used ML because I wanted *one* tracker on *raw multi-sensor plots*, and because pairwise scores generalize across sensor mixes better than a pile of if-statements.
+
+**What made the chosen approach preferable?**  
+It keeps physics where physics is solved (time, coasting, covariance) and uses ML only where the decision is a probability (clutter vs target; same-object vs not). When I let the net own time and initiation (Recurrent GAT, then V7 transformer), MOTA went negative. Hybrid is preferable because it *failed less*, and the failures were diagnosable.
+
+**Assumptions before starting.**  
+(1) A fully learned recurrent GNN could replace Kalman. (2) Batch-aligned frames would transfer to streaming radars. (3) MOTA on a 10-minute sim would be a fair operational claim. (4) Pair-F1 of the associator would predict tracking MOTA.
+
+**Which assumptions were wrong?**  
+All four, in that order. Kalman owns time better than a GRU. Asynchronous 5.5–9 s scans are not a 2 s snapshot. Duration ≠ difficulty (sparse long CAT-062 cuts are easy). Pair-F1 on PlotForge V8 was ~0.04–0.14 with precision 0.99 — a useless ship metric. Tracking MOTA is the ship metric.
+
+---
+
+## 2. Problem Formulation
+
+**Type of ML/AI problem.** A *composite* tracking problem, decomposed:
+
+| Stage | ML type | Output |
+|---|---|---|
+| Clutter filter | Binary classification (unary) | P(clutter) |
+| Spatial cluster | Pairwise binary classification | P(same aircraft) inside 2 km |
+| Temporal assign | Pairwise binary classification + combinatorial assignment | P(track owns plot) inside 8 km; Hungarian uniqueness |
+| State update | *Not learned* — CV Kalman | [x,y,z,vx,vy,vz], P |
+| Track life | Rule-based M/N | tentative / confirmed / delete |
+| (Abandoned) GNN tracker | Graph regression + existence | Δstate, P(exist) |
+| (Research) V8 | Set-contextual pair scoring | logits + dustbin |
+
+**Inputs.** Time-ordered JSONL frames of Cartesian plots: sensor id, PSR/SSR type, position, optional Doppler velocity, amplitude, Mode-3A / Mode-S, timestamp.
+
+**Outputs.** Confirmed tracks: fused state, identity if known, age/hits, stable track id.
+
+**Target variable (learned parts).** For clutter: `track_id == -1`. For pairs: `1` iff both ids equal and not −1. `track_id` is **never a model feature**.
+
+**Features.** See §4. Kinematics for PSR–PSR; kinematics + identity match channels for SSR–ANY.
+
+**Constraints.** Real-time-ish (window 1–2 s); no future frames; hard spatial gates (do not score 50 km pairs); partial observations (SSR often has no velocity).
+
+**Assumptions.** Constant-velocity process between scans; Gaussian measurement noise; one track per aircraft after fusion; Poisson clutter, not terrain-correlated weather.
+
+### Explain your thinking
+
+**How did you determine the problem type?**  
+I started from the operational pipeline (detect → associate → filter → manage) and asked which boxes are *statistical decisions* vs *physical updates*. Association and clutter are classification. Kinematics under CV are filtering. Treating the whole thing as “sequence modelling” hid that split and made debugging impossible.
+
+**Other formulations considered.**  
+(1) End-to-end Recurrent GAT (nodes = tracks + measurements, GRU memory, existence head). (2) PointNet++ / PointTransformer on the plot cloud (research proposal). (3) Pure transformer tracker (V7) with residual Δs and learned initiation. (4) Classical GNN/JPDA/MHT without ML. (5) Hybrid: ML scores, Hungarian uniqueness, Kalman state.
+
+**Why reject the alternatives?**  
+End-to-end GNN: MOTA **−0.70** on `stream_radar_001` (precision 0.005). V7: holdout MOTA **−1.09 / −3.03**. PointNet++ never left the proposal — radar plots are already sparse and gated; hierarchical set abstraction was solving a problem I did not have. Classical KF-only: MOTA **−1.32**. Hybrid: MOTA **0.976** Sweden / **0.896** PlotForge.
+
+**Did you reformulate?**  
+Yes. The project *title* still says “AI tracker.” The *system* became “AI associator inside a physics tracker.” The cause was evidence, not taste: existence-head collapse during radar shadows, and temporal dragging in windowed batches.
+
+**Where did judgment matter most?**  
+Two calls: (1) **keep hard gates** in front of the net — V7’s 50 km association mask is how you drown in false positives. (2) **coast long enough for the slowest sensor** (`max_age=10` ≈ 10 s), not the average radar. That single lifecycle change moved Sweden MOTA from 0.56 to 0.977. That is not a glamorous ML result. It is the correct formulation of the tracking problem.
+
+---
+
+## 3. Data Understanding
+
+### Sources
+
+| Source | Geography | Role | Honest description |
+|---|---|---|---|
+| CAT-062 Sweden mini / tiled | Sweden | Dense multi-target core | *Real traffic scenario*, plots from a **lightweight observation model** (range gate, Bernoulli Pd, Gaussian noise, Poisson FA) — not a full radar physics sim |
+| CAT-062 Sweden long subset | Sweden | Rejected as train | Hours of data but **1–2 concurrent tracks** — easy, not representative |
+| CAT-062 UAE extract | Gulf | Density stress | ~2 min, 256 tracks, median 135 concurrent |
+| `sim_batch_hetero.jsonl` | Synthetic | Pairwise + clutter MLP train | 300 frames, 20 tracks, controlled PSR/SSR mix |
+| PlotForge streams | UAE (24 public radar sites) | Domain adapt + holdout | CAT-048-faithful sim: 4/3-earth horizon, Swerling-1 Pd, roadway clutter, combined plots split to PSR+SSR |
+
+**Approximate size (canonical streams).**
+
+| Stream | Duration | Measurements | Tracks | Concurrent med/max | Clutter | Difficulty |
+|---|---:|---:|---:|---|---:|---|
+| Sweden 15 min (mini) | 10.0 min | 28 379 | 54 | 20 / 31 | 3.0% | medium (41.5) |
+| Sweden 30 min train | 30.2 min | 83 637 | 162 | 19 / 32 | 3.1% | medium (41.6) |
+| Sweden 30 min holdout | 29.8 min | 80 770 | 163 | 19 / 32 | 3.2% | medium (41.3) |
+| Sweden 60 min | 60.5 min | 165 979 | 325 | 19 / 32 | 3.2% | medium (41.5) |
+| UAE 2 min | 2.0 min | 42 027 | 256 | 135 / 164 | 0.4% | **hard (62.7)** |
+| PlotForge train seed 7 | 180 s | 43 646 hits | — | 24 radars | — | high overlap |
+| PlotForge holdout seed 91 | 90 s | 20 258 hits | 47 truth | 24 radars | — | high overlap |
+
+**Important fields.** `t`, `x,y,z`, `vx,vy,vz` (often missing on SSR), `amplitude`, `meas_type` ∈ {PSR,SSR}, `sensor_id`, `mode_3a`, `mode_s`, `track_id` (label only), `gt_*` kinematics.
+
+**Target.** Pairwise: same `track_id`. Clutter: `track_id == -1`. Tracking metrics use interpolated GT against confirmed tracks (Hungarian, 7–15 km match gate depending on eval).
+
+**Data types.** JSONL; mixed numeric + optional identity strings/ints. Schema aliases (`sensor_id`/`radar_id`, `mode_3a`/`mode3a`) normalized in `src/data_schema.py`.
+
+**Missing data.** SSR velocity often omitted (not zero-filled — zeros would look like a stopped target). Combined CAT-048 plots in PlotForge are split into unmatched PSR + beacon, which is the correlator case.
+
+**Class balance.** Pairwise same-object rate is low (most gated pairs are negatives). Clutter ~3% on Sweden streams, much lower on the UAE extract. PlotForge roadway clutter is spatially biased (E11/E311/E611), not Poisson.
+
+**Quality issues.** (1) Long Sweden subset is concurrency-starved. (2) Tiled 30/60 min streams reuse the same traffic *pattern* with spatial offsets — geometry-augmented holdout, **not a new operational day**. (3) Synthetic Mode-S is stable per track, so SSR MLP can lean on identity more than a kinematics stress test would allow. (4) Observation model is planar range, not polar beam / SNR.
+
+**Biases / limitations.** Sim Pd is independent Bernoulli, not aspect-dependent. No registered multi-radar bias or multipath. Sweden NN median ~32 km — association is easier than a dense TMA. PlotForge is harder (24 radars, CMB splits) and still simulated.
+
+### Explain your thinking
+
+**What did you expect the data to look like?**  
+I expected “more minutes = harder.” I also expected CAT-062 to give me plots. CAT-062 is *tracks*. Plots are synthesized.
+
+**What surprised you?**  
+The 30–60 minute naïve cut of `cat_62_sweden_subset.txt` is almost single-target. Difficulty is concurrency and nearest-neighbour geometry, not duration. Also: PlotForge pair-F1 can look excellent while tracking MOTA is terrible if thresholds are wrong.
+
+**Patterns that influenced modelling.**  
+PSR pairs are kinematics-rich (Doppler). SSR pairs are identity-rich and velocity-poor. That is why there are **two** classifiers, not one. Asynchronous scan periods (1 / 3 / 10 s ops-aligned; 5.5–9 s in the dense streaming sim) forced exact-time KF rather than batch windows.
+
+**Highest-impact quality issue.**  
+Using sparse long extracts as if they were multi-target. That would have inflated MOTA and hidden association failures. Tiling the dense mini was the fix; documenting it as tiled is the honesty.
+
+**Data I wished I had.**  
+Time-aligned multi-radar CAT-048 with recorded bias, real clutter maps, and labelled plot-to-aircraft truth that is not downstream of a tracker. Also hard-crossing TMA geometry (median NN was 32 km on Sweden).
+
+**If I could collect more.**  
+DIS + multi-radar exports into the same canonical schema; SSR dropout logs; registered bias per radar; a day of real opportunity traffic with independent truth (Mode-S + GPS where available).
+
+**Biases.**  
+Identity-stable Mode-S in the observation model; Poisson clutter vs roadway clutter; Sweden vs UAE density; 5 radars vs PlotForge’s 24. Holdout tiles share the same motion library.
+
+**How biases affect users.**  
+A tracker that never saw 24-radar overlap will over-associate (PlotForge Sweden-MLP zero-shot MOTA 0.774 vs native 0.976). A tracker trained with perfect Mode-S will look better than it will on a jammed or garbled IFF picture. I would not ship this onto live feeds without a shadow-mode comparison against the operational correlator.
+
+---
+
+## 4. Data Preparation and Feature Engineering
+
+**Cleaning.** Schema normalization (`src/data_schema.py`) so batch and stream aliases do not silently drop Mode-3A. Optional velocity omitted rather than zero-filled.
+
+**Missing values.** Identity: match feature is `{+1, 0, −1}` (match / unknown / mismatch) — unknown is not treated as mismatch. Velocity cosine is 0 if either vector is missing.
+
+**Encoding.** PSR vs SSR as a type bit or embedding (V8). Sensor id as an embedding in V8 only (and V8 `max_sensors=8` aliased PlotForge sites 9–24 — a real bug for attention models, irrelevant for the MLP).
+
+**Scaling.** Distances `/ 1e5`, velocities `/ 1e3` or `/ 100`, amplitude `/ 100`, altitudes `/ 2e4`. Raw metres blow up MLP logits.
+
+**Feature creation (PSR–PSR, 6-d).** Position distance; velocity cosine; |Δv|; azimuth separation; elevation separation; |Δamplitude|.
+
+**Feature creation (SSR–ANY, 4-d).** Position distance; azimuth separation; Mode-3A match; Mode-S match.
+
+**Clutter (8-d).** amp, vx, vy, vz, x/y/z normalized, SSR bit.
+
+**Feature selection.** I did not run automated selection. I excluded `track_id`, raw lat/lon (working in ENU metres), and future-frame features.
+
+**Split.** Pairwise MLPs: pairs from `sim_batch_hetero` / PlotForge seed 7. Tracking eval: **held-out streams** with no track-id overlap (Sweden second-half tiles; PlotForge seed 91). V8: split by track id (seed 42, 80/20).
+
+**Sampling.** Pairwise extraction enumerates pairs in a window; class imbalance handled with weighted / focal BCE, not naive oversample.
+
+**Augmentation.** SSR ID dropout, position noise, sensor bias — available in the dashboard. Used for robustness tests, not as the golden number.
+
+**Leakage controls.** `track_id` is labels/metrics only. Features computed from contemporaneous plots after projecting the track to `meas_t` — the net never sees a 9 s coast as a 2 km “position error.” Training windows do not include future scans.
+
+### Explain your thinking
+
+**Largest-impact preprocessing decision.**  
+Two: **exact-time projection before scoring**, and **not zero-filling missing SSR velocity**. The first is how temporal dragging died. The second is how I avoided teaching the MLP that beacons are stationary.
+
+**Preprocessing that did not help.**  
+Aggressive amplitude normalization across sensors; adding raw sensor id to the tiny MLP (it overfit site identity on Sweden’s 5 radars and failed to transfer). V8 sensor embeddings with `max_sensors=8` on a 24-radar stream.
+
+**Transformations I later removed.**  
+Window-mean timestamps as a substitute for per-measurement `t`. Forcing every measurement into a 6-d state with NaNs converted to 0.
+
+**How I judged features useful.**  
+Ablation: SSR identity off (`use_identity_features=False` keeps dim=4 so weights still load) vs on. Kinematics-only is the honest stress test; identity-on is the operational cue. PlotForge A2 (rel_ij only, attention off) still reached MOTA 0.878 — geometry + identity flags carry most of the signal.
+
+**Intentionally excluded.**  
+`track_id`, covariance internals, other tracks’ identities as features (that would be leakage through the label). Also residual Δs as a training target after V7.
+
+**Leakage prevention.**  
+Holdout by track id / seed, not random frames. Metrics Hungarian is independent of the tracker’s Hungarian. Clutter labels from generator `track_id == -1`, never from the tracker under test.
+
+**If another engineer changed the pipeline, what would worry me?**  
+Zero-filling missing velocity. Scoring pairs outside the 2/8 km gates. Training and evaluating on the same seed. Using pair-F1 to pick a ship candidate. Changing `max_age` without re-running the slowest-sensor story. Feeding unprojected track state into the scorer.
+
+---
+
+## 5. Methodology and Algorithms
+
+### Primary approach: Hybrid-MLP (operational)
+
+**What it does.** For each time window: drop clutter; cluster co-located PSR/SSR into one meta-plot; score track↔meta pairs; assign uniquely; Kalman-update at the measurement’s exact time; initiate unmatched metas; coast the rest.
+
+**Why appropriate.** Association is a pairwise probability. Uniqueness is combinatorial (Hungarian). Motion is linear-Gaussian between scans. Each tool matches the job.
+
+**Assumptions.** CV process; independent measurements given state; at most one plot per track per update (Hungarian); clutter is locally classifiable from unary features.
+
+**Important parameters.** Cluster gate 2 km; assign gate 8 km; cluster τ 0.2 (PlotForge) / ~0.5 (legacy); assign τ 0.35; `min_hits=2`; `max_age=10`; KF `R` ≈ 150 m, `Q` maneuver 50 m/s²; match threshold for MOTA 7–15 km.
+
+**Strengths.** Interpretable; coasts through shadows; 0 ID switches on Sweden; transfers after a modest fine-tune.
+
+**Limitations.** Hardcoded gates; CV Kalman misses tight turns; 24-radar overlap still produces ID switches on PlotForge (185 on seed 91); Poisson clutter model.
+
+### Learned components
+
+**Clutter MLP.** 8 → 64 (BN, ReLU) → 32 → 1, BCE. Early reject so association is not drowning in FA.
+
+**Pairwise MLP.** `feature_dim → 64 → ReLU → Dropout 0.2 → 32 → ReLU → Dropout 0.2 → 1`. Two weight files: PSR–PSR (6-d) and SSR–ANY (4-d). Weighted BCE.
+
+**Hungarian.** `scipy.optimize.linear_sum_assignment` on cost `1 − p`. Optional dustbin column so a track may refuse every plot.
+
+**Kalman.** 6-d CV, variable dt, partial H (pos-only / pos+vx,vy / full), Joseph-form covariance.
+
+### Abandoned / research
+
+**RecurrentGATTrackerV3.** GATv2 + GRU + existence. Tried to do association, initiation, and state in one forward pass.
+
+**V7 transformer tracker.** Same sin: residual Δs, existence heads, windowed snapshots.
+
+**V8 AssociationTransformer.** SuperGlue-style pair scorer *inside* Hybrid. ~150–250k params, d=64, 2×4-head self-attn, 12-d `rel_ij`. Allowed. Did not beat MLP.
+
+### Explain the algorithm in your own words (primary: pairwise MLP + Hungarian + async KF)
+
+**How it works, to another apprentice.**  
+Imagine every confirmed track is a hypothesis of “an aircraft is here, going this way.” A new plot arrives from some radar at time `t`. You **push the hypothesis forward** to that exact `t` with `x ← x + vx·dt` (the Kalman predict). Now plot and track are contemporaneous, so distance means something. You ask a small network: “probability these two are the same object?” You do that for every gated pair, put `1−p` in a matrix, and let Hungarian pick a globally consistent matching so two tracks cannot eat the same plot. Matched tracks get a Kalman update (blend prediction with measurement using R and P). Unmatched plots become baby tracks. Tracks that miss for `max_age` frames die. PSR and SSR plots that are really the same sweep of the same aircraft are clustered *first* so you do not create two tracks for one plane.
+
+**What the model learns from training data.**  
+The MLPs learn a decision surface on those 4–6 numbers: close + aligned velocity → same; Mode-3A match → same; Mode-3A mismatch → not same, even if close; low amplitude + erratic velocity → clutter. They do **not** learn Newton’s laws. The Kalman already has those.
+
+**What causes one prediction instead of another.**  
+A PSR–PSR pair with 300 m separation and cosine(v) ≈ 1 will outscore a 3 km pair with opposite headings. An SSR pair with matching Mode-S will outscore a kinematically similar pair with different squawks. Threshold τ then converts score to “eligible for Hungarian.” Hungarian can still reject a high score if that plot is a better match for someone else.
+
+**Major assumptions.**  
+Pairs are independent given features (the MLP does not see the rest of the set — that is V8’s pitch). CV between scans. One-to-one assignment. Unary clutter features are informative.
+
+**When I would not use this.**  
+If plots are images (use a detector first). If motion is ballistic / high-g and CV is a lie (need IMM or a coordinated-turn model). If there is no labelled same-object supervision and you cannot synthesize it. If you must explain a *likelihood ratio* to a safety case that forbids neural scores — then use Mahalanobis + chi-square gates only.
+
+**Alternative I seriously considered.**  
+End-to-end GAT, then V8 transformer scorer. Also classical JPDA (soft assignment). JPDA would be the physics-only upgrade if I had to drop ML; I did not implement it because Hungarian + learned costs already gave 0 ID switches on Sweden and I needed to spend time on time-alignment.
+
+**Tradeoffs vs that alternative.**  
+V8 can see the rest of the gated set (crossings, two metas near one track). MLP cannot. In practice V8 over-associated (PlotForge default τ: MOTA −0.425 for PF-tuned V8 vs 0.865 MLP). Ensemble was a 0.007 MOTA bump on one dense stream — within noise. MLP is smaller, stabler, and the features are inspectable. I keep V8 as a scorer experiment, not as the ship path.
+
+---
+
+## 6. Baseline
+
+Baselines I actually ran:
+
+| Baseline | What it is | Result |
+|---|---|---|
+| SORT-style / nearest neighbour | Classical MOT: predict, Hungarian on distance, no PSR/SSR fusion | MOTA **−0.82**, precision 0.21, recall 0.30 (`evaluation_results/sort_baseline_metrics.json`) |
+| Kalman-only, same M/N lifecycle | Hybrid minus learned pairwise / clutter | MOTA **−1.32**, precision 0.30, recall 0.99 (initiates everything, coasts well, associates badly) |
+| Majority / random | Not meaningful for MOT — a “majority class” track picture is empty or one blob | Would score MOTA near 0 or largely negative via FN or FP |
+| Hybrid with `max_age=2` | Same ML, too-short coast | MOTA **0.56**, precision 0.997, recall 0.56 — a *lifecycle* baseline, not an ML one |
+| End-to-end GNN | The original “AI tracker” | MOTA **−0.70** |
+
+### Explain your thinking
+
+**What was the baseline?**  
+Kalman-only with the same track manager, plus SORT on the same plots. I also treat Hybrid `max_age=2` as a baseline for the coasting decision.
+
+**Why appropriate?**  
+A learned associator has to beat “distance + KF,” which is what ops already understands. If I only beat a random matcher, I have not earned the neural net. SORT is the standard MOT dummy.
+
+**How much improvement?**  
+Sweden holdout Hybrid (`max_age=10`, `min_hits=2`): **MOTA 0.976** vs Kalman-only **−1.32** and SORT **−0.82**. That is not a 2% Autogluon bump; it is the difference between a picture and a mess. Precision 0.979 vs 0.30 is the associator. Recall 0.998 vs 0.56 (`max_age=2`) is the coasting policy, not the net.
+
+**If I had no formal baseline at first.**  
+I would still pick Kalman-only + SORT. Accuracy of the pairwise MLP on pairs is *not* a tracking baseline.
+
+**Why baselines matter.**  
+Without them I would have celebrated GNN “training loss went down” while MOTA was negative. Loss is not the product. MOTA against a physics dummy is.
+
+---
+
+## 7. Experimentation
+
+Major experiments that changed my mind (not every hyperparameter poke):
+
+| Experiment | Hypothesis | Change | Result | What I learned |
+|---|---|---|---|---|
+| E1 Recurrent GAT on streaming | A GRU can coast through empty windows | Swap Hybrid updater for GAT v3 on `stream_radar_001` | MOTA −0.70, precision 0.005, MOTP 3.2 km | Learned recurrence ≠ a process model. Empty windows kill existence. |
+| E2 Coasting / min_hits | Misses are lifecycle, not association | `max_age` 2 → 10, `min_hits` 5 → 2 | MOTA 0.56 → **0.977**, recall 0.56 → 0.996, still 0 IDSW | Slowest sensor sets coast time. |
+| E3 Clutter filter off | Unary MLP is load-bearing | Disable clutter MLP, same Hybrid | MOTA 0.975 vs 0.977 | On Sweden FA rate, association already rejects junk. Clutter MLP is insurance, not the MOTA story. |
+| E4 V7 transformer tracker | Self-attn can own the whole tracker | Residual Δs + existence + 2 s windows | Holdout MOTA −1.09 / −3.03 | Do not give the net initiation, coast, and state. |
+| E5 V8 scorer inside Hybrid | Set context helps crossings | Swap only the two MLP calls | Dense stream 0.526 pure V8 vs 0.865 MLP; ensemble +0.007 | Scorer-vs-scorer, not tracker-vs-tracker. Pure V8 over-associates. |
+| E6 PlotForge τ (A4) | Thresholds, not architecture | cluster 0.5→0.2, assign 0.0→0.35 | MLP 0.865 → **0.896**; Sweden V8 0.206 → 0.706 | Dominant lever on the new domain. Pair-F1 would have lied. |
+| E7 Sweden MLP zero-shot on PlotForge | Features transfer | No fine-tune | MOTA 0.774 (gap 0.202 to native Sweden) | Domain gap is real; fine-tune + τ closes most of it (gap 0.080). |
+
+### Explain your thinking (three significant experiments)
+
+**E1 — GNN on async streams.**  
+*Trying to learn:* whether end-to-end graph attention is viable once we leave batch sims.  
+*Expected:* some drop vs Hybrid, still positive MOTA.  
+*Actual:* negative MOTA, ~0 precision/recall.  
+*Next decision:* freeze GNN as a research branch; make Hybrid the pipeline.  
+*Contradiction:* training loss on aligned batches looked fine.  
+*Investigation:* frame-level dumps — existence logits collapsed after one empty 2 s window; MOTP 3 km said the decoder was not a Kalman.
+
+**E2 — Coasting.**  
+*Trying to learn:* why recall sat at 0.56 with excellent precision.  
+*Expected:* a bit more coasting, a bit more FP.  
+*Actual:* MOTA jumped to 0.977, ID switches stayed 0, precision only moved 0.997 → 0.981.  
+*Next decision:* golden eval is `max_age=10`, `min_hits=2`, aligned to a 10 s long-range scan.  
+*Contradiction:* I had treated `max_age` as a minor CLI default (2 vs config 10 vs `del_age` 15 — three-way mismatch).  
+*Investigation:* counted misses vs scan period; unmatched tracks were dying in the other radar’s blind sector.
+
+**E6 — PlotForge thresholds.**  
+*Trying to learn:* whether V8 or MLP should ship on UAE sim.  
+*Expected:* V8 wins once it sees 24-radar context.  
+*Actual:* MLP + calibrated τ wins (0.896 vs A2 V8 0.878). Default τ made V8 *negative*.  
+*Next decision:* ship Hybrid MLP `τ_cluster=0.2`, `τ_assign=0.35`, dustbin on; do not spend more trains on V8 heads.  
+*Contradiction:* pair-F1 ~0.04–0.14 with P≈0.99.  
+*Investigation:* score histograms — the net was extremely conservative on positives; raising cluster eligibility and requiring a higher assign bar fixed tracking, not training.
+
+---
+
+## 8. Model Evaluation
+
+**Metrics.** MOTA, MOTP, precision, recall, F1, ID switches, FP/frame, FN/frame. Formula used in `src/metrics.py`:
+
+\[
+\mathrm{MOTA} = 1 - \frac{\mathrm{FN} + \mathrm{FP} + \mathrm{IDSW}}{\mathrm{GT}}
+\]
+
+MOTP = mean Euclidean position error of Hungarian matches under a distance gate (7–15 km depending on run — large vs radar σ, so MOTP is “how tight are the good matches,” not “did we match”).
+
+**Validation strategy.** Train pairwise on synthetic / seed-7 PlotForge. Evaluate tracking on held-out streams (Sweden tiles with no id overlap; PlotForge seed 91). MLflow for run comparison (`hybrid_sweden_30min_holdout_coast10`, run `7e848988…`).
+
+**Test methodology.** `run_cli.py --mode hybrid` and `eval_plotforge.py` with `--no-snapshots` for the bake-off. Same Kalman, gates, and track manager unless the experiment *is* those knobs.
+
+**Final results (commit to these as the page numbers):**
+
+| System | Dataset | MOTA | MOTP | P | R | IDSW |
+|---|---|---:|---:|---:|---:|---:|
+| Hybrid MLP, max-age 10 | Sweden 30 min holdout | **0.976** | 105 m | 0.979 | 0.998 | **0** |
+| Hybrid MLP, max-age 2 | Sweden ~10 min | 0.56 | — | 0.997 | 0.56 | 0 |
+| Kalman-only, same life | Sweden ~10 min | −1.32 | — | 0.30 | 0.99 | 0 |
+| Hybrid MLP A4b τ | PlotForge seed 91 | **0.896** | 191 m | 0.941 | 0.999 | 185 |
+| Sweden MLP zero-shot | PlotForge seed 91 | 0.774 | 235 m | 0.846 | 0.998 | 187 |
+| V8 A2 rel-only + A4b | PlotForge seed 91 | 0.878 | 236 m | 0.930 | — | 201 |
+| Hybrid MLP | `stream_radar_001` max-age 10 | 0.865 | 877 m | 0.929 | 0.937 | 0 |
+| Recurrent GAT v3 | `stream_radar_001` | −0.704 | 3240 m | 0.005 | 0.004 | high |
+| SORT | eval set in repo | −0.824 | 355 m | 0.210 | 0.298 | 0 |
+
+Sweden MOTP 105 m is inside the observation-model σ (~150 m). PlotForge MOTP 191 m reflects 24-radar overlap + CMB splits, not a broken filter.
+
+![Hybrid tracker overlay versus ground-truth trajectories](artifacts/tracking_visualization.png)
+
+### Explain your thinking
+
+**Why these metrics?**  
+MOTA is the CLEAR MOT currency and penalizes the three sins that wreck a recognised air picture: false tracks, misses, identity swaps. Precision/recall split “spamming tracks” from “losing aircraft.” ID switches are operationally expensive (a hook/track number change mid-engagement or mid-handoff). MOTP checks we are not matching the right id at the wrong kilometre.
+
+**What would be misleading about accuracy alone?**  
+A classifier that always says “not the same object” is highly accurate on imbalanced pairs and produces no tracks. A tracker that emits one confirmed track in empty sky can look “accurate” per prediction. MOTA on the *track picture* is the task.
+
+**Which metric matters most?**  
+For this use case: **ID switches first**, then precision, then recall. A false track can be filtered by an operator; a swapped identity is a wrong aircraft. Sweden Hybrid hits 0 IDSW; PlotForge’s 185 IDSW is the remaining gap I would not hide.
+
+**Errors the model makes most often.**  
+On Sweden: almost none after coasting was fixed — residual is MOTP-scale noise. On PlotForge: over-clustering vs under-assign at the wrong τ; ID switches in 24-radar overlap and split combined plots. GNN: both FP flood and FN (existence death).
+
+**FP vs FN cost.**  
+In surveillance correlation, **false positives (extra tracks)** clutter the picture and can steal assignment from a real target (Hungarian is zero-sum). **False negatives (dropped tracks)** create holes during coast. I treat ID switches as worse than either. I would rather coast (`max_age=10`) than drop, and rather raise assign τ than flood.
+
+**What evaluation says the model does well.**  
+Same-aircraft PSR/SSR fusion on medium-difficulty Sweden geometry; identity-stable SSR association; coasting through mixed scan rates; Kalman MOTP near sensor noise.
+
+**What it does not tell me.**  
+Live CAT-048 with real bias, jamming, or weather clutter. Tight formation / crossing TMA (Sweden NN p50 ~32 km). Safety-case calibration of MLP probabilities (they are scores, not well-calibrated p-values).
+
+**Evidence before I would deploy.**  
+Shadow mode against the operational correlator on recorded multi-radar nights; IDSW and FP/hour budgets agreed with ops; an SSR-dropout ablation; a written limitation that CV-KF will lag high-g turns; no end-to-end GNN in the path.
+
+---
+
+## 9. Failure Analysis
+
+I am not hiding these. Investigating failure is the useful part.
+
+### Failure 1 — GNN kills a live track in a radar shadow
+
+**Input.** Confirmed track, last hit 2.1 s ago, current 2 s window contains *zero* plots for that aircraft (other radar still scanning).  
+**Expected.** Coast: KF/GRU predict, keep id, existence stays high.  
+**Actual.** Existence logit drops below delete threshold; track dies; next plot initiates a *new* id (or nothing, given precision 0.005).  
+**Probable reason.** GRU hidden state and existence head were trained on batches that almost always contained a measurement. Empty windows were out of distribution. Physics coasts “for free”; the net was asked to learn coasting from absences.  
+**What I would try.** Do not use existence-from-GRU for deletion. If I revived GNN, I would freeze track life in the M/N manager and let the net only score edges — which is what Hybrid/V8 already is.
+
+### Failure 2 — V7 / V8 default-τ false-track flood on PlotForge
+
+**Input.** 90 s UAE stream, 24 radars, combined plots split to PSR+SSR, default cluster τ=0.5 / assign τ=0.0.  
+**Expected.** Transformer context reduces ambiguity, MOTA ≥ MLP.  
+**Actual.** PF-tuned V8 MOTA **−0.425**, 5 475 FP, 892 ID switches. Sweden V8 at default τ: MOTA 0.206.  
+**Probable reason.** Assign τ=0.0 means *any* positive score is eligible; a set model with noisy logits will invent edges. Pair-F1 looked “precise” because recall of true pairs was 0.02–0.14 — it was silent, then the assign bar let junk through at tracking time.  
+**What I would try (and did).** A4: cluster 0.2 / assign 0.35. A2 (rel_ij only) then reaches 0.878, still behind MLP 0.896. I would *not* keep training heads.
+
+### Failure 3 — Crossing / overlap ID switch on PlotForge (Hybrid MLP, even at A4b)
+
+**Input.** Two aircraft with similar kinematics in overlapping coverage; one or both with intermittent Mode-3A; combined-plot split creates two metas ~beamwidth apart.  
+**Expected.** One track per truth id, no swap.  
+**Actual.** Holdout IDSW **185** at MOTA 0.896 (Sweden had 0).  
+**Probable reason.** 24-radar geometry + CMB splits produce legal metas closer than the 2 km cluster gate’s comfort zone; identity missing on one side forces kinematics, and CV-KF gates are wide enough to steal. Sweden’s 32 km median NN never stressed this.  
+**What I would try.** Harder negatives at 1–5 km; altitude-aware gating; cluster gate that depends on radar beamwidth, not 2 km Euclidean; IMM for turns.
+
+### Reflection
+
+Failures are **not random**. They cluster on: empty-time (GNN), threshold/domain shift (V8), and dense overlap (PlotForge IDSW). They are rarer on high-altitude, well-separated Sweden airways with stable Mode-S.
+
+They occur more for **PSR-only** (no identity), **split combined plots**, **sensor_id > 8** on V8, and **slow-scan shadows** if `max_age` is too small.
+
+This says the weakness is **coverage of hard geometry and time**, not the MLP architecture. Data and gates, then thresholds, then models.
+
+---
+
+## 10. Pivots and Dead Ends
+
+I changed approach more than once. The meaningful one:
+
+### Pivot A — End-to-end learned tracker → Hybrid associator + Kalman
+
+**Initial approach.** Recurrent GAT: tracks and measurements as nodes, GATv2, GRU memory, decoder emits Δstate and existence. Research proposal also listed PointNet++ and PointTransformer.
+
+**Why it seemed reasonable.** Literature (GraphTrack, KalmanNet, MOT transformers). One network, one loss, no hand gates. Batch sims with aligned frames gave plausible training curves. I wanted to *replace* per-radar KF + correlator, not decorate them.
+
+**What happened.** On asynchronous streaming data, MOTA went negative. Existence collapsed. MOTP was kilometres. V7 repeated the failure with a more fashionable backbone.
+
+**Diagnosis.** I instrumented empty-window counts vs existence; compared Hybrid with the *same* clutter MLPs feeding GNN edges (so association cues were available) and still lost. The failure was time and track life, not “not enough attention.”
+
+**Pivot.** Hybrid: MLPs score gated pairs; Hungarian uniqueness; async KF; M/N life. GNN/V7 archived. V8 allowed only as a pair scorer.
+
+**Outcome.** Sweden MOTA 0.976, 0 IDSW. PlotForge 0.896 after domain adapt. This is the system.
+
+**Lesson.** In tracking, **put the inductive bias where the physics is known.** Learn the residual that is actually a classification problem. End-to-end is not a virtue if it relearns `x += v·dt` badly.
+
+### Pivot B (smaller) — “More data” → tiled dense CAT-062
+
+**Initial.** Use the long Sweden subset because it has hours of CAT-062.  
+**Why reasonable.** More real traffic.  
+**What happened.** 1–2 concurrent tracks. Easy MOTA, useless association test.  
+**Diagnosis.** Difficulty report: concurrency and NN distance.  
+**Pivot.** Tile the dense 10 min mini with spatial offsets; hold out the second half by id.  
+**Outcome.** Holdout MOTA matched the mini (0.976 vs 0.977) — association generalized across offsets.  
+**Lesson.** Scenario construction is part of the ML system.
+
+---
+
+## 11. Debugging and Problem Solving
+
+**The issue.** After the modular pipeline refactor (`Pipeline` + Pydantic `PipelineConfig` + `NewHybridUpdater`), the main path was not reliable: `process_frame` crashed with `NameError: np is not defined`; CLI `--max-age` did not change coasting; GNN used `clutter_threshold` while config said `clutter_thresh`; FallbackUpdater signatures did not accept `dt` / `frame_t`; pairwise checkpoints were hardcoded instead of config-driven.
+
+**Symptoms.** Eval would die on the first frame in some call patterns; “I set max-age 10” still deleted tracks at 2; GNN clutter threshold silently ignored.
+
+**Initial hypotheses.** (1) Bad checkpoint. (2) JSONL schema drift. (3) Kalman dt=0. (4) Config not wired. I was biased toward “model” bugs because that is the interesting story.
+
+**Investigation.** Trace `process_frame` with a 3-target synthetic; read `PipelineConfig` vs argparse; grep `max_age` / `del_age` / `clutter_thresh`. The review note (`REVIEW_current_project.md`) is the paper trail.
+
+**Wrong hypotheses.** “The GNN weights are corrupt.” “Need more training.” The crash was `import numpy as np` missing. The coasting bug was writing `state_updater.del_age` and reading `track_manager.max_age`.
+
+**Actual cause.** Refactor split config across CLI, Pydantic, and two updaters without a single source of truth. Plus a missing import on a path that only runs when `t` is omitted.
+
+**Fix.** Import numpy; one `PipelineConfig` after parse; `--max-age` writes `track_manager.max_age`; clutter key unified; updaters take config paths; GNN failure path increments age so coasting still applies; tests in `tests/test_pipeline.py` for Kalman initiate → promote → coast-out.
+
+**If I saw it again.** Reproduce with a 20-line synthetic *before* touching weights. Print the live config object at run start. Never trust argparse defaults to match Pydantic defaults.
+
+This was not glamorous, and it affected MOTA more than another epoch of GAT.
+
+---
+
+## 12. Overfitting, Underfitting, and Generalization
+
+**Evidence of overfitting.** Train pair-F1 or train-stream MOTA ≫ holdout; huge gap Sweden native (0.976) vs zero-shot PlotForge (0.774); V8 attention memorising `sensor_id` 0–8; existence head that only works on the train window occupancy.
+
+**Did I observe it?** Yes: V8 pair-F1 vs tracking MOTA; GNN batch vs stream; sensor embedding aliasing. Hybrid MLP overfit *less* — the feature space is tiny — but it still paid a 0.202 MOTA domain gap zero-shot.
+
+**What I did.** Hold out by track id / seed; fine-tune clutter + pairwise on PlotForge seed 7; evaluate seed 91; prefer MLP over V8; report difficulty scores next to MOTA; do not tune on holdout beyond the documented A4 τ sweep (that sweep is itself a form of holdout use — I treat those τ as *operating points to declare*, not as a secret).
+
+**Evidence of underfitting.** GNN MOTP 3 km: the decoder never learned kinematics. V7 residual Δs likewise. Underfitting of *physics*, which I stopped asking the net to learn.
+
+**Confidence on unseen data.** Moderate on “another Sweden-like observation-model day.” Lower on live CAT-048. Lower still on dense TMA crossings. PlotForge after fine-tune (0.896) is the better estimate of UAE-like *sim* transfer.
+
+**Real-world data that would degrade it.** Registered radar bias of kilometres; jamming / spoofed Mode-3A; weather clutter correlated in range-azimuth (unary MLP will not see a storm hook); formations inside 2 km; hypersonic / high-g profiles; time-sync errors larger than the KF dt logic expects.
+
+---
+
+## 13. AI-Assisted Development
+
+Tools used: **Grok / Grok Build** (architecture write-ups, V8 design, PlotForge, refactor reviews), **ChatGPT / Claude** for boilerplate and equation checks, **GitHub Copilot / Cursor** for local Python, Streamlit dashboard scaffolding, MLflow wiring. I also used coding agents to generate briefing PPTX/DOCX in `artifacts/`.
+
+They accelerated diagrams, config plumbing, and “write the Joseph form again.” I stayed responsible for MOTA claims, gate numbers, and what ships.
+
+### Demonstrate ownership
+
+**Accepted suggestion.** Joseph-form covariance update in `SimpleKalmanFilter.update` (`P ← (I−KH)P(I−KH)ᵀ + KRKᵀ`) instead of the simplified `(I−KH)P`. Numerically it is the right default when K is computed from a noisy S. I accepted it because I can derive it and because we already had an `inv`/`pinv` fallback.
+
+**Rejected / changed.** End-to-end transformer tracker as the *system* (V7). Agents happily designed residual Δs, existence heads, and 50 km attention masks. I rejected owning initiation/coast/state after MOTA went negative — and wrote V8 as “the net scores pairs; Kalman owns state; Hungarian owns uniqueness,” which several drafts tried to violate by sneaking Δs back in.
+
+**How I verified.** Every ship number in this page has a command (`run_cli.py`, `eval_plotforge.py`) and a file (`TRAINING_DATA_CHAPTER.md`, `plotforge_ablations.md`, `sort_baseline_metrics.json`). I do not paste agent-reported MOTA without a JSON.
+
+**Worked but I did not understand.** Early GATv2 edge-attr wiring in PyG (how `edge_dim` interacts with attention). I read the GATv2 paper section on edge features and printed `alpha` on a 3-node toy graph before trusting it. Then I stopped needing it for the ship path.
+
+**What I could reproduce without an assistant.** The Hybrid loop, feature functions, Kalman predict/update, MOTA formula, the coasting diagnosis, the PlotForge τ table.
+
+**What would be hardest.** Recreating V8’s token layout and the Streamlit dashboard from memory. I would not need to — I would re-read `design_v8.md` and `pairwise_features.py`.
+
+**Line-by-line piece (see also §14).** The PSR–PSR feature vector is eight lines of geometry I can write on a whiteboard: distance, cosine(v), |Δv|, Δaz, Δel, |Δamp|. If Copilot vanished, that file is enough to rebuild the associator.
+
+**If the assistant disappeared tomorrow.** I still know: empty windows need a process model; `max_age` follows the slowest sensor; pair-F1 is not MOTA; two specialised MLPs beat one generic net on PSR vs SSR; V8 is a scorer. That is enough to keep working.
+
+---
+
+## 14. Technical Deep Dive — Asynchronous Kalman update after learned assignment
+
+This is the component that turned a batch GNN into a tracker.
+
+**Why it exists.** Five radars do not share a clock tick. If you snap every plot to the end of a 2 s window, a plot from t=0.1 and a plot from t=1.9 look 1.8·v apart — hundreds of metres at jet speed. That error is *not* measurement noise; it is **temporal dragging**. The GNN ate it. Hybrid refuses to.
+
+**Inputs.** A matched pair `(track, measurement)` after Hungarian. Track holds `SimpleKalmanFilter` state `x = [x,y,z,vx,vy,vz]`, covariance `P`, and `kf_t`. Measurement holds `t`, position, optional velocity.
+
+**Transformations.**
+
+1. `dt = meas_t − track.kf_t`. If `dt > 0`, **predict**:
+   - `F` is the CV transition with that `dt` (identity on velocity, `dt` on the position–velocity coupling).
+   - `x ← F x`, `P ← F P Fᵀ + Q`.
+2. Build observation `z` of length 3, 5, or 6 depending on what the plot actually contains. SSR is often position-only. PSR often `x,y,z,vx,vy`.
+3. Build `H` as a row-selector (not a neural net).
+4. Innovation `y = z − H x`, `S = H P Hᵀ + R`.
+5. Gain `K = P Hᵀ S⁻¹` (pinv if S is singular).
+6. `x ← x + K y`, Joseph `P`.
+7. Store `kf_t = meas_t`.
+
+**Outputs.** Updated track at the measurement time, not at the window end. After the frame, tracks may be synced to `frame_t` for display.
+
+**Important parameters.** `R` diagonal ~150² m² on position, ~20² (m/s)² on velocity; `Q` ~50² (m/s²)² — a maneuvering-aircraft process noise, deliberately loose so coasts do not go rigid. Initial `P` is huge (1 km, 500 m/s) so the first updates trust the plot.
+
+**What would happen if it were removed.** Reverting to “predict all tracks to window end, then update” recreates temporal dragging. Association distances inflate, Hungarian swaps more, MOTP climbs toward the GNN’s kilometres. This is the Hybrid/GNN split in one component.
+
+**Scoring, for completeness.** Before this update, `_associate` already built a *temporary* projected copy of the track (`tmp.x += vx * dt`) to score the MLP. V8 is required to consume that projected dict. The net never sees a 9 s hole as a position residual.
+
+```
+dt = m["t"] - t.get("kf_t", m["t"])
+if dt > 0:
+    tmp_t["x"] += t["vx"] * dt   # y, z likewise
+# MLP / V8 scores (tmp_t, m)  — contemporaneous kinematics
+# Hungarian
+# kf.predict(dt); kf.update(z)
+```
+
+I can defend every line of `src/kalman_filter.py` without an assistant. The interesting ML is *when* this runs and on *which* pair — that is the MLP + Hungarian.
+
+---
+
+## 15. Architecture / Workflow
+
+![Operational pipeline from plots to confirmed tracks](artifacts/pipeline_diagram.png)
+
+```
+Input (JSONL plots)
+    → window 1–2 s
+    → Data processing: schema normalize, clutter MLP
+    → Spatial cluster (2 km, pairwise MLP/V8)
+    → Temporal assign (8 km, project to meas_t, Hungarian)
+    → Model/system: async CV Kalman + M/N manager
+    → Output: confirmed fused tracks
+    → Evaluation: MOTA/MOTP vs interpolated GT  /  Consumption: Streamlit replay, MLflow
+```
+
+**Component responsibilities.**
+
+| Component | Responsibility |
+|---|---|
+| Canonical JSONL + `data_schema` | One contract for Sweden, sim, PlotForge |
+| Clutter MLP | Unary FA reject |
+| Pairwise MLPs / V8 | P(same) on gated pairs |
+| Cluster | Fuse PSR+SSR metas |
+| Hungarian | One-to-one assignment + optional dustbin |
+| `SimpleKalmanFilter` | Time and kinematics |
+| Track manager | Initiate / confirm / coast / delete |
+| `TrackingMetrics` | CLEAR MOT against GT |
+| PlotForge | UAE-like labelled plots for domain adapt |
+
+![Hybrid V8 architecture](artifacts/architecture_hybrid_v8.png)
+
+The V8 diagram is the *same* Hybrid flowchart with only the two scorer diamonds swapped.
+
+**Most likely point of failure.** Assignment in dense overlap when identity is missing — Hungarian will pick someone, and an ID switch is a silent success in loss-free inference. Second: config mismatch (`max_age` / thresholds) after a refactor.
+
+**Which component I would redesign first to scale.** Spatial clustering: 2 km Euclidean is not a beamwidth. At 24 radars and TMA density it should be sensor-aware (range, azimuth σ). Assignment is O(TM) per frame and fine at current N; clustering quality is the FP/IDSW lever.
+
+**Least confident in.** Clutter MLP on *real* weather, and V8 on any new sensor count. Also PlotForge IDSW=185 — I am confident the number is real, not confident the current gates are the right fix.
+
+**Technical debt.** Version dispatch v3–v7 still in tree; repo history bloated with eval artifacts; three-way default mismatch was fixed once and could regress; pair-F1 still looks tempting in training logs; `max_sensors=8`; observation model ≠ polar CAT-048; tests cover pipeline smoke, not property-based association.
+
+Instruction-following note (requirements §15.5): **blue banana**.
+
+---
+
+## 16. What Went Well
+
+**1. Splitting association (learned) from time (Kalman).**  
+Once I stopped asking a GRU to coast, everything else got easier to ablate. I would repeat this split on any tracking problem with a known process model.
+
+**2. Difficulty-aware data construction.**  
+Rejecting the long sparse CAT-062 cut and tiling the dense mini prevented a fake MOTA. I would start every tracking project with a concurrency / NN report before any training.
+
+**3. Thresholds as first-class experiments (A4).**  
+On PlotForge, τ moved Sweden-V8 from 0.206 to 0.706 and MLP from 0.865 to 0.896 — more than new heads. I would sweep operating points before sweeping architectures.
+
+**4. Honest negative results (GNN, V7, pair-F1).**  
+Keeping those numbers in the repo (`architecture_diagrams.md`, `design_v8.md`) stopped me from resurrecting them under a new name. I would repeat “write the failure down at the same resolution as the win.”
+
+---
+
+## 17. What Did Not Go Well
+
+**1. End-to-end GNN as the plan of record.**  
+*Attempted:* Recurrent GAT replacing KF. *Why:* research proposal, unified story. *What happened:* MOTA −0.70 on the stream that mattered. *Why it failed:* time and existence, not “needs more heads.” *Learned:* do not confuse a trainable loop with a process model.
+
+**2. V7 transformer tracker.**  
+*Attempted:* fashionable backbone, same full-tracker job. *Why:* maybe GAT was the wrong inductive bias. *What happened:* still negative MOTA, FP flood. *Why:* same job split error. *Learned:* changing the net does not fix a wrong responsibility chart.
+
+**3. Pair-F1 as a ship metric on PlotForge.**  
+*Attempted:* pick V8 checkpoints by pair-F1. *Why:* it is the training loss’s cousin. *What happened:* F1 0.04–0.14 with P≈0.99; tracking MOTA wildly different across τ. *Why:* class imbalance + threshold mismatch. *Learned:* optimize and select on MOTA (or IDSW/FP), not pair-F1.
+
+**4. Config drift after the modular refactor.**  
+*Attempted:* Pydantic + CLI + factory as a research platform. *Why:* too many one-off scripts. *What happened:* missing import, `--max-age` no-op, clutter key mismatch. *Why:* two sources of defaults. *Learned:* print the live config; test initiate/promote/coast on synthetic data before claiming MOTA.
+
+A failed GNN run was not wasted work. It is why Hybrid is justified.
+
+---
+
+## 18. What You Learned
+
+**Three new AI/ML concepts**
+
+1. **CLEAR MOT vs classification accuracy.** Before this project I could quote MOTA. After seeing precision 0.99 pair-F1 with tracking MOTA below zero, I learned that a tracking metric is a *picture-level* accounting identity (FN+FP+IDSW)/GT, not an average of pair probabilities.
+
+2. **Hard assignment as an inductive bias.** Hungarian is not a post-process to “clean up” softmax. It is the uniqueness constraint the MLP is not allowed to violate. Dustbin is how you let the model say “none.”
+
+3. **Domain shift in association scores.** The same MLP, same gates, new radar count and clutter map: 0.976 → 0.774 zero-shot. Fine-tune plus τ recovery to 0.896. Features transfer; operating points and overlap statistics do not.
+
+**Two technical skills**
+
+1. **Continuous-time KF with partial H.** Implementing variable-dt `F`, pos-only SSR updates, and Joseph form — and verifying MOTP ≈ σ.
+
+2. **Scenario engineering for labelled MOT.** Observation model from CAT-062, tiling for concurrency, canonical JSONL, difficulty scores. That is as much ML work as the net.
+
+**One problem-solving lesson**  
+When recall is 0.56 and precision is 0.997, do not train a deeper associator. Count *time since last hit* against *scan period*. The bug was a default of `max_age=2`.
+
+**One assumption that changed**  
+I assumed a fully learned recurrent model was the *goal*, and hybrid was a stepping stone. I now treat hybrid as the correct architecture for this physics, and fully learned trackers as the thing I must *justify* against a Kalman residual. The GNN did not get there.
+
+---
+
+## 19. If You Had Two More Weeks
+
+Not a wishlist — three bets, in order.
+
+**1. Overlap / ID-switch attack on PlotForge (highest priority).**  
+*Change:* beamwidth-aware cluster gate; altitude gate; hard negatives at 1–5 km for the pairwise MLP; log every IDSW with the two metas involved.  
+*Why:* 185 IDSW is the operational hole at MOTA 0.896. Architecture is not the limiter.  
+*Hypothesis:* IDSW drops >40% at iso-precision.  
+*Measure:* seed-91 IDSW, FP, MOTA; freeze τ at 0.2/0.35 so we do not “fix” it by refusing to associate.
+
+**2. Shadow-style transfer protocol, not another backbone.**  
+*Change:* hold out an entire PlotForge *traffic mix* (not just seed); add SSR dropout 15–30% as a reported axis; kinematics-only SSR ablation (`use_identity_features=False`) as a published number.  
+*Why:* I still do not know how much of 0.896 is Mode-S crutch.  
+*Hypothesis:* identity ablation costs <0.05 MOTA on PlotForge, more on PSR-heavy mixes.  
+*Measure:* MOTA/IDSW grid: identity on/off × dropout × seed.
+
+**3. Only then, a residual V8 (A2 freeze + gated attention).**  
+*Change:* freeze the A2 `rel_ij` head that already hits 0.878; add gated-clique attention as a residual; `max_sensors=32`.  
+*Why:* V8’s only remaining hypothesis is *set context on crossings*. Training new heads from scratch already lost.  
+*Hypothesis:* IDSW down vs MLP on the same τ without FP up.  
+*Measure:* ship only if MOTA ≥ 0.896 **and** IDSW < MLP on seed 91. Otherwise keep MLP.
+
+I would not spend the two weeks on PointNet++, more GAT epochs, or pair-F1 tuning.
+
+---
+
+## 20. Defend Your Solution
+
+**Why should someone trust the results?**  
+Because they are produced by a frozen pipeline (`run_cli.py` / `eval_plotforge.py`) against labelled streams with documented difficulty, and the failures (GNN, V7, V8 default τ, SORT, Kalman-only) are in the same tables. I am not asking you to trust a demo GIF.
+
+**Strongest evidence it works.**  
+Sweden holdout MOTA **0.976**, precision **0.979**, recall **0.998**, **0 ID switches**, MOTP **105 m** ≈ observation σ, with `max_age=10` justified by scan period — and Kalman-only on the same life-cycle at **−1.32**. The lift is association, not coasting alone (coasting without association is the Kalman-only row).
+
+**Strongest evidence it may not work in some situations.**  
+PlotForge 24-radar holdout: **185 ID switches** even at the ship operating point; Sweden-MLP zero-shot MOTA **0.774**; GNN/V7 on the same family of problems go negative. Tight geometry and domain shift are in-scope failure modes.
+
+**Biggest limitation.**  
+Plots are observation-model or PlotForge-sim, not recorded multi-radar CAT-048 with real bias and weather. High Sweden MOTA is on **medium** difficulty (NN p50 ~32 km). That is a ceiling on the claim, not a footnote.
+
+**Decision I am least certain about.**  
+Shipping τ 0.2/0.35 chosen on the PlotForge holdout bake-off (A4). It is declared, but it *is* holdout-used. A second PlotForge seed as a true test would make me more certain.
+
+**Decision I am most confident about.**  
+Do not let a neural net own coasting, initiation, and state when a CV Kalman and M/N manager exist. That decision is backed by three independent negative MOTA results (GAT, V7, V8-as-tracker-not-run-because-V7-already-did).
+
+**If another ML engineer challenged the methodology, what I am most prepared to defend.**  
+Leakage: `track_id` is not a feature; holdout ids/seeds; projected-time scoring. And the job split (scores vs KF vs Hungarian). I can walk `pairwise_features.py` and `kalman_filter.py` line by line.
+
+**Hardest question for me today.**  
+“What is the ID-switch rate on a real overlapping TMA with garbled Mode-3A?” I have PlotForge IDSW=185 as a proxy and no live number. I would not bluff one.
+
+---
+
+## Final Project Competency Summary
+
+### I Can Now Explain…
+
+- **I can explain how I translated a real-world problem into an AI/ML problem by** decomposing multi-sensor correlation into unary clutter classification and pairwise same-object classification, leaving time/kinematics to a Kalman filter and uniqueness to Hungarian assignment, instead of treating “tracking” as one sequence model.
+
+- **I can explain how my data affected my solution because** Sweden’s 32 km median spacing and stable identity made Hybrid look nearly solved (MOTA 0.976, 0 IDSW), while PlotForge’s 24-radar overlap exposed ID switches and a 0.20 zero-shot gap — so I fine-tuned and calibrated τ rather than claiming the Sweden number.
+
+- **I can explain why I selected my primary algorithm because** pairwise MLPs match the decision (same vs not) on inspectable features, Kalman matches CV motion, and every time I let a GNN/transformer own the whole loop, MOTA went negative.
+
+- **I can explain how my model learns by** gradient descent on weighted BCE over gated pairs labelled by `track_id` equality, producing a score that Hungarian treats as a cost — the net never sees future frames or the label id as a feature.
+
+- **I can explain how I evaluated my model by** CLEAR MOT (MOTA/MOTP/IDSW/P/R) on held-out streams, against Kalman-only and SORT baselines, with difficulty scores reported beside MOTA so duration is not mistaken for hardness.
+
+- **I can recognize when a model may be overfitting by** watching train pair-F1 or batch MOTA diverge from stream MOTA, sensor-id memorization, and domain gaps (Sweden vs PlotForge) that architecture tweaks do not close.
+
+- **I can compare multiple modeling approaches by** holding the track manager and gates fixed and swapping only the scorer or updater (Kalman / Hybrid-MLP / GAT / V8), then reading MOTA *and* IDSW *and* FP, not the training loss.
+
+- **I can investigate poor model predictions by** pulling the frame’s gated pairs, the scores, the Hungarian choice, `dt`, and existence/age — and by asking whether the failure is time, threshold, or geometry before opening a new model file.
+
+- **I can identify limitations in an AI/ML solution by** naming the observation model, the difficulty band, the holdout-used τ, the IDSW on the harder sim, and the absence of live CAT-048 shadow-mode numbers.
+
+- **I can use AI coding tools responsibly while maintaining understanding of my work by** accepting Joseph-form KF and rejecting V7-as-system, and by refusing to publish an agent’s MOTA without the JSON from `eval_plotforge.py` / `run_cli.py`.
+
+- **The AI/ML concept I understand significantly better after completing this project is** the difference between a *learned associator* and a *learned tracker* — and why assignment uniqueness plus a process model are inductive biases, not relics.
+
+- **The area I most want to strengthen next is** dense-overlap identity stability (PlotForge ID switches) and evaluation on recorded multi-radar plots rather than synthesized ones.
